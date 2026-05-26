@@ -1,9 +1,9 @@
 /**
  * Cayley-style graph visualizations.
  *
- * The pancake, star, permutohedron, and cyclic-adjacent graphs have every
- * permutation of {1,…,n} as a vertex. The hypercube has every n-bit string
- * as a vertex. They differ by the generator set used for edges.
+ * The pancake, star, permutohedron, cyclic-adjacent, and kaleidoscope graphs
+ * have every permutation of {1,…,n} as a vertex. The hypercube has every
+ * n-bit string as a vertex. They differ by the generator set used for edges.
  *
  * Permutations are stored as `Uint8Array` (1 byte per element) for
  * memory efficiency — at n = 10 we hold 10! = 3,628,800 of them.
@@ -44,6 +44,17 @@ export function swap(p: Perm, i: number, j: number): Perm {
   return q;
 }
 
+/** Reverse an arbitrary contiguous block of p, returning a new Uint8Array. */
+export function reverseBlock(p: Perm, start: number, end: number): Perm {
+  const q = new Uint8Array(p);
+  for (let i = start, j = end; i < j; i++, j--) {
+    const t = q[i];
+    q[i] = q[j];
+    q[j] = t;
+  }
+  return q;
+}
+
 export type PancakeOrder = "zaks" | "williams";
 export type GraphPreset =
   | "pancake-zaks"
@@ -51,12 +62,14 @@ export type GraphPreset =
   | "star"
   | "permutohedron"
   | "cyclic-adjacent"
+  | "kaleidoscope"
   | "hypercube";
 export type GraphKind =
   | "pancake"
   | "star"
   | "permutohedron"
   | "cyclic-adjacent"
+  | "kaleidoscope"
   | "hypercube";
 
 export interface PancakeCycle {
@@ -190,8 +203,9 @@ export async function buildPancakeGraph(
   onProgress?: (phase: string, done: number, total: number) => void,
   signal?: AbortSignal
 ): Promise<PancakeGraph> {
-  if (n < 2 || n > 10) {
-    throw new Error(`n must be between 2 and 10, got ${n}`);
+  const maxN = graphMaxN(preset);
+  if (n < 2 || n > maxN) {
+    throw new Error(`n must be between 2 and ${maxN} for ${graphPresetLabel(preset)}, got ${n}`);
   }
   throwIfAborted(signal);
 
@@ -264,6 +278,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Permutohedron graph";
     case "cyclic-adjacent":
       return "Cyclic adjacent graph";
+    case "kaleidoscope":
+      return "Kaleidoscope graph";
     case "hypercube":
       return "Hypercube";
   }
@@ -281,6 +297,8 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Adjacent transpositions s_i = (i, i+1)";
     case "cyclic-adjacent":
       return "Adjacent transpositions on a ring, including (n, 1)";
+    case "kaleidoscope":
+      return "Reverse any contiguous block";
     case "hypercube":
       return "Flip one bit";
   }
@@ -292,8 +310,13 @@ export function graphVertexCount(n: number, preset: GraphPreset): number {
 
 export function graphEdgeCount(n: number, preset: GraphPreset): number {
   if (preset === "hypercube") return n * 2 ** (n - 1);
+  if (preset === "kaleidoscope") return ((n * (n - 1)) / 2 * factorial(n)) / 2;
   if (preset === "cyclic-adjacent") return (n * factorial(n)) / 2;
   return ((n - 1) * factorial(n)) / 2;
+}
+
+export function graphMaxN(preset: GraphPreset): number {
+  return preset === "kaleidoscope" ? 9 : 10;
 }
 
 function graphKind(preset: GraphPreset): GraphKind {
@@ -301,6 +324,7 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "star" ||
     preset === "permutohedron" ||
     preset === "cyclic-adjacent" ||
+    preset === "kaleidoscope" ||
     preset === "hypercube"
   ) {
     return preset;
@@ -340,6 +364,18 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
     }
     if (preset === "cyclic-adjacent") {
       generators.push({ id: n, apply: (p) => swap(p, n - 1, 0) });
+    }
+    return generators;
+  }
+  if (preset === "kaleidoscope") {
+    const generators: Generator[] = [];
+    for (let start = 0; start < n - 1; start++) {
+      for (let end = start + 1; end < n; end++) {
+        generators.push({
+          id: (start + 1) * 100 + (end + 1),
+          apply: (p) => reverseBlock(p, start, end),
+        });
+      }
     }
     return generators;
   }

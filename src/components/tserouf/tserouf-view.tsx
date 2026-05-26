@@ -7,6 +7,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -20,9 +21,33 @@ import { Loader2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
-const N_OPTIONS = [1, 2, 3, 4, 5, 6, 7] as const;
+const N_OPTIONS = [2, 3, 4, 5, 6, 7] as const;
 const WORDS_PER_LINE = 6;
+const HEBREW_LETTERS = ["א", "ב", "ג", "ד", "ה", "ו", "ז"] as const;
+const SOURCE_HEBREW_INTRO = "כאי זה צד צרפן";
+const SOURCE_HEBREW_ROWS = [
+  ["שני אבנים", "בונות", "שני בתים"],
+  ["שלש", "בונות", "ששה בתים"],
+  ["ארבע", "בונות", "עשרים וארבע בתים"],
+  ["חמש", "בונות", "מאה ועשרים בתים"],
+  ["שש", "בונות", "שבע מאות ועשרים בתים"],
+  ["שבע", "בונות", "חמשת אלפים וארבעים"],
+] as const;
+const SOURCE_HEBREW_OUTRO =
+  "מיכן ואילך צא וחשב מה שאין הפה יכול לדבר ומה שאין האוזן יכולה לשמוע";
+const SOURCE_TRANSLATION_INTRO = "How did he combine them";
+const SOURCE_TRANSLATION_ROWS = [
+  ["two stones", "build", "two houses"],
+  ["three", "build", "six"],
+  ["four", "build", "twenty-four"],
+  ["five", "build", "one hundred and twenty"],
+  ["six", "build", "seven hundred and twenty"],
+  ["seven", "build", "five thousand and forty"],
+] as const;
+const SOURCE_TRANSLATION_OUTRO =
+  "From here on go out and ponder what the mouth cannot speak\nand what the ear cannot hear";
 type NValue = (typeof N_OPTIONS)[number];
+type Alphabet = "latin" | "hebrew";
 
 interface ZaksWord {
   word: string;
@@ -44,6 +69,7 @@ interface TseroufBlock {
 
 export function TseroufView() {
   const [n, setN] = useState<NValue>(3);
+  const [alphabet, setAlphabet] = useState<Alphabet>("latin");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [running, setRunning] = useState(false);
@@ -52,6 +78,7 @@ export function TseroufView() {
     () => Array.from({ length: n }, (_, i) => String.fromCharCode(97 + i)).join(""),
     [n]
   );
+  const displayBaseWord = displayWord(baseWord, alphabet);
   const wordBlocks = useMemo(() => blockWords(words, n), [n, words]);
 
   useEffect(() => {
@@ -91,12 +118,25 @@ export function TseroufView() {
   }, [baseWord, n]);
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+    <div className="space-y-6">
+      <SourcePassage />
+
+      <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
       <Card className="self-start border-none bg-transparent py-0 shadow-none ring-0 lg:sticky lg:top-4">
         <CardHeader className="space-y-1 px-0">
-          <CardTitle className="text-lg">Tsérouf</CardTitle>
+          <CardTitle className="text-lg">Tserouf</CardTitle>
           <CardDescription>
-            All permutations of the word <span className="font-mono">{baseWord}</span>,
+            All permutations of the word{" "}
+            <span
+              dir={alphabet === "hebrew" ? "rtl" : "ltr"}
+              className={`inline-block ${
+                alphabet === "hebrew"
+                  ? "font-[family-name:var(--font-hebrew)]"
+                  : "font-mono"
+              }`}
+            >
+              {displayBaseWord}
+            </span>,
             listed in Zaks suffix-reversal order; each number k reverses the
             last k letters.
           </CardDescription>
@@ -124,8 +164,29 @@ export function TseroufView() {
             </Select>
           </div>
 
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            onClick={() =>
+              setAlphabet((current) =>
+                current === "latin" ? "hebrew" : "latin"
+              )
+            }
+          >
+            Show {alphabet === "latin" ? "Hebrew" : "Latin"} letters
+          </Button>
+
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
-            <Stat label="Word" value={baseWord} />
+            <Stat
+              label="Word"
+              value={displayBaseWord}
+              dir={alphabet === "hebrew" ? "rtl" : "ltr"}
+            />
+            <Stat
+              label="Letters"
+              value={alphabet === "hebrew" ? "Hebrew" : "Latin"}
+            />
             <Stat label="Permutations" value={factorial(n)} />
             <Stat label="Algorithm" value="Zaks suffix" />
             <Stat label="Status" value={status} full />
@@ -149,6 +210,7 @@ export function TseroufView() {
                     key={blockIndex}
                     block={block}
                     n={n}
+                    alphabet={alphabet}
                     toneStart={toneStart}
                   />
                 );
@@ -157,17 +219,53 @@ export function TseroufView() {
           )}
         </CardContent>
       </Card>
+      </div>
     </div>
+  );
+}
+
+function SourcePassage() {
+  return (
+    <figure className="max-w-4xl space-y-6 rounded-xl border border-border/70 bg-card/55 p-5">
+      <blockquote dir="rtl" className="space-y-4 font-[family-name:var(--font-hebrew)] text-2xl leading-9 text-foreground">
+        <p>{SOURCE_HEBREW_INTRO}</p>
+        <div className="grid w-fit grid-cols-[max-content_max-content_max-content] gap-x-4">
+          {SOURCE_HEBREW_ROWS.map(([subject, verb, object]) => (
+            <div key={subject} className="contents">
+              <span>{subject}</span>
+              <span>{verb}</span>
+              <span>{object}</span>
+            </div>
+          ))}
+        </div>
+        <p>{SOURCE_HEBREW_OUTRO}</p>
+      </blockquote>
+      <figcaption className="max-w-3xl space-y-3 font-[family-name:var(--font-mystic)] text-xl leading-8 text-muted-foreground">
+        <p>{SOURCE_TRANSLATION_INTRO}</p>
+        <div className="grid w-fit grid-cols-[max-content_max-content_max-content] gap-x-3">
+          {SOURCE_TRANSLATION_ROWS.map(([subject, verb, object]) => (
+            <div key={subject} className="contents">
+              <span>{subject}</span>
+              <span>{verb}</span>
+              <span>{object}</span>
+            </div>
+          ))}
+        </div>
+        <p className="whitespace-pre-line">{SOURCE_TRANSLATION_OUTRO}</p>
+      </figcaption>
+    </figure>
   );
 }
 
 function TseroufBlockView({
   block,
   n,
+  alphabet,
   toneStart,
 }: {
   block: TseroufBlock;
   n: number;
+  alphabet: Alphabet;
   toneStart: number;
 }) {
   return (
@@ -195,7 +293,11 @@ function TseroufBlockView({
                     line.type === "spacer" ? (
                       <p key={lineIndex} className="h-5" />
                     ) : (
-                      <WordLine key={lineIndex} line={line.words} />
+                      <WordLine
+                        key={lineIndex}
+                        line={line.words}
+                        alphabet={alphabet}
+                      />
                     )
                   )}
                 </div>
@@ -209,7 +311,7 @@ function TseroufBlockView({
             line.type === "spacer" ? (
               <p key={lineIndex} className="h-5" />
             ) : (
-              <WordLine key={lineIndex} line={line.words} />
+              <WordLine key={lineIndex} line={line.words} alphabet={alphabet} />
             )
           )}
         </div>
@@ -218,30 +320,40 @@ function TseroufBlockView({
   );
 }
 
-function WordLine({ line }: { line: ZaksWord[] }) {
+function WordLine({ line, alphabet }: { line: ZaksWord[]; alphabet: Alphabet }) {
   const stable = stablePositions(line);
+  const isHebrew = alphabet === "hebrew";
 
   return (
-    <p className="flex flex-wrap gap-x-4 gap-y-4">
+    <p
+      dir={isHebrew ? "rtl" : "ltr"}
+      className="flex flex-wrap gap-x-4 gap-y-4"
+    >
       {line.map((item, itemIndex) => (
         <span
           key={`${itemIndex}-${item.word}`}
           className="inline-flex min-w-14 flex-col items-center leading-none"
         >
-          <span className="h-4 text-[11px] leading-4 text-muted-foreground">
+          <span
+            dir="ltr"
+            className="h-4 text-[11px] leading-4 text-muted-foreground"
+          >
             {item.flip ?? ""}
           </span>
-          <span className="font-[var(--font-mystic)] text-2xl leading-8 text-foreground">
+          <span
+            dir={isHebrew ? "rtl" : "ltr"}
+            className={`text-2xl leading-8 text-foreground [unicode-bidi:isolate] ${
+              isHebrew
+                ? "font-[family-name:var(--font-hebrew)] font-medium"
+                : "font-[family-name:var(--font-mystic)]"
+            }`}
+          >
             {Array.from(item.word).map((letter, index) => (
               <span
                 key={index}
-                className={
-                  stable[index]
-                    ? "rounded bg-primary/15 px-1 text-primary"
-                    : undefined
-                }
+                className={letterClassName(stable, index)}
               >
-                {letter}
+                {displayLetter(letter, alphabet)}
               </span>
             ))}
           </span>
@@ -249,6 +361,32 @@ function WordLine({ line }: { line: ZaksWord[] }) {
       ))}
     </p>
   );
+}
+
+function letterClassName(stable: boolean[], index: number): string {
+  if (!stable[index]) return "inline-block px-1";
+
+  const startsRun = !stable[index - 1];
+  const endsRun = !stable[index + 1];
+
+  return [
+    "inline-block px-1 bg-primary/15 text-primary",
+    startsRun ? "rounded-s" : "",
+    endsRun ? "rounded-e" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function displayWord(word: string, alphabet: Alphabet): string {
+  return Array.from(word)
+    .map((letter) => displayLetter(letter, alphabet))
+    .join("");
+}
+
+function displayLetter(letter: string, alphabet: Alphabet): string {
+  if (alphabet === "latin") return letter;
+  return HEBREW_LETTERS[letter.charCodeAt(0) - 97] ?? letter;
 }
 
 function stablePositions(block: ZaksWord[]): boolean[] {
@@ -411,16 +549,18 @@ function spacerCountAfter(completedWords: number, n: number): number {
 function Stat({
   label,
   value,
+  dir = "ltr",
   full,
 }: {
   label: string;
   value: number | string | undefined;
+  dir?: "ltr" | "rtl";
   full?: boolean;
 }) {
   return (
     <div className={`flex items-center justify-between gap-3 ${full ? "col-span-2" : ""}`}>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="truncate text-right font-mono text-xs">
+      <dd dir={dir} className="truncate text-right font-mono text-xs">
         {value === undefined
           ? "-"
           : typeof value === "number"

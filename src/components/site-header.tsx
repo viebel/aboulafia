@@ -18,28 +18,15 @@ export function SiteHeader() {
           </span>
         </Link>
         <nav className="flex items-center gap-4 text-sm text-muted-foreground">
+          <Link href="/" className="transition-colors hover:text-foreground">
+            Graph
+          </Link>
           <Link
             href="/tserouf"
             className="transition-colors hover:text-foreground"
           >
-            Tsérouf
+            Tserouf
           </Link>
-          <a
-            href="https://en.wikipedia.org/wiki/Pancake_graph"
-            target="_blank"
-            rel="noreferrer"
-            className="transition-colors hover:text-foreground"
-          >
-            Pancake graph
-          </a>
-          <a
-            href="https://en.wikipedia.org/wiki/Abraham_Abulafia"
-            target="_blank"
-            rel="noreferrer"
-            className="transition-colors hover:text-foreground"
-          >
-            R. Abulafia
-          </a>
         </nav>
       </div>
     </header>

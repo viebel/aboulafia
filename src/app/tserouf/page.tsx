@@ -2,7 +2,7 @@ import { TseroufView } from "@/components/tserouf/tserouf-view";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Tsérouf",
+  title: "Tserouf",
   description:
     "Display all permutations of an n-letter word in Zaks prefix-reversal order.",
 };

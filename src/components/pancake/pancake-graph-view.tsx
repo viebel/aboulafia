@@ -24,6 +24,7 @@ import {
   graphEdgeCount,
   graphPresetDescription,
   graphPresetLabel,
+  graphMaxN,
   graphVertexCount,
   type PancakeGraph,
   type GraphPreset,
@@ -47,6 +48,7 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "star",
   "permutohedron",
   "cyclic-adjacent",
+  "kaleidoscope",
   "hypercube",
 ];
 
@@ -91,6 +93,10 @@ export function PancakeGraphView() {
   const isVeryHeavy = estimatedVertices > 1_000_000 || estimatedEdges > 10_000_000;
   const canUseInteractiveSvg = n <= MAX_INTERACTIVE_SVG_N;
   const activeRenderer: Renderer = canUseInteractiveSvg ? renderer : "canvas";
+  const availableNOptions = useMemo(
+    () => N_OPTIONS.filter((option) => option <= graphMaxN(preset)),
+    [preset]
+  );
 
   useEffect(() => {
     const ac = new AbortController();
@@ -299,7 +305,12 @@ export function PancakeGraphView() {
   };
 
   const selectPreset = (value: string) => {
-    setPreset(value as GraphPreset);
+    const nextPreset = value as GraphPreset;
+    setPreset(nextPreset);
+    if (n > graphMaxN(nextPreset)) {
+      setN(graphMaxN(nextPreset) as NValue);
+      setRenderer("canvas");
+    }
   };
 
   const selectedPresetLabel = graphPresetLabel(preset);
@@ -362,7 +373,7 @@ export function PancakeGraphView() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {N_OPTIONS.map((opt) => (
+                  {availableNOptions.map((opt) => (
                     <SelectItem key={opt} value={String(opt)}>
                       n = {opt} —{" "}
                       {NUMBER_FORMAT.format(graphVertexCount(opt, preset))} vertices
