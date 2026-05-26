@@ -29,6 +29,19 @@ interface ZaksWord {
   flip?: number;
 }
 
+type TseroufLine =
+  | { type: "words"; words: ZaksWord[] }
+  | { type: "spacer" };
+
+type TseroufRenderUnit =
+  | { type: "subblock"; index: number; lines: TseroufLine[] }
+  | { type: "spacer" };
+
+interface TseroufBlock {
+  index: number;
+  lines: TseroufLine[];
+}
+
 export function TseroufView() {
   const [n, setN] = useState<NValue>(3);
   const [words, setWords] = useState<ZaksWord[]>([]);
@@ -79,8 +92,8 @@ export function TseroufView() {
 
   return (
     <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
-      <Card className="self-start lg:sticky lg:top-4">
-        <CardHeader className="space-y-1">
+      <Card className="self-start border-none bg-transparent py-0 shadow-none ring-0 lg:sticky lg:top-4">
+        <CardHeader className="space-y-1 px-0">
           <CardTitle className="text-lg">Tsérouf</CardTitle>
           <CardDescription>
             All permutations of the word <span className="font-mono">{baseWord}</span>,
@@ -88,7 +101,7 @@ export function TseroufView() {
             last k letters.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-4 px-0">
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wider text-muted-foreground">
               Word length
@@ -120,18 +133,26 @@ export function TseroufView() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardContent className="pt-6">
+      <Card className="border-none bg-transparent py-0 pl-8 shadow-none ring-0 lg:pl-12">
+        <CardContent className="p-0">
           {running ? (
             <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 text-muted-foreground">
               <Loader2 className="h-8 w-8 animate-spin" />
               <p className="text-sm">{status}</p>
             </div>
           ) : (
-            <div className="rounded-lg border bg-muted/10 p-5 font-mono text-sm">
-              {wordBlocks.map((block, blockIndex) => (
-                <WordBlock key={blockIndex} block={block} />
-              ))}
+            <div className="flex flex-col items-start gap-5 font-mono text-sm">
+              {wordBlocks.map((block, blockIndex) => {
+                const toneStart = toneStartForBlock(wordBlocks, blockIndex, n);
+                return (
+                  <TseroufBlockView
+                    key={blockIndex}
+                    block={block}
+                    n={n}
+                    toneStart={toneStart}
+                  />
+                );
+              })}
             </div>
           )}
         </CardContent>
@@ -140,14 +161,69 @@ export function TseroufView() {
   );
 }
 
-function WordBlock({ block }: { block: ZaksWord[] }) {
-  if (block.length === 0) return <p className="h-5" />;
+function TseroufBlockView({
+  block,
+  n,
+  toneStart,
+}: {
+  block: TseroufBlock;
+  n: number;
+  toneStart: number;
+}) {
+  return (
+    <section
+      className="inline-block rounded-xl p-4"
+      style={{
+        backgroundColor: tintFor(toneStart, 0.035),
+      }}
+    >
+      {n >= 6 ? (
+        <div className="flex flex-col items-start gap-3">
+          {subblockUnits(block.lines).map((unit, unitIndex) =>
+            unit.type === "spacer" ? (
+              <p key={unitIndex} className="h-5" />
+            ) : (
+              <section
+                key={unitIndex}
+                className="inline-block rounded-lg p-3"
+                style={{
+                  backgroundColor: tintFor(toneStart + unit.index - 1, 0.075),
+                }}
+              >
+                <div className="space-y-3">
+                  {unit.lines.map((line, lineIndex) =>
+                    line.type === "spacer" ? (
+                      <p key={lineIndex} className="h-5" />
+                    ) : (
+                      <WordLine key={lineIndex} line={line.words} />
+                    )
+                  )}
+                </div>
+              </section>
+            )
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {block.lines.map((line, lineIndex) =>
+            line.type === "spacer" ? (
+              <p key={lineIndex} className="h-5" />
+            ) : (
+              <WordLine key={lineIndex} line={line.words} />
+            )
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
 
-  const stable = stablePositions(block);
+function WordLine({ line }: { line: ZaksWord[] }) {
+  const stable = stablePositions(line);
 
   return (
     <p className="flex flex-wrap gap-x-4 gap-y-4">
-      {block.map((item, itemIndex) => (
+      {line.map((item, itemIndex) => (
         <span
           key={`${itemIndex}-${item.word}`}
           className="inline-flex min-w-14 flex-col items-center leading-none"
@@ -180,6 +256,55 @@ function stablePositions(block: ZaksWord[]): boolean[] {
   return Array.from(first).map((letter, index) =>
     block.every((item) => item.word[index] === letter)
   );
+}
+
+function tintFor(index: number, base: number): string {
+  return `rgba(180, 120, 24, ${Math.min(base + index * 0.035, 0.38)})`;
+}
+
+function toneStartForBlock(
+  blocks: TseroufBlock[],
+  blockIndex: number,
+  n: number
+): number {
+  let tone = 1;
+  for (let i = 0; i < blockIndex; i++) {
+    tone += n >= 6 ? subblockUnits(blocks[i].lines).filter((unit) => unit.type === "subblock").length : 1;
+  }
+  return tone;
+}
+
+function subblockUnits(lines: TseroufLine[]): TseroufRenderUnit[] {
+  const units: TseroufRenderUnit[] = [];
+  let current: TseroufLine[] = [];
+  let wordLineCount = 0;
+  let subblockIndex = 1;
+
+  const flush = () => {
+    if (current.length === 0) return;
+    units.push({ type: "subblock", index: subblockIndex, lines: current });
+    subblockIndex++;
+    current = [];
+    wordLineCount = 0;
+  };
+
+  for (const line of lines) {
+    if (line.type === "spacer") {
+      if (current.length === 0) {
+        units.push({ type: "spacer" });
+      } else {
+        current.push(line);
+      }
+      continue;
+    }
+
+    current.push(line);
+    wordLineCount++;
+    if (wordLineCount === 4) flush();
+  }
+
+  flush();
+  return units;
 }
 
 async function suffixZaksCycle(
@@ -238,29 +363,49 @@ function lettersForPermutation(perm: Perm): string {
   return s;
 }
 
-function blockWords(words: ZaksWord[], n: number): ZaksWord[][] {
-  const blocks: ZaksWord[][] = [];
-  let current: ZaksWord[] = [];
+function blockWords(words: ZaksWord[], n: number): TseroufBlock[] {
+  const blockSize = factorial(Math.max(0, n - 1));
+  const blocks: TseroufBlock[] = [];
 
-  for (const item of words) {
-    if (current.length === WORDS_PER_LINE) {
-      blocks.push(current);
-      current = [];
-    }
+  for (let start = 0; start < words.length; start += blockSize) {
+    const chunk = words.slice(start, start + blockSize);
+    const lines: TseroufLine[] = [];
+    let current: ZaksWord[] = [];
 
-    current.push(item);
+    for (let offset = 0; offset < chunk.length; offset++) {
+      const item = chunk[offset];
+      current.push(item);
 
-    if (item.flip === n || (item.flip !== undefined && item.flip > 3)) {
-      blocks.push(current);
-      if (item.flip > 3) {
-        for (let i = 0; i < item.flip - 2; i++) blocks.push([]);
+      if (current.length === WORDS_PER_LINE) {
+        lines.push({ type: "words", words: current });
+        current = [];
+
+        const completedWords = start + offset + 1;
+        for (let i = 0; i < spacerCountAfter(completedWords, n); i++) {
+          lines.push({ type: "spacer" });
+        }
       }
-      current = [];
     }
+
+    if (current.length > 0) lines.push({ type: "words", words: current });
+
+    blocks.push({
+      index: blocks.length + 1,
+      lines,
+    });
   }
 
-  if (current.length > 0) blocks.push(current);
   return blocks;
+}
+
+function spacerCountAfter(completedWords: number, n: number): number {
+  let count = 0;
+  for (let k = 4; k <= n; k++) {
+    if (completedWords % factorial(k - 1) === 0) {
+      count = k - 2;
+    }
+  }
+  return count;
 }
 
 function Stat({
