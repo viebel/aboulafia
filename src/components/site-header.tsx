@@ -18,6 +18,12 @@ export function SiteHeader() {
           </span>
         </Link>
         <nav className="flex items-center gap-4 text-sm text-muted-foreground">
+          <Link
+            href="/tserouf"
+            className="transition-colors hover:text-foreground"
+          >
+            Tsérouf
+          </Link>
           <a
             href="https://en.wikipedia.org/wiki/Pancake_graph"
             target="_blank"
