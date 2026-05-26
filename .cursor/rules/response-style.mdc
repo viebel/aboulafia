@@ -1,0 +1,9 @@
+---
+description: Project-specific response style
+alwaysApply: true
+---
+
+# Response Style
+
+- Do not include routine verification summaries like `Verified with npm run lint && npm run build.` in final responses.
+- If verification fails or could not be run, mention that briefly because it affects the user's next step.
