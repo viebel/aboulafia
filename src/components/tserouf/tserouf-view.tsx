@@ -72,6 +72,7 @@ export function TseroufView() {
   const [alphabet, setAlphabet] = useState<Alphabet>("latin");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
+  const [copied, setCopied] = useState(false);
   const [running, setRunning] = useState(false);
 
   const baseWord = useMemo(
@@ -80,6 +81,10 @@ export function TseroufView() {
   );
   const displayBaseWord = displayWord(baseWord, alphabet);
   const wordBlocks = useMemo(() => blockWords(words, n), [n, words]);
+  const clipboardText = useMemo(
+    () => enumerationClipboardText(wordBlocks, alphabet),
+    [alphabet, wordBlocks]
+  );
 
   useEffect(() => {
     const ac = new AbortController();
@@ -116,6 +121,19 @@ export function TseroufView() {
       clearTimeout(id);
     };
   }, [baseWord, n]);
+
+  const copyEnumeration = async () => {
+    if (!clipboardText) return;
+
+    try {
+      await copyTextToClipboard(clipboardText);
+      setCopied(true);
+      setStatus("Copied letters-only enumeration to clipboard.");
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch (e) {
+      setStatus(`Copy failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -175,6 +193,16 @@ export function TseroufView() {
             }
           >
             Show {alphabet === "latin" ? "Hebrew" : "Latin"} letters
+          </Button>
+
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            onClick={copyEnumeration}
+            disabled={running || words.length === 0}
+          >
+            {copied ? "Copied" : "copy tserouf to clipboard"}
           </Button>
 
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
@@ -387,6 +415,52 @@ function displayWord(word: string, alphabet: Alphabet): string {
 function displayLetter(letter: string, alphabet: Alphabet): string {
   if (alphabet === "latin") return letter;
   return HEBREW_LETTERS[letter.charCodeAt(0) - 97] ?? letter;
+}
+
+function enumerationClipboardText(
+  blocks: TseroufBlock[],
+  alphabet: Alphabet
+): string {
+  const lines: string[] = [];
+
+  for (const block of blocks) {
+    if (lines.length > 0) lines.push("");
+
+    for (const line of block.lines) {
+      if (line.type === "spacer") {
+        lines.push("");
+      } else {
+        lines.push(
+          line.words.map((item) => displayWord(item.word, alphabet)).join(" ")
+        );
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("The browser blocked clipboard access.");
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 function stablePositions(block: ZaksWord[]): boolean[] {
