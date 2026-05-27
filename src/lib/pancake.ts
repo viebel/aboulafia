@@ -1,9 +1,10 @@
 /**
  * Cayley-style graph visualizations.
  *
- * The pancake, star, permutohedron, cyclic-adjacent, and kaleidoscope graphs
- * have every permutation of {1,…,n} as a vertex. The hypercube has every
- * n-bit string as a vertex. They differ by the generator set used for edges.
+ * The pancake, star, permutohedron, cyclic-adjacent, transposition, and
+ * kaleidoscope graphs have every permutation of {1,…,n} as a vertex. The
+ * hypercube has every n-bit string as a vertex. They differ by the generator
+ * set used for edges.
  *
  * Permutations are stored as `Uint8Array` (1 byte per element) for
  * memory efficiency — at n = 10 we hold 10! = 3,628,800 of them.
@@ -62,6 +63,7 @@ export type GraphPreset =
   | "star"
   | "permutohedron"
   | "cyclic-adjacent"
+  | "transposition"
   | "kaleidoscope"
   | "hypercube";
 export type GraphKind =
@@ -69,6 +71,7 @@ export type GraphKind =
   | "star"
   | "permutohedron"
   | "cyclic-adjacent"
+  | "transposition"
   | "kaleidoscope"
   | "hypercube";
 
@@ -180,8 +183,7 @@ export interface PancakeGraph {
   flips: number[];
   /**
    * All Cayley edges, deduplicated, encoded as flat triples for memory:
-   * for edge t, src=edges[3t], dst=edges[3t+1], flipSize=edges[3t+2].
-   * Total length is 3 * (n-1) * n! / 2.
+   * for edge t, src=edges[3t], dst=edges[3t+1], generatorId=edges[3t+2].
    */
   edges: Uint32Array;
   /** Indices (along the selected cycle) of edges that are full-reversal rₙ flips. */
@@ -216,7 +218,7 @@ export async function buildPancakeGraph(
     preset === "hypercube"
       ? await hypercubeGrayOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : order === undefined
-        ? preset === "permutohedron" || preset === "cyclic-adjacent"
+        ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
         : await lexicographicOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
         : await prefixReversalCycle(
@@ -278,6 +280,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Permutohedron graph";
     case "cyclic-adjacent":
       return "Cyclic adjacent graph";
+    case "transposition":
+      return "Transposition graph";
     case "kaleidoscope":
       return "Kaleidoscope graph";
     case "hypercube":
@@ -297,6 +301,8 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Adjacent transpositions s_i = (i, i+1)";
     case "cyclic-adjacent":
       return "Adjacent transpositions on a ring, including (n, 1)";
+    case "transposition":
+      return "All transpositions (i, j)";
     case "kaleidoscope":
       return "Reverse any contiguous block";
     case "hypercube":
@@ -310,13 +316,15 @@ export function graphVertexCount(n: number, preset: GraphPreset): number {
 
 export function graphEdgeCount(n: number, preset: GraphPreset): number {
   if (preset === "hypercube") return n * 2 ** (n - 1);
-  if (preset === "kaleidoscope") return ((n * (n - 1)) / 2 * factorial(n)) / 2;
+  if (preset === "kaleidoscope" || preset === "transposition") {
+    return ((n * (n - 1)) / 2 * factorial(n)) / 2;
+  }
   if (preset === "cyclic-adjacent") return (n * factorial(n)) / 2;
   return ((n - 1) * factorial(n)) / 2;
 }
 
 export function graphMaxN(preset: GraphPreset): number {
-  return preset === "kaleidoscope" ? 9 : 10;
+  return preset === "kaleidoscope" || preset === "transposition" ? 9 : 10;
 }
 
 function graphKind(preset: GraphPreset): GraphKind {
@@ -324,6 +332,7 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "star" ||
     preset === "permutohedron" ||
     preset === "cyclic-adjacent" ||
+    preset === "transposition" ||
     preset === "kaleidoscope" ||
     preset === "hypercube"
   ) {
@@ -364,6 +373,18 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
     }
     if (preset === "cyclic-adjacent") {
       generators.push({ id: n, apply: (p) => swap(p, n - 1, 0) });
+    }
+    return generators;
+  }
+  if (preset === "transposition") {
+    const generators: Generator[] = [];
+    for (let i = 0; i < n - 1; i++) {
+      for (let j = i + 1; j < n; j++) {
+        generators.push({
+          id: (i + 1) * 100 + (j + 1),
+          apply: (p) => swap(p, i, j),
+        });
+      }
     }
     return generators;
   }

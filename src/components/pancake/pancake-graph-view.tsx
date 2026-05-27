@@ -48,6 +48,7 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "star",
   "permutohedron",
   "cyclic-adjacent",
+  "transposition",
   "kaleidoscope",
   "hypercube",
 ];

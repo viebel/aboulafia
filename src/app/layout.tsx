@@ -33,7 +33,7 @@ export const metadata: Metadata = {
     template: "%s · Aboulafia",
   },
   description:
-    "Visualization of graph generators: pancake, star, permutohedron, cyclic adjacent, and hypercube.",
+    "Visualization of graph generators: pancake, star, permutohedron, transposition, cyclic adjacent, and hypercube.",
   metadataBase: new URL("https://aboulafia.vercel.app"),
 };
 
