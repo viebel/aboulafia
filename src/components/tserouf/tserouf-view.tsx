@@ -24,9 +24,8 @@ const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 const N_OPTIONS = [2, 3, 4, 5, 6, 7] as const;
 const WORDS_PER_LINE = 6;
 const HEBREW_LETTERS = ["א", "ב", "ג", "ד", "ה", "ו", "ז"] as const;
-const SOURCE_HEBREW_INTRO = "כאי זה צד צרפן";
 const SOURCE_HEBREW_ROWS = [
-  ["שני אבנים", "בונות", "שני בתים"],
+  ["שתי אבנים", "בונות", "שני בתים"],
   ["שלש", "בונות", "ששה בתים"],
   ["ארבע", "בונות", "עשרים וארבע בתים"],
   ["חמש", "בונות", "מאה ועשרים בתים"],
@@ -34,8 +33,7 @@ const SOURCE_HEBREW_ROWS = [
   ["שבע", "בונות", "חמשת אלפים וארבעים"],
 ] as const;
 const SOURCE_HEBREW_OUTRO =
-  "מיכן ואילך צא וחשב מה שאין הפה יכול לדבר ומה שאין האוזן יכולה לשמוע";
-const SOURCE_TRANSLATION_INTRO = "How did he combine them";
+  "מכאן ואילך צא וחשב מה שאין הפה יכלה לדבר  ואין האוזן יכלה לשמוע";
 const SOURCE_TRANSLATION_ROWS = [
   ["two stones", "build", "two houses"],
   ["three", "build", "six"],
@@ -45,7 +43,7 @@ const SOURCE_TRANSLATION_ROWS = [
   ["seven", "build", "five thousand and forty"],
 ] as const;
 const SOURCE_TRANSLATION_OUTRO =
-  "From here on go out and ponder what the mouth cannot speak\nand what the ear cannot hear";
+  "From here on, go out and calculate what the mouth cannot speak\nand the ear cannot hear";
 type NValue = (typeof N_OPTIONS)[number];
 type Alphabet = "latin" | "hebrew";
 
@@ -256,7 +254,6 @@ function SourcePassage() {
   return (
     <figure className="max-w-4xl space-y-6 rounded-xl border border-border/70 bg-card/55 p-5">
       <blockquote dir="rtl" className="space-y-4 font-[family-name:var(--font-hebrew)] text-2xl leading-9 text-foreground">
-        <p>{SOURCE_HEBREW_INTRO}</p>
         <div className="grid w-fit grid-cols-[max-content_max-content_max-content] gap-x-4">
           {SOURCE_HEBREW_ROWS.map(([subject, verb, object]) => (
             <div key={subject} className="contents">
@@ -269,7 +266,6 @@ function SourcePassage() {
         <p>{SOURCE_HEBREW_OUTRO}</p>
       </blockquote>
       <figcaption className="max-w-3xl space-y-3 font-[family-name:var(--font-mystic)] text-xl leading-8 text-muted-foreground">
-        <p>{SOURCE_TRANSLATION_INTRO}</p>
         <div className="grid w-fit grid-cols-[max-content_max-content_max-content] gap-x-3">
           {SOURCE_TRANSLATION_ROWS.map(([subject, verb, object]) => (
             <div key={subject} className="contents">
