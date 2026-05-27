@@ -370,7 +370,10 @@ function WordLine({ line, alphabet }: { line: ZaksWord[]; alphabet: Alphabet }) 
           </span>
           <span
             dir={isHebrew ? "rtl" : "ltr"}
-            className={`text-2xl leading-8 text-foreground [unicode-bidi:isolate] ${
+            title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
+            className={`rounded-md border px-1.5 py-0.5 text-2xl leading-8 [unicode-bidi:isolate] ${parityClassName(
+              item.word
+            )} ${
               isHebrew
                 ? "font-[family-name:var(--font-hebrew)] font-medium"
                 : "font-[family-name:var(--font-mystic)]"
@@ -391,6 +394,12 @@ function WordLine({ line, alphabet }: { line: ZaksWord[]; alphabet: Alphabet }) 
   );
 }
 
+function parityClassName(word: string): string {
+  return isEvenPermutationWord(word)
+    ? "border-sky-300/50 bg-sky-500/12 text-sky-700 dark:border-sky-400/35 dark:bg-sky-400/15 dark:text-sky-200"
+    : "border-rose-300/50 bg-rose-500/12 text-rose-700 dark:border-rose-400/35 dark:bg-rose-400/15 dark:text-rose-200";
+}
+
 function letterClassName(stable: boolean[], index: number): string {
   if (!stable[index]) return "inline-block px-1";
 
@@ -398,12 +407,25 @@ function letterClassName(stable: boolean[], index: number): string {
   const endsRun = !stable[index + 1];
 
   return [
-    "inline-block px-1 bg-primary/15 text-primary",
+    "inline-block px-1 bg-current/10",
     startsRun ? "rounded-s" : "",
     endsRun ? "rounded-e" : "",
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+function isEvenPermutationWord(word: string): boolean {
+  let inversions = 0;
+  const letters = Array.from(word);
+
+  for (let i = 0; i < letters.length; i++) {
+    for (let j = i + 1; j < letters.length; j++) {
+      if (letters[i] > letters[j]) inversions++;
+    }
+  }
+
+  return inversions % 2 === 0;
 }
 
 function displayWord(word: string, alphabet: Alphabet): string {
