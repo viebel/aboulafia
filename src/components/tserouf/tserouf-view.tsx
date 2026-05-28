@@ -46,6 +46,7 @@ const SOURCE_TRANSLATION_OUTRO =
   "From here on, go out and calculate what the mouth cannot speak\nand the ear cannot hear";
 type NValue = (typeof N_OPTIONS)[number];
 type Alphabet = "latin" | "hebrew";
+type Layout = "flat" | "tree";
 
 interface ZaksWord {
   word: string;
@@ -65,9 +66,14 @@ interface TseroufBlock {
   lines: TseroufLine[];
 }
 
+type RecCell =
+  | { kind: "pair"; words: ZaksWord[] }
+  | { kind: "group"; level: number; children: RecCell[] };
+
 export function TseroufView() {
   const [n, setN] = useState<NValue>(3);
   const [alphabet, setAlphabet] = useState<Alphabet>("latin");
+  const [layout, setLayout] = useState<Layout>("flat");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
@@ -78,10 +84,13 @@ export function TseroufView() {
     [n]
   );
   const displayBaseWord = displayWord(baseWord, alphabet);
-  const wordBlocks = useMemo(() => blockWords(words, n), [n, words]);
+  const recursiveCell = useMemo(
+    () => (words.length > 0 ? buildRecursiveCells(words, n) : null),
+    [n, words]
+  );
   const clipboardText = useMemo(
-    () => enumerationClipboardText(wordBlocks, alphabet),
-    [alphabet, wordBlocks]
+    () => (recursiveCell ? enumerationClipboardText(recursiveCell, alphabet) : ""),
+    [alphabet, recursiveCell]
   );
 
   useEffect(() => {
@@ -193,6 +202,32 @@ export function TseroufView() {
             Show {alphabet === "latin" ? "Hebrew" : "Latin"} letters
           </Button>
 
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Layout
+            </Label>
+            <div className="grid grid-cols-2 gap-1 rounded-md border p-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={layout === "flat" ? "default" : "ghost"}
+                className="h-8"
+                onClick={() => setLayout("flat")}
+              >
+                Flat
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={layout === "tree" ? "default" : "ghost"}
+                className="h-8"
+                onClick={() => setLayout("tree")}
+              >
+                Tree
+              </Button>
+            </div>
+          </div>
+
           <Button
             type="button"
             variant="outline"
@@ -214,6 +249,10 @@ export function TseroufView() {
               value={alphabet === "hebrew" ? "Hebrew" : "Latin"}
             />
             <Stat label="Permutations" value={factorial(n)} />
+            <Stat
+              label="Layout"
+              value={layout === "tree" ? "Tree" : "Flat"}
+            />
             <Stat label="Algorithm" value="Zaks suffix" />
             <Stat label="Status" value={status} full />
           </dl>
@@ -227,22 +266,15 @@ export function TseroufView() {
               <Loader2 className="h-8 w-8 animate-spin" />
               <p className="text-sm">{status}</p>
             </div>
-          ) : (
-            <div className="flex flex-col items-start gap-5 font-mono text-sm">
-              {wordBlocks.map((block, blockIndex) => {
-                const toneStart = toneStartForBlock(wordBlocks, blockIndex, n);
-                return (
-                  <TseroufBlockView
-                    key={blockIndex}
-                    block={block}
-                    n={n}
-                    alphabet={alphabet}
-                    toneStart={toneStart}
-                  />
-                );
-              })}
+          ) : recursiveCell ? (
+            <div className="font-mono text-sm">
+              {layout === "tree" ? (
+                <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
+              ) : (
+                <FlatWordsView words={words} alphabet={alphabet} n={n} />
+              )}
             </div>
-          )}
+          ) : null}
         </CardContent>
       </Card>
       </div>
@@ -278,6 +310,203 @@ function SourcePassage() {
         <p className="whitespace-pre-line">{SOURCE_TRANSLATION_OUTRO}</p>
       </figcaption>
     </figure>
+  );
+}
+
+function buildRecursiveCells(words: ZaksWord[], level: number): RecCell {
+  if (level <= 2 || words.length <= 2) {
+    return { kind: "pair", words };
+  }
+  const childSize = factorial(level - 1);
+  const children: RecCell[] = [];
+  for (let i = 0; i < words.length; i += childSize) {
+    children.push(buildRecursiveCells(words.slice(i, i + childSize), level - 1));
+  }
+  return { kind: "group", level, children };
+}
+
+function TreeView({
+  cell,
+  alphabet,
+  n,
+}: {
+  cell: RecCell;
+  alphabet: Alphabet;
+  n: number;
+}) {
+  return (
+    <div className="tserouf-tree w-full overflow-x-auto pb-4">
+      <ul>
+        <TreeNode cell={cell} alphabet={alphabet} n={n} />
+      </ul>
+    </div>
+  );
+}
+
+function TreeNode({
+  cell,
+  alphabet,
+  n,
+}: {
+  cell: RecCell;
+  alphabet: Alphabet;
+  n: number;
+}) {
+  if (cell.kind === "pair") {
+    return (
+      <li>
+        <TreeLeaf words={cell.words} alphabet={alphabet} />
+      </li>
+    );
+  }
+
+  if (cell.level <= 3) {
+    return (
+      <li>
+        <TreeLeaf words={collectWords(cell)} alphabet={alphabet} />
+      </li>
+    );
+  }
+
+  const fixedLen = n - cell.level;
+  const sample = firstWordOf(cell);
+  const prefix = sample.slice(0, fixedLen);
+
+  return (
+    <li>
+      <TreeBranchLabel
+        prefix={prefix}
+        level={cell.level}
+        n={n}
+        alphabet={alphabet}
+      />
+      <ul>
+        {cell.children.map((child, i) => (
+          <TreeNode key={i} cell={child} alphabet={alphabet} n={n} />
+        ))}
+      </ul>
+    </li>
+  );
+}
+
+function TreeBranchLabel({
+  prefix,
+  level,
+  n,
+  alphabet,
+}: {
+  prefix: string;
+  level: number;
+  n: number;
+  alphabet: Alphabet;
+}) {
+  const isHebrew = alphabet === "hebrew";
+  const depth = n - level;
+  const alpha = Math.min(0.34, 0.07 + depth * 0.06);
+
+  return (
+    <span
+      className="relative z-10 inline-flex flex-col items-center gap-0.5"
+      title={prefix ? `Fixed prefix: ${displayWord(prefix, alphabet)}` : "Full set — no letter fixed yet"}
+    >
+      <span
+        className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border px-2 text-lg leading-none"
+        style={{
+          backgroundColor: `rgba(180, 120, 24, ${alpha})`,
+          borderColor: `rgba(120, 75, 15, ${Math.min(0.5, 0.15 + depth * 0.06)})`,
+        }}
+      >
+        {prefix ? (
+          <span
+            dir={isHebrew ? "rtl" : "ltr"}
+            className={`[unicode-bidi:isolate] ${
+              isHebrew
+                ? "font-[family-name:var(--font-hebrew)] font-medium"
+                : "font-[family-name:var(--font-mystic)]"
+            }`}
+          >
+            {displayWord(prefix, alphabet)}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">•</span>
+        )}
+      </span>
+      <span className="font-mono text-[10px] text-muted-foreground">
+        k={level}
+      </span>
+    </span>
+  );
+}
+
+function TreeLeaf({
+  words,
+  alphabet,
+}: {
+  words: ZaksWord[];
+  alphabet: Alphabet;
+}) {
+  const stable = stablePositions(words);
+  const isHebrew = alphabet === "hebrew";
+
+  return (
+    <div
+      dir={isHebrew ? "rtl" : "ltr"}
+      className="relative z-10 inline-flex flex-col items-center gap-1 rounded-md p-1.5"
+      style={{ backgroundColor: "rgba(180, 120, 24, 0.06)" }}
+    >
+      {words.map((item, i) => (
+        <WordTile
+          key={`${i}-${item.word}`}
+          item={item}
+          stable={stable}
+          alphabet={alphabet}
+        />
+      ))}
+    </div>
+  );
+}
+
+function firstWordOf(cell: RecCell): string {
+  let current = cell;
+  while (current.kind === "group") {
+    current = current.children[0];
+  }
+  return current.words[0]?.word ?? "";
+}
+
+function collectWords(cell: RecCell): ZaksWord[] {
+  if (cell.kind === "pair") return cell.words;
+  const out: ZaksWord[] = [];
+  for (const child of cell.children) out.push(...collectWords(child));
+  return out;
+}
+
+function FlatWordsView({
+  words,
+  alphabet,
+  n,
+}: {
+  words: ZaksWord[];
+  alphabet: Alphabet;
+  n: number;
+}) {
+  const wordBlocks = useMemo(() => blockWords(words, n), [n, words]);
+
+  return (
+    <div className="flex flex-col items-start gap-5 font-mono text-sm">
+      {wordBlocks.map((block, blockIndex) => {
+        const toneStart = toneStartForBlock(wordBlocks, blockIndex, n);
+        return (
+          <TseroufBlockView
+            key={blockIndex}
+            block={block}
+            n={n}
+            alphabet={alphabet}
+            toneStart={toneStart}
+          />
+        );
+      })}
+    </div>
   );
 }
 
@@ -354,39 +583,53 @@ function WordLine({ line, alphabet }: { line: ZaksWord[]; alphabet: Alphabet }) 
       className="flex flex-wrap gap-x-4 gap-y-4"
     >
       {line.map((item, itemIndex) => (
-        <span
+        <WordTile
           key={`${itemIndex}-${item.word}`}
-          className="inline-flex min-w-14 flex-col items-center leading-none"
-        >
-          <span
-            dir="ltr"
-            className="h-4 text-[11px] leading-4 text-muted-foreground"
-          >
-            {item.flip ?? ""}
-          </span>
-          <span
-            dir={isHebrew ? "rtl" : "ltr"}
-            title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
-            className={`rounded-md border px-1.5 py-0.5 text-2xl leading-8 [unicode-bidi:isolate] ${parityClassName(
-              item.word
-            )} ${
-              isHebrew
-                ? "font-[family-name:var(--font-hebrew)] font-medium"
-                : "font-[family-name:var(--font-mystic)]"
-            }`}
-          >
-            {Array.from(item.word).map((letter, index) => (
-              <span
-                key={index}
-                className={letterClassName(stable, index)}
-              >
-                {displayLetter(letter, alphabet)}
-              </span>
-            ))}
-          </span>
-        </span>
+          item={item}
+          stable={stable}
+          alphabet={alphabet}
+        />
       ))}
     </p>
+  );
+}
+
+function WordTile({
+  item,
+  stable,
+  alphabet,
+}: {
+  item: ZaksWord;
+  stable: boolean[];
+  alphabet: Alphabet;
+}) {
+  const isHebrew = alphabet === "hebrew";
+  return (
+    <span className="inline-flex min-w-14 flex-col items-center leading-none">
+      <span
+        dir="ltr"
+        className="h-4 text-[11px] leading-4 text-muted-foreground"
+      >
+        {item.flip ?? ""}
+      </span>
+      <span
+        dir={isHebrew ? "rtl" : "ltr"}
+        title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
+        className={`rounded-md border px-1.5 py-0.5 text-2xl leading-8 [unicode-bidi:isolate] ${parityClassName(
+          item.word
+        )} ${
+          isHebrew
+            ? "font-[family-name:var(--font-hebrew)] font-medium"
+            : "font-[family-name:var(--font-mystic)]"
+        }`}
+      >
+        {Array.from(item.word).map((letter, index) => (
+          <span key={index} className={letterClassName(stable, index)}>
+            {displayLetter(letter, alphabet)}
+          </span>
+        ))}
+      </span>
+    </span>
   );
 }
 
@@ -435,27 +678,29 @@ function displayLetter(letter: string, alphabet: Alphabet): string {
   return HEBREW_LETTERS[letter.charCodeAt(0) - 97] ?? letter;
 }
 
-function enumerationClipboardText(
-  blocks: TseroufBlock[],
-  alphabet: Alphabet
-): string {
-  const lines: string[] = [];
-
-  for (const block of blocks) {
-    if (lines.length > 0) lines.push("");
-
-    for (const line of block.lines) {
-      if (line.type === "spacer") {
-        lines.push("");
-      } else {
-        lines.push(
-          line.words.map((item) => displayWord(item.word, alphabet)).join(" ")
-        );
-      }
+function enumerationClipboardText(root: RecCell, alphabet: Alphabet): string {
+  const collectWords = (cell: RecCell, out: string[]): void => {
+    if (cell.kind === "pair") {
+      for (const item of cell.words) out.push(displayWord(item.word, alphabet));
+    } else {
+      for (const child of cell.children) collectWords(child, out);
     }
-  }
+  };
 
-  return lines.join("\n");
+  const format = (cell: RecCell): string => {
+    if (cell.kind === "pair") {
+      return cell.words.map((w) => displayWord(w.word, alphabet)).join(" ");
+    }
+    if (cell.level <= 3) {
+      const words: string[] = [];
+      collectWords(cell, words);
+      return words.join(" ");
+    }
+    const separator = "\n" + "\n".repeat(Math.min(cell.level - 3, 2));
+    return cell.children.map(format).join(separator);
+  };
+
+  return format(root);
 }
 
 async function copyTextToClipboard(text: string) {
@@ -537,6 +782,51 @@ function subblockUnits(lines: TseroufLine[]): TseroufRenderUnit[] {
   return units;
 }
 
+function blockWords(words: ZaksWord[], n: number): TseroufBlock[] {
+  const blockSize = factorial(Math.max(0, n - 1));
+  const blocks: TseroufBlock[] = [];
+
+  for (let start = 0; start < words.length; start += blockSize) {
+    const chunk = words.slice(start, start + blockSize);
+    const lines: TseroufLine[] = [];
+    let current: ZaksWord[] = [];
+
+    for (let offset = 0; offset < chunk.length; offset++) {
+      const item = chunk[offset];
+      current.push(item);
+
+      if (current.length === WORDS_PER_LINE) {
+        lines.push({ type: "words", words: current });
+        current = [];
+
+        const completedWords = start + offset + 1;
+        for (let i = 0; i < spacerCountAfter(completedWords, n); i++) {
+          lines.push({ type: "spacer" });
+        }
+      }
+    }
+
+    if (current.length > 0) lines.push({ type: "words", words: current });
+
+    blocks.push({
+      index: blocks.length + 1,
+      lines,
+    });
+  }
+
+  return blocks;
+}
+
+function spacerCountAfter(completedWords: number, n: number): number {
+  let count = 0;
+  for (let k = 4; k <= n; k++) {
+    if (completedWords % factorial(k - 1) === 0) {
+      count = k - 2;
+    }
+  }
+  return count;
+}
+
 async function suffixZaksCycle(
   n: number,
   signal?: AbortSignal
@@ -591,51 +881,6 @@ function lettersForPermutation(perm: Perm): string {
     s += String.fromCharCode(96 + perm[i]);
   }
   return s;
-}
-
-function blockWords(words: ZaksWord[], n: number): TseroufBlock[] {
-  const blockSize = factorial(Math.max(0, n - 1));
-  const blocks: TseroufBlock[] = [];
-
-  for (let start = 0; start < words.length; start += blockSize) {
-    const chunk = words.slice(start, start + blockSize);
-    const lines: TseroufLine[] = [];
-    let current: ZaksWord[] = [];
-
-    for (let offset = 0; offset < chunk.length; offset++) {
-      const item = chunk[offset];
-      current.push(item);
-
-      if (current.length === WORDS_PER_LINE) {
-        lines.push({ type: "words", words: current });
-        current = [];
-
-        const completedWords = start + offset + 1;
-        for (let i = 0; i < spacerCountAfter(completedWords, n); i++) {
-          lines.push({ type: "spacer" });
-        }
-      }
-    }
-
-    if (current.length > 0) lines.push({ type: "words", words: current });
-
-    blocks.push({
-      index: blocks.length + 1,
-      lines,
-    });
-  }
-
-  return blocks;
-}
-
-function spacerCountAfter(completedWords: number, n: number): number {
-  let count = 0;
-  for (let k = 4; k <= n; k++) {
-    if (completedWords % factorial(k - 1) === 0) {
-      count = k - 2;
-    }
-  }
-  return count;
 }
 
 function Stat({

@@ -128,3 +128,62 @@
     @apply font-sans;
   }
 }
+
+/* Top-down node-link tree (CSSTree technique) for the Tserouf recursive view. */
+.tserouf-tree ul {
+  position: relative;
+  padding: 1.5rem 0 0 0;
+  margin: 0;
+  list-style: none;
+  white-space: nowrap;
+  text-align: center;
+}
+.tserouf-tree li {
+  display: inline-block;
+  vertical-align: top;
+  text-align: center;
+  list-style: none;
+  position: relative;
+  padding: 1.5rem 0.5rem 0 0.5rem;
+}
+.tserouf-tree li::before,
+.tserouf-tree li::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 50%;
+  width: 50%;
+  height: 1.5rem;
+  border-top: 1px solid var(--border);
+}
+.tserouf-tree li::after {
+  right: auto;
+  left: 50%;
+  border-left: 1px solid var(--border);
+}
+.tserouf-tree li:only-child::before,
+.tserouf-tree li:only-child::after {
+  display: none;
+}
+.tserouf-tree li:only-child {
+  padding-top: 0;
+}
+.tserouf-tree li:first-child::before,
+.tserouf-tree li:last-child::after {
+  border: 0 none;
+}
+.tserouf-tree li:last-child::before {
+  border-right: 1px solid var(--border);
+}
+.tserouf-tree ul ul::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 0;
+  height: 1.5rem;
+  border-left: 1px solid var(--border);
+}
+.tserouf-tree > ul {
+  padding-top: 0;
+}
