@@ -65,6 +65,7 @@ export type GraphPreset =
   | "cyclic-adjacent"
   | "transposition"
   | "kaleidoscope"
+  | "lexicographic"
   | "hypercube";
 export type GraphKind =
   | "pancake"
@@ -73,6 +74,7 @@ export type GraphKind =
   | "cyclic-adjacent"
   | "transposition"
   | "kaleidoscope"
+  | "lexicographic"
   | "hypercube";
 
 export interface PancakeCycle {
@@ -210,6 +212,12 @@ export interface GeneratorInfo {
   parity: 0 | 1;
   /** Short, preset-specific label suitable for chips/buttons. */
   label: string;
+  /**
+   * Average angular distance (in degrees, 0..180) between the two endpoints of
+   * this generator's edges, measured along the circle on which vertices are
+   * placed in `path` order. Undefined when the generator has no edges.
+   */
+  avgArcDegrees?: number;
 }
 
 interface Generator {
@@ -272,6 +280,10 @@ export async function buildPancakeGraph(
   let edgeWriteIdx = 0;
   let evenEdgeCount = 0;
   let oddEdgeCount = 0;
+  // Per-generator accumulation of angular distance between connected vertices,
+  // measured as the shortest arc along the display circle (in index steps).
+  const arcStepSum = new Map<number, number>();
+  const arcCount = new Map<number, number>();
 
   onProgress?.("edges", 0, total);
   for (let i = 0; i < total; i++) {
@@ -281,6 +293,10 @@ export async function buildPancakeGraph(
         edges[edgeWriteIdx++] = i;
         edges[edgeWriteIdx++] = j;
         edges[edgeWriteIdx++] = generator.id;
+        const rawSteps = j - i;
+        const arcSteps = Math.min(rawSteps, total - rawSteps);
+        arcStepSum.set(generator.id, (arcStepSum.get(generator.id) ?? 0) + arcSteps);
+        arcCount.set(generator.id, (arcCount.get(generator.id) ?? 0) + 1);
         if ((vertexParity[i] ^ vertexParity[j]) === 0) {
           evenEdgeCount++;
         } else {
@@ -295,6 +311,14 @@ export async function buildPancakeGraph(
     }
   }
   onProgress?.("edges", total, total);
+
+  const degreesPerStep = 360 / total;
+  for (const info of generatorInfos) {
+    const count = arcCount.get(info.id) ?? 0;
+    if (count > 0) {
+      info.avgArcDegrees = (arcStepSum.get(info.id)! / count) * degreesPerStep;
+    }
+  }
 
   const rnIndices: number[] = [];
   if (kind === "pancake") {
@@ -351,14 +375,22 @@ function computeGeneratorInfos(
     return {
       id: gen.id,
       parity,
-      label: generatorLabel(gen.id, preset, n),
+      label: generatorLabel(gen.id, preset, n, result),
     };
   });
   infos.sort((a, b) => a.id - b.id);
   return infos;
 }
 
-function generatorLabel(id: number, preset: GraphPreset, n: number): string {
+function generatorLabel(
+  id: number,
+  preset: GraphPreset,
+  n: number,
+  result?: Perm
+): string {
+  if (preset === "lexicographic") {
+    return result ? permString(result) : String(id);
+  }
   if (preset === "pancake-zaks" || preset === "pancake-williams") {
     return String(id);
   }
@@ -450,6 +482,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Transposition graph";
     case "kaleidoscope":
       return "Kaleidoscope graph";
+    case "lexicographic":
+      return "Lexicographic graph";
     case "hypercube":
       return "Hypercube";
   }
@@ -471,6 +505,8 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "All transpositions (i, j)";
     case "kaleidoscope":
       return "Reverse any contiguous block";
+    case "lexicographic":
+      return "Lexicographic-successor generators Aₙ = {pᵢ⁻¹·pᵢ₊₁}";
     case "hypercube":
       return "Flip one bit";
   }
@@ -482,7 +518,11 @@ export function graphVertexCount(n: number, preset: GraphPreset): number {
 
 export function graphEdgeCount(n: number, preset: GraphPreset): number {
   if (preset === "hypercube") return n * 2 ** (n - 1);
-  if (preset === "kaleidoscope" || preset === "transposition") {
+  if (
+    preset === "kaleidoscope" ||
+    preset === "transposition" ||
+    preset === "lexicographic"
+  ) {
     return ((n * (n - 1)) / 2 * factorial(n)) / 2;
   }
   if (preset === "cyclic-adjacent") return (n * factorial(n)) / 2;
@@ -490,7 +530,11 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
 }
 
 export function graphMaxN(preset: GraphPreset): number {
-  return preset === "kaleidoscope" || preset === "transposition" ? 9 : 10;
+  return preset === "kaleidoscope" ||
+    preset === "transposition" ||
+    preset === "lexicographic"
+    ? 9
+    : 10;
 }
 
 function graphKind(preset: GraphPreset): GraphKind {
@@ -500,6 +544,7 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "cyclic-adjacent" ||
     preset === "transposition" ||
     preset === "kaleidoscope" ||
+    preset === "lexicographic" ||
     preset === "hypercube"
   ) {
     return preset;
@@ -566,6 +611,19 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
     }
     return generators;
   }
+  if (preset === "lexicographic") {
+    // Right-multiply by each distinct lexicographic-successor generator:
+    // (p·g)(k) = p(g(k)). The connection set Aₙ is closed under inverse,
+    // so the undirected edge dedup in buildPancakeGraph stays correct.
+    return lexicographicGenerators(n).map((g, idx) => ({
+      id: idx + 1,
+      apply: (p) => {
+        const q = new Uint8Array(n);
+        for (let k = 0; k < n; k++) q[k] = p[g[k] - 1];
+        return q;
+      },
+    }));
+  }
 
   return [];
 }
@@ -625,6 +683,44 @@ async function lexicographicOrder(
   }
   onProgress?.(total, total);
   return { path, flips: [] };
+}
+
+/**
+ * Lexicographic connection set of Sₙ.
+ *
+ * Enumerate Sₙ in lexicographic order p₁, …, p_{n!}. For each consecutive
+ * pair compute the generator gᵢ = pᵢ⁻¹·pᵢ₊₁, so that pᵢ₊₁ = pᵢ·gᵢ under right
+ * function composition (p·g)(k) = p(g(k)). Return the distinct generators in
+ * order of first appearance — only the set Aₙ = {gᵢ | 1 ≤ i < n!}, not a graph.
+ *
+ * Every lexicographic step changes only a suffix (the maximal decreasing run),
+ * so each generator fixes a prefix. Counting (suffix length, pivot rank) pairs
+ * gives exactly |Aₙ| = C(n, 2): |A₃| = 3, |A₄| = 6, |A₅| = 10, |A₆| = 15.
+ */
+export function lexicographicGenerators(n: number): Perm[] {
+  if (n < 2) return [];
+  const total = factorial(n);
+  const current = new Uint8Array(n);
+  for (let i = 0; i < n; i++) current[i] = i + 1;
+  const prev = new Uint8Array(current);
+
+  const inv = new Uint8Array(n + 1);
+  const seen = new Set<string>();
+  const generators: Perm[] = [];
+
+  for (let step = 1; step < total; step++) {
+    nextPermutation(current);
+    for (let j = 0; j < n; j++) inv[prev[j]] = j + 1;
+    const g = new Uint8Array(n);
+    for (let k = 0; k < n; k++) g[k] = inv[current[k]];
+    const gk = key(g);
+    if (!seen.has(gk)) {
+      seen.add(gk);
+      generators.push(g);
+    }
+    prev.set(current);
+  }
+  return generators;
 }
 
 async function johnsonTrotterOrder(

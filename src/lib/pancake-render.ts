@@ -47,28 +47,68 @@ export interface Palette {
 
 export const DEFAULT_PALETTE: Palette = {
   background: "#ffffff",
-  vertexFill: "#2a80c9",
+  vertexFill: "#666666",
   vertexStroke: "#111111",
   cayleyStroke: "#000000",
   // sky-500 / rose-500 — match the Tserouf parity coloring
   cayleyEvenStroke: "#0ea5e9",
   cayleyOddStroke: "#f43f5e",
-  cycleStroke: "#1f77b4",
+  cycleStroke: "#666666",
   labelFill: "#111111",
 };
 
 interface SizingConstants {
-  baseAlpha: number;
-  baseWidth: number;
   cycleWidth: number;
   vertexRadius: number;
 }
 
+const clamp = (v: number, lo: number, hi: number): number =>
+  v < lo ? lo : v > hi ? hi : v;
+
+/*
+ * Edge strength / width are driven entirely by the UI sliders (1..100).
+ * The mapping is exponential so a single slider spans the wide dynamic
+ * range needed across n: a dense pancake graph at n=10 needs ~30× thinner,
+ * far fainter strokes than a sparse graph at n=4. The component sets a
+ * density-appropriate slider value on each n/graph change; the user can
+ * then adjust from there.
+ *
+ * `*ToSlider` are the exact inverses of `sliderTo*`, so the recommended
+ * value the component computes round-trips back to the same effective
+ * style here.
+ */
+const EDGE_ALPHA_MIN = 0.05;
+const EDGE_ALPHA_MAX = 0.6;
+const EDGE_WIDTH_MIN = 0.04; // at scale = 1
+const EDGE_WIDTH_MAX = 2.0;
+
+export function sliderToEdgeAlpha(slider: number): number {
+  const t = clamp(slider, 1, 100) / 100;
+  return Math.min(
+    0.95,
+    EDGE_ALPHA_MIN * Math.pow(EDGE_ALPHA_MAX / EDGE_ALPHA_MIN, t)
+  );
+}
+
+export function edgeAlphaToSlider(alpha: number): number {
+  const a = clamp(alpha, EDGE_ALPHA_MIN, EDGE_ALPHA_MAX);
+  const t = Math.log(a / EDGE_ALPHA_MIN) / Math.log(EDGE_ALPHA_MAX / EDGE_ALPHA_MIN);
+  return clamp(Math.round(t * 100), 1, 100);
+}
+
+/** Returned width is at scale = 1; callers multiply by their render scale. */
+export function sliderToEdgeWidth(slider: number): number {
+  const t = clamp(slider, 1, 100) / 100;
+  return EDGE_WIDTH_MIN * Math.pow(EDGE_WIDTH_MAX / EDGE_WIDTH_MIN, t);
+}
+
+export function edgeWidthToSlider(width: number): number {
+  const w = clamp(width, EDGE_WIDTH_MIN, EDGE_WIDTH_MAX);
+  const t = Math.log(w / EDGE_WIDTH_MIN) / Math.log(EDGE_WIDTH_MAX / EDGE_WIDTH_MIN);
+  return clamp(Math.round(t * 100), 1, 100);
+}
+
 function constantsFor(n: number, scale: number): SizingConstants {
-  const baseAlpha =
-    n <= 5 ? 0.18 : n === 6 ? 0.22 : n === 7 ? 0.3 : n === 8 ? 0.13 : n === 9 ? 0.12 : 0.08;
-  const baseWidth =
-    n <= 5 ? 1.15 : n === 6 ? 0.65 : n === 7 ? 0.32 : n === 8 ? 0.095 : n === 9 ? 0.09 : 0.05;
   // For n >= 8 the per-segment arc length on the cycle is tiny, so we
   // need a thicker stroke to actually see the perimeter at typical
   // canvas sizes (~800 px).
@@ -77,7 +117,7 @@ function constantsFor(n: number, scale: number): SizingConstants {
   const vertexRadius =
     (n <= 4 ? 10 : n === 5 ? 4.4 : n === 6 ? 1.7 : n === 7 ? 0.9 : n === 8 ? 0.5 : n === 9 ? 0.35 : 0.2) *
     scale;
-  return { baseAlpha, baseWidth, cycleWidth, vertexRadius };
+  return { cycleWidth, vertexRadius };
 }
 
 function point(i: number, total: number, c: number, r: number): [number, number] {
@@ -136,10 +176,8 @@ export function drawToCanvas(
   const scale = size / 1000;
 
   const k = constantsFor(n, scale);
-  const a = settings.alpha / 100;
-  const ww = settings.width / 100;
-  const edgeAlpha = Math.min(0.95, k.baseAlpha * (0.3 + 2.4 * a));
-  const edgeWidth = k.baseWidth * (0.35 + 2.4 * ww) * scale;
+  const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
+  const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
 
   ctx.lineCap = "round";
 
@@ -150,7 +188,7 @@ export function drawToCanvas(
   if (settings.showCycle) {
     ctx.beginPath();
     ctx.arc(c, cy, r, 0, 2 * Math.PI);
-    ctx.strokeStyle = withAlpha(palette.cycleStroke, n <= 6 ? 0.85 : 0.55);
+    ctx.strokeStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
     ctx.lineWidth = k.cycleWidth;
     ctx.stroke();
   }
@@ -189,24 +227,14 @@ export function drawToCanvas(
   }
 
   if (settings.showVertices) {
-    ctx.fillStyle = withAlpha(palette.vertexFill, 0.85);
-    ctx.strokeStyle = palette.vertexStroke;
-    ctx.lineWidth = k.vertexRadius > 2 * dpr ? 0.8 * dpr : 0;
-    const showStroke = k.vertexRadius > 2 * dpr;
-    if (k.vertexRadius <= 1.5 * dpr) {
-      const dotSize = Math.max(1, k.vertexRadius * 2);
-      for (let i = 0; i < total; i++) {
-        const [x, y] = pointXY(i, total, c, cy, r);
-        ctx.fillRect(x - dotSize / 2, y - dotSize / 2, dotSize, dotSize);
-      }
-    } else {
-      for (let i = 0; i < total; i++) {
-        const [x, y] = pointXY(i, total, c, cy, r);
-        ctx.beginPath();
-        ctx.arc(x, y, k.vertexRadius, 0, 2 * Math.PI);
-        ctx.fill();
-        if (showStroke) ctx.stroke();
-      }
+    // Plain solid dots — same gray as the edges (color + alpha).
+    ctx.fillStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
+    const dotRadius = Math.max(0.5, k.vertexRadius);
+    for (let i = 0; i < total; i++) {
+      const [x, y] = pointXY(i, total, c, cy, r);
+      ctx.beginPath();
+      ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
+      ctx.fill();
     }
   }
 
@@ -303,10 +331,8 @@ export function toSVG(opts: SvgOpts): string {
   const scale = size / 1000;
 
   const k = constantsFor(n, scale);
-  const a = settings.alpha / 100;
-  const ww = settings.width / 100;
-  const edgeAlpha = Math.min(0.95, k.baseAlpha * (0.3 + 2.4 * a));
-  const edgeWidth = k.baseWidth * (0.35 + 2.4 * ww) * scale;
+  const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
+  const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
 
   const parts: string[] = [];
   parts.push(
@@ -319,7 +345,7 @@ export function toSVG(opts: SvgOpts): string {
   // perimeter, e.g. parity-preserving generators in pancake-Zaks).
   if (settings.showCycle) {
     parts.push(
-      `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cycleStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${n <= 6 ? 0.85 : 0.55}"/>`
+      `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`
     );
   }
 
@@ -348,16 +374,13 @@ export function toSVG(opts: SvgOpts): string {
   }
 
   if (settings.showVertices) {
-    const showStroke = k.vertexRadius > 2;
-    const strokeAttr = showStroke
-      ? ` stroke="${palette.vertexStroke}" stroke-width="0.8"`
-      : "";
+    const dotRadius = Math.max(0.5, k.vertexRadius);
     for (let i = 0; i < total; i++) {
       const [x, y] = point(i, total, c, r);
       parts.push(
-        `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${k.vertexRadius.toFixed(
+        `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotRadius.toFixed(
           2
-        )}" fill="${palette.vertexFill}"${strokeAttr} opacity="0.85"/>`
+        )}" fill="${palette.cayleyStroke}" fill-opacity="${edgeAlpha}"/>`
       );
     }
     if (settings.showLabels && n <= 5) {

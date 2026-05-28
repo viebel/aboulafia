@@ -31,6 +31,8 @@ import {
 } from "@/lib/pancake";
 import {
   drawToCanvas,
+  edgeAlphaToSlider,
+  edgeWidthToSlider,
   toSVG,
   type ParityMode,
   type RenderSettings,
@@ -48,6 +50,28 @@ import {
 
 const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 
+const SVG_VIEWBOX = 1200;
+
+/**
+ * Density-appropriate starting positions for the edge strength/width
+ * sliders. We pick a target effective style from the edge count and
+ * convert it to a slider value (1..100); the renderer maps the same
+ * slider value back to that style. Sparse graphs start strong and thick,
+ * dense graphs start faint and thin — and the user can adjust from there.
+ */
+function recommendedEdgeSliders(
+  n: number,
+  preset: GraphPreset
+): { alpha: number; width: number } {
+  const e = Math.max(1, graphEdgeCount(n, preset));
+  const targetAlpha = 2.4 / Math.pow(e, 0.2);
+  const targetWidth = 4.2 / Math.pow(e, 0.3);
+  return {
+    alpha: edgeAlphaToSlider(targetAlpha),
+    width: edgeWidthToSlider(targetWidth),
+  };
+}
+
 const N_OPTIONS = [3, 4, 5, 6, 7, 8, 9, 10] as const;
 type NValue = (typeof N_OPTIONS)[number];
 
@@ -59,14 +83,15 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "cyclic-adjacent",
   "transposition",
   "kaleidoscope",
+  "lexicographic",
   "hypercube",
 ];
 
 type Renderer = "svg" | "canvas";
 const MAX_INTERACTIVE_SVG_N = 8;
 const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 4;
-const ZOOM_STEP = 0.25;
+const MAX_ZOOM = 64;
+const ZOOM_FACTOR = 1.5;
 const WHEEL_LINE_HEIGHT = 16;
 const WHEEL_DELTA_LINE = 1;
 const WHEEL_DELTA_PAGE = 2;
@@ -98,8 +123,7 @@ export function PancakeGraphView() {
   const [running, setRunning] = useState(false);
 
   const [settings, setSettings] = useState<RenderSettings>({
-    alpha: 40,
-    width: 36,
+    ...recommendedEdgeSliders(6, "pancake-zaks"),
     showCayley: true,
     showCycle: true,
     showVertices: true,
@@ -136,6 +160,15 @@ export function PancakeGraphView() {
   );
 
   useEffect(() => {
+    // Switching graph or n changes the whole layout, so any prior
+    // zoom/pan no longer makes sense — snap the view back to fit.
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+    // Edge density changes too, so move the strength/width sliders to a
+    // density-appropriate recommendation for the new graph.
+    const rec = recommendedEdgeSliders(n, preset);
+    setSettings((s) => ({ ...s, alpha: rec.alpha, width: rec.width }));
+
     const ac = new AbortController();
     const signal = ac.signal;
 
@@ -242,11 +275,32 @@ export function PancakeGraphView() {
     const host = svgHostRef.current;
     if (!host || !graph) return;
     // Square SVG with a viewBox — CSS scales it to fill the stage.
-    const svg = toSVG({ graph, settings, size: 1200 });
+    const svg = toSVG({ graph, settings, size: SVG_VIEWBOX });
     host.innerHTML = svg
-      .replace('width="1200"', 'width="100%"')
-      .replace('height="1200"', 'height="100%"');
+      .replace(`width="${SVG_VIEWBOX}"`, 'width="100%"')
+      .replace(`height="${SVG_VIEWBOX}"`, 'height="100%"');
   }, [activeRenderer, graph, settings]);
+
+  // Zoom/pan for SVG are driven through the viewBox rather than a CSS
+  // transform: changing the viewBox re-rasterizes the vectors crisply at
+  // any zoom, whereas `transform: scale()` bitmap-scales a 100k-path SVG
+  // into a blur. This only mutates an attribute, so it is cheap enough to
+  // run on every zoom/pan tick without regenerating the path data.
+  useEffect(() => {
+    if (activeRenderer !== "svg") return;
+    const host = svgHostRef.current;
+    const svgEl = host?.querySelector("svg");
+    if (!svgEl) return;
+    const display = Math.min(stageSize.width, stageSize.height) || SVG_VIEWBOX;
+    const pxPerUnit = (display * zoom) / SVG_VIEWBOX;
+    const w = SVG_VIEWBOX / zoom;
+    const focusX = SVG_VIEWBOX / 2 - pan.x / pxPerUnit;
+    const focusY = SVG_VIEWBOX / 2 - pan.y / pxPerUnit;
+    svgEl.setAttribute(
+      "viewBox",
+      `${focusX - w / 2} ${focusY - w / 2} ${w} ${w}`
+    );
+  }, [activeRenderer, graph, settings, zoom, pan.x, pan.y, stageSize]);
 
   const downloadSVG = useCallback(() => {
     if (!graph) return;
@@ -342,11 +396,11 @@ export function PancakeGraphView() {
   };
 
   const zoomOut = () => {
-    setZoom((value) => Math.max(MIN_ZOOM, value - ZOOM_STEP));
+    setZoom((value) => Math.max(MIN_ZOOM, value / ZOOM_FACTOR));
   };
 
   const zoomIn = () => {
-    setZoom((value) => Math.min(MAX_ZOOM, value + ZOOM_STEP));
+    setZoom((value) => Math.min(MAX_ZOOM, value * ZOOM_FACTOR));
   };
 
   const resetView = () => {
@@ -660,6 +714,7 @@ export function PancakeGraphView() {
                       <GeneratorChip
                         key={gen.id}
                         label={gen.label}
+                        avgArcDegrees={gen.avgArcDegrees}
                         parity={gen.parity}
                         hidden={hidden}
                         onClick={() =>
@@ -678,7 +733,8 @@ export function PancakeGraphView() {
                   })}
                 </div>
                 <p className="text-[11px] leading-snug text-muted-foreground">
-                  Click a label to hide its edges.{" "}
+                  Click a label to hide its edges. The small degree value is the
+                  average arc between the points each generator connects.{" "}
                   <span style={{ color: "#0ea5e9" }}>blue</span> = even-parity
                   generator,{" "}
                   <span style={{ color: "#f43f5e" }}>red</span> = odd-parity.
@@ -768,10 +824,6 @@ export function PancakeGraphView() {
                   <div
                     ref={svgHostRef}
                     className="block h-full w-full [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
-                    style={{
-                      transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                      transformOrigin: "center",
-                    }}
                   />
                 )}
               </div>
@@ -913,11 +965,13 @@ function Stat({
 
 function GeneratorChip({
   label,
+  avgArcDegrees,
   parity,
   hidden,
   onClick,
 }: {
   label: string;
+  avgArcDegrees?: number;
   parity: 0 | 1;
   hidden: boolean;
   onClick: () => void;
@@ -926,16 +980,23 @@ function GeneratorChip({
     parity === 0
       ? "border-sky-500/40 text-sky-700 dark:text-sky-300"
       : "border-rose-500/40 text-rose-700 dark:text-rose-300";
+  const arcLabel =
+    avgArcDegrees === undefined ? undefined : `${Math.round(avgArcDegrees)}°`;
   return (
     <button
       type="button"
       onClick={onClick}
-      title={`${label} · ${parity === 0 ? "even" : "odd"} parity${hidden ? " · hidden" : ""}`}
-      className={`min-w-7 rounded-md border bg-background px-2 py-0.5 text-center font-mono text-xs leading-5 transition-opacity hover:opacity-100 ${colorClass} ${
+      title={`${label} · ${parity === 0 ? "even" : "odd"} parity${
+        arcLabel ? ` · avg arc ${avgArcDegrees!.toFixed(1)}°` : ""
+      }${hidden ? " · hidden" : ""}`}
+      className={`flex min-w-7 flex-col items-center rounded-md border bg-background px-2 py-0.5 text-center font-mono text-xs leading-5 transition-opacity hover:opacity-100 ${colorClass} ${
         hidden ? "opacity-30 line-through" : "opacity-100"
       }`}
     >
-      {label}
+      <span>{label}</span>
+      {arcLabel ? (
+        <span className="text-[9px] leading-none opacity-70">{arcLabel}</span>
+      ) : null}
     </button>
   );
 }
