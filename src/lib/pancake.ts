@@ -188,6 +188,28 @@ export interface PancakeGraph {
   edges: Uint32Array;
   /** Indices (along the selected cycle) of edges that are full-reversal rₙ flips. */
   rn: Uint32Array;
+  /**
+   * Parity per vertex (0 = even, 1 = odd).
+   * Permutation parity (number of inversions mod 2) for permutation graphs;
+   * Hamming-weight parity for the hypercube.
+   */
+  vertexParity: Uint8Array;
+  /** Edges connecting same-parity endpoints (parity-preserving generators). */
+  evenEdgeCount: number;
+  /** Edges connecting opposite-parity endpoints (parity-changing generators). */
+  oddEdgeCount: number;
+  /** Per-generator metadata, sorted by id. */
+  generators: GeneratorInfo[];
+}
+
+/** Display + parity info for a single Cayley generator. */
+export interface GeneratorInfo {
+  /** Stable id matching the third entry of each edge triple. */
+  id: number;
+  /** Parity of the generator as a permutation (or bit-flip for hypercube). */
+  parity: 0 | 1;
+  /** Short, preset-specific label suitable for chips/buttons. */
+  label: string;
 }
 
 interface Generator {
@@ -234,10 +256,22 @@ export async function buildPancakeGraph(
   for (let i = 0; i < total; i++) index.set(key(path[i]), i);
   throwIfAborted(signal);
 
+  onProgress?.("parity", 0, total);
+  const vertexParity = await computeVertexParity(
+    path,
+    preset === "hypercube",
+    (done, totalSteps) => onProgress?.("parity", done, totalSteps),
+    signal
+  );
+  throwIfAborted(signal);
+
   const generators = graphGenerators(n, preset);
+  const generatorInfos = computeGeneratorInfos(n, preset, generators);
   const edgeCount = (generators.length * total) / 2;
   const edges = new Uint32Array(edgeCount * 3);
   let edgeWriteIdx = 0;
+  let evenEdgeCount = 0;
+  let oddEdgeCount = 0;
 
   onProgress?.("edges", 0, total);
   for (let i = 0; i < total; i++) {
@@ -247,6 +281,11 @@ export async function buildPancakeGraph(
         edges[edgeWriteIdx++] = i;
         edges[edgeWriteIdx++] = j;
         edges[edgeWriteIdx++] = generator.id;
+        if ((vertexParity[i] ^ vertexParity[j]) === 0) {
+          evenEdgeCount++;
+        } else {
+          oddEdgeCount++;
+        }
       }
     }
     if ((i + 1) % 50_000 === 0) {
@@ -265,7 +304,134 @@ export async function buildPancakeGraph(
   }
   const rn = new Uint32Array(rnIndices);
 
-  return { n, preset, kind, order, path, flips, edges, rn };
+  return {
+    n,
+    preset,
+    kind,
+    order,
+    path,
+    flips,
+    edges,
+    rn,
+    vertexParity,
+    evenEdgeCount,
+    oddEdgeCount,
+    generators: generatorInfos,
+  };
+}
+
+function computeGeneratorInfos(
+  n: number,
+  preset: GraphPreset,
+  generators: Generator[]
+): GeneratorInfo[] {
+  const isHypercube = preset === "hypercube";
+  const identity = new Uint8Array(n);
+  if (!isHypercube) {
+    for (let i = 0; i < n; i++) identity[i] = i + 1;
+  }
+
+  const infos = generators.map((gen) => {
+    const result = gen.apply(identity);
+    let parity: 0 | 1 = 0;
+    if (isHypercube) {
+      let s = 0;
+      for (let i = 0; i < n; i++) s ^= result[i];
+      parity = (s & 1) as 0 | 1;
+    } else {
+      let par = 0;
+      for (let a = 0; a < n; a++) {
+        const va = result[a];
+        for (let b = a + 1; b < n; b++) {
+          if (va > result[b]) par ^= 1;
+        }
+      }
+      parity = par as 0 | 1;
+    }
+    return {
+      id: gen.id,
+      parity,
+      label: generatorLabel(gen.id, preset, n),
+    };
+  });
+  infos.sort((a, b) => a.id - b.id);
+  return infos;
+}
+
+function generatorLabel(id: number, preset: GraphPreset, n: number): string {
+  if (preset === "pancake-zaks" || preset === "pancake-williams") {
+    return String(id);
+  }
+  if (preset === "hypercube") {
+    return String(id);
+  }
+  if (preset === "star") {
+    return String(id);
+  }
+  if (preset === "permutohedron") {
+    return `s${id}`;
+  }
+  if (preset === "cyclic-adjacent") {
+    return id === n ? `s${n}` : `s${id}`;
+  }
+  if (preset === "transposition") {
+    const i = Math.floor(id / 100);
+    const j = id % 100;
+    return `${i},${j}`;
+  }
+  if (preset === "kaleidoscope") {
+    const i = Math.floor(id / 100);
+    const j = id % 100;
+    return `${i}–${j}`;
+  }
+  return String(id);
+}
+
+async function computeVertexParity(
+  path: Perm[],
+  isHypercube: boolean,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 100_000
+): Promise<Uint8Array> {
+  throwIfAborted(signal);
+  const total = path.length;
+  const parity = new Uint8Array(total);
+
+  if (isHypercube) {
+    for (let i = 0; i < total; i++) {
+      const v = path[i];
+      let s = 0;
+      for (let b = 0; b < v.length; b++) s ^= v[b];
+      parity[i] = s & 1;
+      if ((i + 1) % chunk === 0) {
+        onProgress?.(i + 1, total);
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+      }
+    }
+  } else {
+    for (let i = 0; i < total; i++) {
+      const v = path[i];
+      const len = v.length;
+      let par = 0;
+      for (let a = 0; a < len; a++) {
+        const va = v[a];
+        for (let b = a + 1; b < len; b++) {
+          if (va > v[b]) par ^= 1;
+        }
+      }
+      parity[i] = par;
+      if ((i + 1) % chunk === 0) {
+        onProgress?.(i + 1, total);
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+      }
+    }
+  }
+
+  onProgress?.(total, total);
+  return parity;
 }
 
 export function graphPresetLabel(preset: GraphPreset): string {

@@ -32,6 +32,7 @@ import {
 import {
   drawToCanvas,
   toSVG,
+  type ParityMode,
   type RenderSettings,
 } from "@/lib/pancake-render";
 import { AlertTriangle, Download, Loader2 } from "lucide-react";
@@ -61,8 +62,17 @@ interface RunMetrics {
   cayleyEdges: number;
   cycleEdges: number;
   rnEdges: number;
+  evenEdges: number;
+  oddEdges: number;
   elapsedMs: number;
 }
+
+const PARITY_MODE_LABELS: Record<ParityMode, string> = {
+  off: "Single color",
+  both: "Color by parity",
+  even: "Even only",
+  odd: "Odd only",
+};
 
 export function PancakeGraphView() {
   const [n, setN] = useState<NValue>(6);
@@ -80,6 +90,8 @@ export function PancakeGraphView() {
     showCycle: true,
     showVertices: true,
     showLabels: false,
+    parityMode: "off",
+    hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
 
@@ -119,19 +131,30 @@ export function PancakeGraphView() {
                 ? `Ordering vertices: ${NUMBER_FORMAT.format(done)} / ${NUMBER_FORMAT.format(total)} (${pct}%)`
                 : phase === "edges"
                   ? `Building edges: ${NUMBER_FORMAT.format(done)} / ${NUMBER_FORMAT.format(total)} (${pct}%)`
-                  : phase;
+                  : phase === "parity"
+                    ? `Computing parity: ${NUMBER_FORMAT.format(done)} / ${NUMBER_FORMAT.format(total)} (${pct}%)`
+                    : phase;
             setStatus(label);
           },
           signal
         );
         if (signal.aborted) return;
         setGraph(g);
+        // Different presets/n use different generator-id schemes — drop
+        // any stale hide-list so the new graph starts fully visible.
+        setSettings((s) =>
+          s.hiddenGenerators.length === 0
+            ? s
+            : { ...s, hiddenGenerators: [] }
+        );
         const elapsed = Math.round(performance.now() - t0);
         setMetrics({
           vertices: g.path.length,
           cayleyEdges: g.edges.length / 3,
           cycleEdges: g.flips.length,
           rnEdges: g.rn.length,
+          evenEdges: g.evenEdgeCount,
+          oddEdges: g.oddEdgeCount,
           elapsedMs: elapsed,
         });
         setStatus(`${graphPresetLabel(preset)} drawn.`);
@@ -185,20 +208,7 @@ export function PancakeGraphView() {
       cssHeight: height,
       dpr,
     });
-  }, [
-    activeRenderer,
-    graph,
-    settings,
-    settings.alpha,
-    settings.width,
-    settings.showCayley,
-    settings.showCycle,
-    settings.showVertices,
-    settings.showLabels,
-    stageSize,
-    stageSize.width,
-    stageSize.height,
-  ]);
+  }, [activeRenderer, graph, settings, stageSize]);
 
   useEffect(() => {
     if (activeRenderer !== "svg") return;
@@ -209,17 +219,7 @@ export function PancakeGraphView() {
     host.innerHTML = svg
       .replace('width="1200"', 'width="100%"')
       .replace('height="1200"', 'height="100%"');
-  }, [
-    activeRenderer,
-    graph,
-    settings,
-    settings.alpha,
-    settings.width,
-    settings.showCayley,
-    settings.showCycle,
-    settings.showVertices,
-    settings.showLabels,
-  ]);
+  }, [activeRenderer, graph, settings]);
 
   const downloadSVG = useCallback(() => {
     if (!graph) return;
@@ -403,6 +403,8 @@ export function PancakeGraphView() {
                 label="rₙ edges"
                 value={graph?.kind === "pancake" ? metrics?.rnEdges : "—"}
               />
+              <Stat label="Even edges" value={metrics?.evenEdges} />
+              <Stat label="Odd edges" value={metrics?.oddEdges} />
               <Stat
                 label="Time"
                 value={metrics ? `${NUMBER_FORMAT.format(metrics.elapsedMs)} ms` : undefined}
@@ -495,6 +497,108 @@ export function PancakeGraphView() {
 
             <div className="space-y-2">
               <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                Edge parity
+              </Label>
+              <Select
+                value={settings.parityMode}
+                onValueChange={(v) => setS("parityMode", v as ParityMode)}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(Object.keys(PARITY_MODE_LABELS) as ParityMode[]).map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      {PARITY_MODE_LABELS[mode]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <div className="grid grid-cols-2 gap-2 pt-0.5">
+                <ParityCount
+                  color="#0ea5e9"
+                  label="even"
+                  value={metrics?.evenEdges}
+                />
+                <ParityCount
+                  color="#f43f5e"
+                  label="odd"
+                  value={metrics?.oddEdges}
+                />
+              </div>
+              {settings.parityMode === "both" ? (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Even = same-parity endpoints (parity-preserving generators).
+                  Odd = opposite-parity endpoints. The rarer class is drawn on
+                  top.
+                </p>
+              ) : null}
+            </div>
+
+            {graph && graph.generators.length > 0 ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Generators
+                  </Label>
+                  <div className="flex gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+                    <button
+                      type="button"
+                      className="hover:text-foreground"
+                      onClick={() => setS("hiddenGenerators", [])}
+                    >
+                      all
+                    </button>
+                    <span className="opacity-40">·</span>
+                    <button
+                      type="button"
+                      className="hover:text-foreground"
+                      onClick={() =>
+                        setS(
+                          "hiddenGenerators",
+                          graph.generators.map((g) => g.id)
+                        )
+                      }
+                    >
+                      none
+                    </button>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {graph.generators.map((gen) => {
+                    const hidden = settings.hiddenGenerators.includes(gen.id);
+                    return (
+                      <GeneratorChip
+                        key={gen.id}
+                        label={gen.label}
+                        parity={gen.parity}
+                        hidden={hidden}
+                        onClick={() =>
+                          setSettings((s) => {
+                            const exists = s.hiddenGenerators.includes(gen.id);
+                            return {
+                              ...s,
+                              hiddenGenerators: exists
+                                ? s.hiddenGenerators.filter((id) => id !== gen.id)
+                                : [...s.hiddenGenerators, gen.id],
+                            };
+                          })
+                        }
+                      />
+                    );
+                  })}
+                </div>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Click a label to hide its edges.{" "}
+                  <span style={{ color: "#0ea5e9" }}>blue</span> = even-parity
+                  generator,{" "}
+                  <span style={{ color: "#f43f5e" }}>red</span> = odd-parity.
+                </p>
+              </div>
+            ) : null}
+
+            <div className="space-y-2">
+              <Label className="text-xs uppercase tracking-wider text-muted-foreground">
                 Export size
               </Label>
               <Select
@@ -567,7 +671,7 @@ export function PancakeGraphView() {
                   className="block h-full w-full [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
                 />
               )}
-              <div className="absolute left-3 top-3 flex items-center gap-2 rounded-md border bg-background/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
+              <div className="absolute left-3 top-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border bg-background/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
                 <span className="font-mono">n = {n}</span>
                 <span>·</span>
                 <span className="rounded border bg-muted px-1 py-px font-mono text-[10px] uppercase">
@@ -577,6 +681,31 @@ export function PancakeGraphView() {
                 <span className="rounded border bg-muted px-1 py-px font-mono text-[10px] uppercase">
                   {graphPresetLabel(preset)}
                 </span>
+                {metrics ? (
+                  <>
+                    <span>·</span>
+                    <span
+                      className="inline-flex items-center gap-1 font-mono"
+                      title="Parity-preserving edges (same-parity endpoints)"
+                    >
+                      <span
+                        className="inline-block h-2 w-2 rounded-full"
+                        style={{ backgroundColor: "#0ea5e9" }}
+                      />
+                      {NUMBER_FORMAT.format(metrics.evenEdges)} even
+                    </span>
+                    <span
+                      className="inline-flex items-center gap-1 font-mono"
+                      title="Parity-changing edges (opposite-parity endpoints)"
+                    >
+                      <span
+                        className="inline-block h-2 w-2 rounded-full"
+                        style={{ backgroundColor: "#f43f5e" }}
+                      />
+                      {NUMBER_FORMAT.format(metrics.oddEdges)} odd
+                    </span>
+                  </>
+                ) : null}
                 <span>·</span>
                 <span>{status}</span>
               </div>
@@ -642,6 +771,62 @@ function Stat({
             ? NUMBER_FORMAT.format(value)
             : value}
       </dd>
+    </div>
+  );
+}
+
+function GeneratorChip({
+  label,
+  parity,
+  hidden,
+  onClick,
+}: {
+  label: string;
+  parity: 0 | 1;
+  hidden: boolean;
+  onClick: () => void;
+}) {
+  const colorClass =
+    parity === 0
+      ? "border-sky-500/40 text-sky-700 dark:text-sky-300"
+      : "border-rose-500/40 text-rose-700 dark:text-rose-300";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={`${label} · ${parity === 0 ? "even" : "odd"} parity${hidden ? " · hidden" : ""}`}
+      className={`min-w-7 rounded-md border bg-background px-2 py-0.5 text-center font-mono text-xs leading-5 transition-opacity hover:opacity-100 ${colorClass} ${
+        hidden ? "opacity-30 line-through" : "opacity-100"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function ParityCount({
+  color,
+  label,
+  value,
+}: {
+  color: string;
+  label: string;
+  value: number | undefined;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-2 py-1">
+      <span
+        className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+      <div className="flex min-w-0 flex-col leading-tight">
+        <span className="font-mono text-sm">
+          {value === undefined ? "—" : NUMBER_FORMAT.format(value)}
+        </span>
+        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          {label}
+        </span>
+      </div>
     </div>
   );
 }

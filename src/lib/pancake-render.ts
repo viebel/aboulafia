@@ -13,6 +13,15 @@
 
 import type { PancakeGraph } from "./pancake";
 
+/**
+ * Edge coloring mode:
+ *   - "off"  → all edges share a single color (legacy behavior)
+ *   - "both" → edges colored by parity of their endpoints (two-pass)
+ *   - "even" → only parity-preserving (same-parity) edges are drawn
+ *   - "odd"  → only parity-changing (cross-parity) edges are drawn
+ */
+export type ParityMode = "off" | "both" | "even" | "odd";
+
 export interface RenderSettings {
   alpha: number;
   width: number;
@@ -20,6 +29,9 @@ export interface RenderSettings {
   showCycle: boolean;
   showVertices: boolean;
   showLabels: boolean;
+  parityMode: ParityMode;
+  /** Generator ids whose edges should be skipped at render time. */
+  hiddenGenerators: number[];
 }
 
 export interface Palette {
@@ -27,6 +39,8 @@ export interface Palette {
   vertexFill: string;
   vertexStroke: string;
   cayleyStroke: string;
+  cayleyEvenStroke: string;
+  cayleyOddStroke: string;
   cycleStroke: string;
   labelFill: string;
 }
@@ -36,6 +50,9 @@ export const DEFAULT_PALETTE: Palette = {
   vertexFill: "#2a80c9",
   vertexStroke: "#111111",
   cayleyStroke: "#000000",
+  // sky-500 / rose-500 — match the Tserouf parity coloring
+  cayleyEvenStroke: "#0ea5e9",
+  cayleyOddStroke: "#f43f5e",
   cycleStroke: "#1f77b4",
   labelFill: "#111111",
 };
@@ -108,34 +125,49 @@ export function drawToCanvas(
 
   ctx.lineCap = "round";
 
-  if (settings.showCayley && edges.length > 0) {
-    ctx.strokeStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
-    ctx.lineWidth = edgeWidth;
-
-    // Very large paths can be discarded by browser canvas implementations.
-    // Stroke in batches so P9/P10 do not build a multi-million segment path.
-    const batchSize = n >= 9 ? 15_000 : 60_000;
-    for (let start = 0; start < edges.length; start += batchSize * 3) {
-      const end = Math.min(edges.length, start + batchSize * 3);
-      ctx.beginPath();
-      for (let t = start; t < end; t += 3) {
-        const i = edges[t];
-        const j = edges[t + 1];
-        const [ax, ay] = pointXY(i, total, c, cy, r);
-        const [bx, by] = pointXY(j, total, c, cy, r);
-        ctx.moveTo(ax, ay);
-        ctx.lineTo(bx, by);
-      }
-      ctx.stroke();
-    }
-  }
-
+  // Draw the cycle first so edges paint over it. Many Cayley generators
+  // produce short chords that hug the perimeter; if the cycle were on top
+  // it would completely occlude them (the cycle stroke is wider than the
+  // chord deviation from the arc).
   if (settings.showCycle) {
     ctx.beginPath();
     ctx.arc(c, cy, r, 0, 2 * Math.PI);
     ctx.strokeStyle = withAlpha(palette.cycleStroke, n <= 6 ? 0.85 : 0.55);
     ctx.lineWidth = k.cycleWidth;
     ctx.stroke();
+  }
+
+  if (settings.showCayley && edges.length > 0) {
+    ctx.lineWidth = edgeWidth;
+    // Very large paths can be discarded by browser canvas implementations.
+    // Stroke in batches so P9/P10 do not build a multi-million segment path.
+    const batchSize = n >= 9 ? 15_000 : 60_000;
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+
+    const drawPass = (parityFilter: -1 | 0 | 1, color: string) => {
+      ctx.strokeStyle = withAlpha(color, edgeAlpha);
+      for (let start = 0; start < edges.length; start += batchSize * 3) {
+        const end = Math.min(edges.length, start + batchSize * 3);
+        ctx.beginPath();
+        for (let t = start; t < end; t += 3) {
+          const i = edges[t];
+          const j = edges[t + 1];
+          if (hidden && hidden.has(edges[t + 2])) continue;
+          if (parityFilter >= 0) {
+            const p = graph.vertexParity[i] ^ graph.vertexParity[j];
+            if (p !== parityFilter) continue;
+          }
+          const [ax, ay] = pointXY(i, total, c, cy, r);
+          const [bx, by] = pointXY(j, total, c, cy, r);
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(bx, by);
+        }
+        ctx.stroke();
+      }
+    };
+
+    const passes = parityPasses(settings.parityMode, graph, palette);
+    for (const pass of passes) drawPass(pass.filter, pass.color);
   }
 
   if (settings.showVertices) {
@@ -175,6 +207,39 @@ export function drawToCanvas(
 function pointXY(i: number, total: number, cx: number, cy: number, r: number): [number, number] {
   const a = (2 * Math.PI * i) / total;
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+}
+
+/**
+ * Return the per-parity stroke passes to perform for the given mode.
+ * Filter values: -1 = all edges, 0 = even (parity-preserving), 1 = odd.
+ *
+ * For the "both" mode we draw the majority class first and the minority on
+ * top, so the rare class is never painted over by the dominant one.
+ */
+function hiddenGeneratorSet(ids: number[] | undefined): Set<number> | null {
+  if (!ids || ids.length === 0) return null;
+  return new Set(ids);
+}
+
+function parityPasses(
+  mode: ParityMode,
+  graph: PancakeGraph,
+  palette: Palette
+): Array<{ filter: -1 | 0 | 1; color: string }> {
+  if (mode === "off") {
+    return [{ filter: -1, color: palette.cayleyStroke }];
+  }
+  if (mode === "even") {
+    return [{ filter: 0, color: palette.cayleyEvenStroke }];
+  }
+  if (mode === "odd") {
+    return [{ filter: 1, color: palette.cayleyOddStroke }];
+  }
+  const evenPass = { filter: 0 as const, color: palette.cayleyEvenStroke };
+  const oddPass = { filter: 1 as const, color: palette.cayleyOddStroke };
+  return graph.evenEdgeCount >= graph.oddEdgeCount
+    ? [evenPass, oddPass]
+    : [oddPass, evenPass];
 }
 
 function withAlpha(hex: string, alpha: number): string {
@@ -229,24 +294,37 @@ export function toSVG(opts: SvgOpts): string {
   );
   parts.push(`<rect width="100%" height="100%" fill="${palette.background}"/>`);
 
-  if (settings.showCayley && edges.length > 0) {
-    let d = "";
-    for (let t = 0; t < edges.length; t += 3) {
-      const i = edges[t];
-      const j = edges[t + 1];
-      const [ax, ay] = point(i, total, c, r);
-      const [bx, by] = point(j, total, c, r);
-      d += `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
-    }
-    parts.push(
-      `<path d="${d}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
-    );
-  }
-
+  // Cycle first, then edges, so chord strokes are not occluded by the
+  // wider cycle outline (especially important for short chords near the
+  // perimeter, e.g. parity-preserving generators in pancake-Zaks).
   if (settings.showCycle) {
     parts.push(
       `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cycleStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${n <= 6 ? 0.85 : 0.55}"/>`
     );
+  }
+
+  if (settings.showCayley && edges.length > 0) {
+    const passes = parityPasses(settings.parityMode, graph, palette);
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    for (const pass of passes) {
+      let d = "";
+      for (let t = 0; t < edges.length; t += 3) {
+        const i = edges[t];
+        const j = edges[t + 1];
+        if (hidden && hidden.has(edges[t + 2])) continue;
+        if (pass.filter >= 0) {
+          const p = graph.vertexParity[i] ^ graph.vertexParity[j];
+          if (p !== pass.filter) continue;
+        }
+        const [ax, ay] = point(i, total, c, r);
+        const [bx, by] = point(j, total, c, r);
+        d += `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
+      }
+      if (d.length === 0) continue;
+      parts.push(
+        `<path d="${d}" fill="none" stroke="${pass.color}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
+      );
+    }
   }
 
   if (settings.showVertices) {
