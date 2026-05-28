@@ -35,8 +35,16 @@ import {
   type ParityMode,
   type RenderSettings,
 } from "@/lib/pancake-render";
-import { AlertTriangle, Download, Loader2 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Download, Loader2, Minus, Plus, RotateCcw } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent,
+  type WheelEvent,
+} from "react";
 
 const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 
@@ -56,6 +64,12 @@ const GRAPH_PRESETS: GraphPreset[] = [
 
 type Renderer = "svg" | "canvas";
 const MAX_INTERACTIVE_SVG_N = 8;
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 4;
+const ZOOM_STEP = 0.25;
+const WHEEL_LINE_HEIGHT = 16;
+const WHEEL_DELTA_LINE = 1;
+const WHEEL_DELTA_PAGE = 2;
 
 interface RunMetrics {
   vertices: number;
@@ -94,10 +108,20 @@ export function PancakeGraphView() {
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
 
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const svgHostRef = useRef<HTMLDivElement>(null);
+  const panStartRef = useRef<{
+    pointerId: number;
+    x: number;
+    y: number;
+    panX: number;
+    panY: number;
+  } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
   const estimatedVertices = graphVertexCount(n, preset);
@@ -207,8 +231,11 @@ export function PancakeGraphView() {
       cssWidth: width,
       cssHeight: height,
       dpr,
+      zoom,
+      panX: pan.x,
+      panY: pan.y,
     });
-  }, [activeRenderer, graph, settings, stageSize]);
+  }, [activeRenderer, graph, settings, stageSize, pan.x, pan.y, zoom]);
 
   useEffect(() => {
     if (activeRenderer !== "svg") return;
@@ -312,6 +339,68 @@ export function PancakeGraphView() {
       setN(graphMaxN(nextPreset) as NValue);
       setRenderer("canvas");
     }
+  };
+
+  const zoomOut = () => {
+    setZoom((value) => Math.max(MIN_ZOOM, value - ZOOM_STEP));
+  };
+
+  const zoomIn = () => {
+    setZoom((value) => Math.min(MAX_ZOOM, value + ZOOM_STEP));
+  };
+
+  const resetView = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  const handlePanStart = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || zoom <= 1) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panStartRef.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      panX: pan.x,
+      panY: pan.y,
+    };
+    setIsPanning(true);
+  };
+
+  const handlePanMove = (event: PointerEvent<HTMLDivElement>) => {
+    const start = panStartRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    setPan({
+      x: start.panX + event.clientX - start.x,
+      y: start.panY + event.clientY - start.y,
+    });
+  };
+
+  const handlePanEnd = (event: PointerEvent<HTMLDivElement>) => {
+    const start = panStartRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    panStartRef.current = null;
+    setIsPanning(false);
+  };
+
+  const handleWheelPan = (event: WheelEvent<HTMLDivElement>) => {
+    if (zoom <= 1) return;
+    event.preventDefault();
+
+    const deltaMultiplier =
+      event.deltaMode === WHEEL_DELTA_LINE
+        ? WHEEL_LINE_HEIGHT
+        : event.deltaMode === WHEEL_DELTA_PAGE
+          ? Math.max(stageSize.height, WHEEL_LINE_HEIGHT)
+          : 1;
+
+    setPan((value) => ({
+      x: value.x - event.deltaX * deltaMultiplier,
+      y: value.y - event.deltaY * deltaMultiplier,
+    }));
   };
 
   const selectedPresetLabel = graphPresetLabel(preset);
@@ -663,14 +752,29 @@ export function PancakeGraphView() {
             </div>
           ) : (
             <>
-              {activeRenderer === "canvas" ? (
-                <canvas ref={canvasRef} className="block h-full w-full" />
-              ) : (
-                <div
-                  ref={svgHostRef}
-                  className="block h-full w-full [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
-                />
-              )}
+              <div
+                className={`absolute inset-0 touch-none ${
+                  zoom > 1 ? (isPanning ? "cursor-grabbing" : "cursor-grab") : ""
+                }`}
+                onPointerDown={handlePanStart}
+                onPointerMove={handlePanMove}
+                onPointerUp={handlePanEnd}
+                onPointerCancel={handlePanEnd}
+                onWheel={handleWheelPan}
+              >
+                {activeRenderer === "canvas" ? (
+                  <canvas ref={canvasRef} className="block h-full w-full" />
+                ) : (
+                  <div
+                    ref={svgHostRef}
+                    className="block h-full w-full [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
+                    style={{
+                      transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                      transformOrigin: "center",
+                    }}
+                  />
+                )}
+              </div>
               <div className="absolute left-3 top-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border bg-background/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
                 <span className="font-mono">n = {n}</span>
                 <span>·</span>
@@ -708,6 +812,38 @@ export function PancakeGraphView() {
                 ) : null}
                 <span>·</span>
                 <span>{status}</span>
+              </div>
+              <div className="absolute right-3 top-3 flex items-center gap-1 rounded-md border bg-background/90 p-1 text-xs text-muted-foreground shadow-sm backdrop-blur">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={zoomOut}
+                  disabled={zoom <= MIN_ZOOM}
+                  aria-label="Zoom out"
+                >
+                  <Minus className="h-3.5 w-3.5" />
+                </Button>
+                <span className="w-12 text-center font-mono">
+                  {Math.round(zoom * 100)}%
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={zoomIn}
+                  disabled={zoom >= MAX_ZOOM}
+                  aria-label="Zoom in"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={resetView}
+                  disabled={zoom === 1 && pan.x === 0 && pan.y === 0}
+                  aria-label="Reset zoom and pan"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                </Button>
               </div>
             </>
           )}

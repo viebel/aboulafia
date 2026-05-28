@@ -93,6 +93,9 @@ interface CanvasDrawOpts {
   cssWidth: number;
   cssHeight: number;
   dpr: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
   palette?: Palette;
 }
 
@@ -100,7 +103,17 @@ export function drawToCanvas(
   ctx: CanvasRenderingContext2D,
   opts: CanvasDrawOpts
 ): void {
-  const { graph, settings, cssWidth, cssHeight, dpr, palette = DEFAULT_PALETTE } = opts;
+  const {
+    graph,
+    settings,
+    cssWidth,
+    cssHeight,
+    dpr,
+    zoom = 1,
+    panX = 0,
+    panY = 0,
+    palette = DEFAULT_PALETTE,
+  } = opts;
   const { n, path, edges } = graph;
   const total = path.length;
 
@@ -110,6 +123,11 @@ export function drawToCanvas(
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = palette.background;
   ctx.fillRect(0, 0, w, h);
+
+  ctx.save();
+  ctx.translate(w / 2 + panX * dpr, h / 2 + panY * dpr);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-w / 2, -h / 2);
 
   const size = Math.min(w, h);
   const c = size / 2 + (w - size) / 2;
@@ -202,6 +220,8 @@ export function drawToCanvas(
       ctx.fillText(permLabel(path[i]), x, y);
     }
   }
+
+  ctx.restore();
 }
 
 function pointXY(i: number, total: number, cx: number, cy: number, r: number): [number, number] {
