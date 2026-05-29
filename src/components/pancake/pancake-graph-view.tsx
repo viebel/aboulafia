@@ -72,12 +72,36 @@ function recommendedEdgeSliders(
   };
 }
 
-const N_OPTIONS = [3, 4, 5, 6, 7, 8, 9, 10] as const;
-type NValue = (typeof N_OPTIONS)[number];
+// Values above 10 only apply to graphs that opt into them via graphMaxN
+// (currently the simplex, whose K_{n+1} stays tiny even at n = 40);
+// availableNOptions filters this list per preset.
+const N_OPTIONS: readonly number[] = Array.from(
+  { length: 38 },
+  (_, i) => i + 3
+);
+const DEFAULT_N = 6;
+
+/**
+ * Generators a freshly built graph should hide by default. Most graphs start
+ * fully visible (empty list). Pancake graphs use generator id = prefix-reversal
+ * length, and each generator is an involution, so it contributes a perfect
+ * matching of n!/2 chords. At large n even one matching nearly tiles the disk,
+ * so we keep only the full reversal rₙ (id = n) and hide every shorter
+ * reversal. The user can re-enable any of them from the generator chips.
+ */
+function defaultHiddenGenerators(graph: PancakeGraph): number[] {
+  if (graph.kind !== "pancake" || graph.n < 9) return [];
+  return graph.generators
+    .map((gen) => gen.id)
+    .filter((id) => id < graph.n);
+}
+type NValue = number;
 
 const GRAPH_PRESETS: GraphPreset[] = [
   "pancake-zaks",
   "pancake-williams",
+  "complete",
+  "cayley-complete",
   "star",
   "permutohedron",
   "cyclic-adjacent",
@@ -85,10 +109,11 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "kaleidoscope",
   "lexicographic",
   "hypercube",
+  "sliding-puzzle",
+  "simplex",
 ];
 
 type Renderer = "svg" | "canvas";
-const MAX_INTERACTIVE_SVG_N = 8;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 64;
 const ZOOM_FACTOR = 1.5;
@@ -114,7 +139,7 @@ const PARITY_MODE_LABELS: Record<ParityMode, string> = {
 };
 
 export function PancakeGraphView() {
-  const [n, setN] = useState<NValue>(6);
+  const [n, setN] = useState<NValue>(DEFAULT_N);
   const [preset, setPreset] = useState<GraphPreset>("pancake-zaks");
   const [renderer, setRenderer] = useState<Renderer>("svg");
   const [graph, setGraph] = useState<PancakeGraph | null>(null);
@@ -152,8 +177,11 @@ export function PancakeGraphView() {
   const estimatedEdges = graphEdgeCount(n, preset);
   const isHeavy = estimatedVertices >= 300_000 || estimatedEdges >= 1_000_000;
   const isVeryHeavy = estimatedVertices > 1_000_000 || estimatedEdges > 10_000_000;
-  const canUseInteractiveSvg = n <= MAX_INTERACTIVE_SVG_N;
-  const activeRenderer: Renderer = canUseInteractiveSvg ? renderer : "canvas";
+  // SVG is never blocked by graph size — the user can always opt into the
+  // vector renderer even for dense graphs (it may be slow, but that is their
+  // choice).
+  const canUseInteractiveSvg = true;
+  const activeRenderer: Renderer = renderer;
   const availableNOptions = useMemo(
     () => N_OPTIONS.filter((option) => option <= graphMaxN(preset)),
     [preset]
@@ -197,13 +225,16 @@ export function PancakeGraphView() {
         );
         if (signal.aborted) return;
         setGraph(g);
-        // Different presets/n use different generator-id schemes — drop
-        // any stale hide-list so the new graph starts fully visible.
-        setSettings((s) =>
-          s.hiddenGenerators.length === 0
-            ? s
-            : { ...s, hiddenGenerators: [] }
-        );
+        // Different presets/n use different generator-id schemes, so reset the
+        // hide-list to the new graph's default (empty for most graphs; the
+        // short reversals for large pancake graphs — see defaultHiddenGenerators).
+        setSettings((s) => {
+          const initialHidden = defaultHiddenGenerators(g);
+          const unchanged =
+            s.hiddenGenerators.length === initialHidden.length &&
+            s.hiddenGenerators.every((id, i) => id === initialHidden[i]);
+          return unchanged ? s : { ...s, hiddenGenerators: initialHidden };
+        });
         const elapsed = Math.round(performance.now() - t0);
         setMetrics({
           vertices: g.path.length,
@@ -368,7 +399,12 @@ export function PancakeGraphView() {
 
   const svgDownloadDisabled = useMemo(() => {
     if (!graph) return true;
-    return graph.kind !== "hypercube" && graph.n >= 9;
+    // Gate on vertex count rather than n: the sliding puzzle reaches millions
+    // of states at a small n, where an SVG file would be unusably large.
+    return (
+      graph.kind !== "hypercube" &&
+      graphVertexCount(graph.n, graph.preset) >= 300_000
+    );
   }, [graph]);
 
   const imageDownloadDisabled = !graph;
@@ -379,20 +415,15 @@ export function PancakeGraphView() {
   ) => setSettings((s) => ({ ...s, [key]: value }));
 
   const selectN = (value: string) => {
-    const nextN = Number(value) as NValue;
-    setN(nextN);
-    if (nextN > MAX_INTERACTIVE_SVG_N) {
-      setRenderer("canvas");
-    }
+    setN(Number(value) as NValue);
   };
 
   const selectPreset = (value: string) => {
     const nextPreset = value as GraphPreset;
     setPreset(nextPreset);
-    if (n > graphMaxN(nextPreset)) {
-      setN(graphMaxN(nextPreset) as NValue);
-      setRenderer("canvas");
-    }
+    // Switching graph family resets n to the default, clamped to the new
+    // preset's maximum (some presets, e.g. the sliding puzzle, top out lower).
+    setN(Math.min(DEFAULT_N, graphMaxN(nextPreset)) as NValue);
   };
 
   const zoomOut = () => {
@@ -491,7 +522,7 @@ export function PancakeGraphView() {
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent position="popper">
                   {GRAPH_PRESETS.map((option) => (
                     <SelectItem key={option} value={option}>
                       {graphPresetLabel(option)}
@@ -516,7 +547,7 @@ export function PancakeGraphView() {
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent position="popper">
                   {availableNOptions.map((opt) => (
                     <SelectItem key={opt} value={String(opt)}>
                       n = {opt} —{" "}
@@ -528,12 +559,12 @@ export function PancakeGraphView() {
               {isVeryHeavy ? (
                 <HeavyWarning
                   title="Massive graph"
-                  body={`${NUMBER_FORMAT.format(estimatedVertices)} vertices and about ${NUMBER_FORMAT.format(estimatedEdges)} edges. Canvas is used on-screen because SVG can freeze the browser.`}
+                  body={`${NUMBER_FORMAT.format(estimatedVertices)} vertices and about ${NUMBER_FORMAT.format(estimatedEdges)} edges. Canvas is recommended on-screen; SVG may freeze the browser at this size.`}
                 />
               ) : isHeavy ? (
                 <HeavyWarning
                   title="Heavy computation"
-                  body={`${NUMBER_FORMAT.format(estimatedVertices)} vertices and about ${NUMBER_FORMAT.format(estimatedEdges)} edges. Building the graph takes a few seconds; Canvas is used on-screen.`}
+                  body={`${NUMBER_FORMAT.format(estimatedVertices)} vertices and about ${NUMBER_FORMAT.format(estimatedEdges)} edges. Building the graph takes a few seconds; Canvas is recommended on-screen.`}
                 />
               ) : null}
             </div>
@@ -770,7 +801,7 @@ export function PancakeGraphView() {
                 disabled={running || svgDownloadDisabled}
                 title={
                   svgDownloadDisabled
-                    ? "SVG export is unavailable above P8 for this graph"
+                    ? "SVG export is unavailable for this many vertices"
                     : undefined
                 }
               >

@@ -6,11 +6,25 @@
  * hypercube has every n-bit string as a vertex. They differ by the generator
  * set used for edges.
  *
+ * The simplex (Kₙ₊₁) and complete (Kₙ) graphs are tiny by comparison: their
+ * vertices are single values placed on a regular polygon, joined by every
+ * possible chord.
+ *
+ * The sliding-puzzle graph is the state graph of the 15-puzzle and its
+ * generalizations: vertices are arrangements of 0,…,N-1 (0 = the blank) on a
+ * 2 × n grid (N = 2n cells), and edges slide a tile into the blank. Unlike the
+ * Cayley graphs above it is not regular (the blank in a corner has 2 moves, on
+ * an edge 3), so its generators have fixed points and its edge count is not
+ * generators × vertices / 2.
+ *
  * Permutations are stored as `Uint8Array` (1 byte per element) for
  * memory efficiency — at n = 10 we hold 10! = 3,628,800 of them.
  */
 
 export type Perm = Uint8Array<ArrayBuffer>;
+
+/** Rows of the sliding-puzzle grid; the n parameter is the number of columns. */
+const SLIDING_PUZZLE_ROWS = 2;
 
 export function factorial(n: number): number {
   let r = 1;
@@ -66,7 +80,11 @@ export type GraphPreset =
   | "transposition"
   | "kaleidoscope"
   | "lexicographic"
-  | "hypercube";
+  | "hypercube"
+  | "sliding-puzzle"
+  | "simplex"
+  | "complete"
+  | "cayley-complete";
 export type GraphKind =
   | "pancake"
   | "star"
@@ -75,7 +93,11 @@ export type GraphKind =
   | "transposition"
   | "kaleidoscope"
   | "lexicographic"
-  | "hypercube";
+  | "hypercube"
+  | "sliding-puzzle"
+  | "simplex"
+  | "complete"
+  | "cayley-complete";
 
 export interface PancakeCycle {
   order: PancakeOrder;
@@ -247,6 +269,12 @@ export async function buildPancakeGraph(
   const { path, flips } =
     preset === "hypercube"
       ? await hypercubeGrayOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
+      : preset === "sliding-puzzle"
+      ? await slidingPuzzleOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
+      : preset === "simplex"
+      ? await simplexOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
+      : preset === "complete"
+      ? await completeOrder(n, (done, total) => onProgress?.("cycle", done, total))
       : order === undefined
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
@@ -328,6 +356,13 @@ export async function buildPancakeGraph(
   }
   const rn = new Uint32Array(rnIndices);
 
+  // Non-regular graphs (e.g. the sliding puzzle, whose generators have fixed
+  // points when the blank is on a border) write fewer edges than the
+  // generators × vertices / 2 upper bound used for allocation. Trim the tail
+  // so consumers never see phantom (0,0,0) edges.
+  const trimmedEdges =
+    edgeWriteIdx === edges.length ? edges : edges.slice(0, edgeWriteIdx);
+
   return {
     n,
     preset,
@@ -335,7 +370,7 @@ export async function buildPancakeGraph(
     order,
     path,
     flips,
-    edges,
+    edges: trimmedEdges,
     rn,
     vertexParity,
     evenEdgeCount,
@@ -349,6 +384,19 @@ function computeGeneratorInfos(
   preset: GraphPreset,
   generators: Generator[]
 ): GeneratorInfo[] {
+  if (preset === "sliding-puzzle") {
+    // Every move swaps the blank with a neighbor — a transposition, hence
+    // odd. The identity-application trick below would not find a blank, so we
+    // assign parity directly.
+    const infos = generators.map((gen) => ({
+      id: gen.id,
+      parity: 1 as 0 | 1,
+      label: generatorLabel(gen.id, preset, n),
+    }));
+    infos.sort((a, b) => a.id - b.id);
+    return infos;
+  }
+
   const isHypercube = preset === "hypercube";
   const identity = new Uint8Array(n);
   if (!isHypercube) {
@@ -388,7 +436,7 @@ function generatorLabel(
   n: number,
   result?: Perm
 ): string {
-  if (preset === "lexicographic") {
+  if (preset === "lexicographic" || preset === "cayley-complete") {
     return result ? permString(result) : String(id);
   }
   if (preset === "pancake-zaks" || preset === "pancake-williams") {
@@ -399,6 +447,9 @@ function generatorLabel(
   }
   if (preset === "star") {
     return String(id);
+  }
+  if (preset === "sliding-puzzle") {
+    return id === 1 ? "↑" : id === 2 ? "↓" : id === 3 ? "←" : "→";
   }
   if (preset === "permutohedron") {
     return `s${id}`;
@@ -486,6 +537,14 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Lexicographic graph";
     case "hypercube":
       return "Hypercube";
+    case "sliding-puzzle":
+      return "Sliding puzzle (15-puzzle)";
+    case "simplex":
+      return "Simplex (Petrie polygon)";
+    case "complete":
+      return "Complete graph Kₙ";
+    case "cayley-complete":
+      return "Complete Cayley graph of Sₙ";
   }
 }
 
@@ -509,15 +568,38 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Lexicographic-successor generators Aₙ = {pᵢ⁻¹·pᵢ₊₁}";
     case "hypercube":
       return "Flip one bit";
+    case "sliding-puzzle":
+      return "Slide a tile into the blank on a 2 × n grid";
+    case "simplex":
+      return "Complete graph Kₙ₊₁ — n-simplex projected onto a regular (n+1)-gon with all diagonals";
+    case "complete":
+      return "Complete graph Kₙ — n vertices on a regular n-gon with every pair joined";
+    case "cayley-complete":
+      return "Cayley graph of Sₙ with every non-identity permutation as a generator — the complete graph K_{n!}";
   }
 }
 
 export function graphVertexCount(n: number, preset: GraphPreset): number {
+  if (preset === "sliding-puzzle") return factorial(SLIDING_PUZZLE_ROWS * n);
+  if (preset === "simplex") return n + 1;
+  if (preset === "complete") return n;
   return preset === "hypercube" ? 2 ** n : factorial(n);
 }
 
 export function graphEdgeCount(n: number, preset: GraphPreset): number {
+  if (preset === "simplex") return (n * (n + 1)) / 2;
+  if (preset === "complete") return (n * (n - 1)) / 2;
+  if (preset === "cayley-complete") {
+    const v = factorial(n);
+    return (v * (v - 1)) / 2;
+  }
   if (preset === "hypercube") return n * 2 ** (n - 1);
+  if (preset === "sliding-puzzle") {
+    // One state-graph edge per grid adjacency per blank placement on it:
+    // (grid edges) × (N - 1)!, with N = 2n cells and 3n - 2 grid edges.
+    const N = SLIDING_PUZZLE_ROWS * n;
+    return (3 * n - 2) * factorial(N - 1);
+  }
   if (
     preset === "kaleidoscope" ||
     preset === "transposition" ||
@@ -530,6 +612,18 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
 }
 
 export function graphMaxN(preset: GraphPreset): number {
+  // The puzzle has (2n)! states, so it hits the 10! ceiling already at n = 5
+  // (a 2 × 5 grid). The true 15-puzzle (4 × 4, 16!/2 ≈ 10¹³ states) is far
+  // beyond what can be enumerated here.
+  if (preset === "sliding-puzzle") return 5;
+  // K_{n+1} has only n+1 vertices and n(n+1)/2 edges, so the simplex stays
+  // cheap far past the permutation graphs' limits. Kₙ is just as cheap.
+  if (preset === "simplex") return 40;
+  if (preset === "complete") return 40;
+  // K_{n!} explodes fast: the generator set is S_n \ {id}, so edge-building
+  // is O((n!)²). n = 6 already gives 720 vertices, 719 generators, and
+  // ~259k edges; n = 7 would be 5040 vertices and ~12.7M edges, so cap here.
+  if (preset === "cayley-complete") return 6;
   return preset === "kaleidoscope" ||
     preset === "transposition" ||
     preset === "lexicographic"
@@ -545,7 +639,11 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "transposition" ||
     preset === "kaleidoscope" ||
     preset === "lexicographic" ||
-    preset === "hypercube"
+    preset === "hypercube" ||
+    preset === "sliding-puzzle" ||
+    preset === "simplex" ||
+    preset === "complete" ||
+    preset === "cayley-complete"
   ) {
     return preset;
   }
@@ -624,6 +722,98 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
       },
     }));
   }
+  if (preset === "sliding-puzzle") {
+    // 2 × n grid, cells indexed row-major. A move slides the blank (value 0)
+    // into an orthogonal neighbor. When the neighbor is off the grid the move
+    // is a no-op: returning `p` unchanged yields a fixed point that the edge
+    // builder skips, which is exactly how the puzzle's irregular degree arises.
+    const rows = SLIDING_PUZZLE_ROWS;
+    const cols = n;
+    const N = rows * cols;
+    const move = (dr: number, dc: number, id: number): Generator => ({
+      id,
+      apply: (p) => {
+        let blank = -1;
+        for (let i = 0; i < N; i++) {
+          if (p[i] === 0) {
+            blank = i;
+            break;
+          }
+        }
+        const r = Math.floor(blank / cols);
+        const c = blank % cols;
+        const nr = r + dr;
+        const nc = c + dc;
+        if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) return p;
+        return swap(p, blank, nr * cols + nc);
+      },
+    });
+    return [move(-1, 0, 1), move(1, 0, 2), move(0, -1, 3), move(0, 1, 4)];
+  }
+  if (preset === "simplex") {
+    // Petrie polygon of the n-simplex = complete graph K_{n+1}, realised as
+    // the Cayley graph of Z_{n+1} with the full connection set {1, …, n}.
+    // Generator k advances the vertex value by k (mod n+1); since every
+    // distinct pair of vertices differs by some k in {1, …, n}, every pair is
+    // adjacent — exactly the all-diagonals projection of the simplex.
+    const m = n + 1;
+    const generators: Generator[] = [];
+    for (let k = 1; k <= n; k++) {
+      generators.push({
+        id: k,
+        apply: (p) => {
+          const q = new Uint8Array(1);
+          q[0] = ((p[0] - 1 + k) % m) + 1;
+          return q;
+        },
+      });
+    }
+    return generators;
+  }
+  if (preset === "complete") {
+    // Complete graph Kₙ as the Cayley graph of Z_n with the full connection
+    // set {1, …, n-1}. Generator k advances the vertex value by k (mod n);
+    // since every distinct pair of vertices differs by some k in {1, …, n-1},
+    // every pair is adjacent. The connection set is closed under inverse
+    // (k ↔ n-k), so the undirected i < j dedup in buildPancakeGraph is exact.
+    const generators: Generator[] = [];
+    for (let k = 1; k <= n - 1; k++) {
+      generators.push({
+        id: k,
+        apply: (p) => {
+          const q = new Uint8Array(1);
+          q[0] = ((p[0] - 1 + k) % n) + 1;
+          return q;
+        },
+      });
+    }
+    return generators;
+  }
+  if (preset === "cayley-complete") {
+    // Cayley graph of Sₙ with the full connection set S_n \ {id}: right-
+    // multiply by every non-identity permutation g, (p·g)(k) = p(g(k)). For
+    // any two permutations p, q the element p⁻¹·q ≠ id is a generator, so
+    // every pair is adjacent — the complete graph K_{n!}. The set is closed
+    // under inverse, so the undirected i < j dedup in buildPancakeGraph is
+    // exact, and g ≠ id guarantees no fixed points (no self-loops).
+    const total = factorial(n);
+    const current = new Uint8Array(n);
+    for (let i = 0; i < n; i++) current[i] = i + 1;
+    const generators: Generator[] = [];
+    for (let step = 1; step < total; step++) {
+      nextPermutation(current);
+      const g = new Uint8Array(current);
+      generators.push({
+        id: step,
+        apply: (p) => {
+          const q = new Uint8Array(n);
+          for (let k = 0; k < n; k++) q[k] = p[g[k] - 1];
+          return q;
+        },
+      });
+    }
+    return generators;
+  }
 
   return [];
 }
@@ -680,6 +870,81 @@ async function lexicographicOrder(
       await yieldToEventLoop();
       throwIfAborted(signal);
     }
+  }
+  onProgress?.(total, total);
+  return { path, flips: [] };
+}
+
+/**
+ * All arrangements of {0,…,N-1} on the 2 × n puzzle grid (0 = blank), in
+ * lexicographic order. There is no natural Hamiltonian display cycle for the
+ * puzzle graph, so — like the lexicographic graph — we just enumerate states
+ * and leave `flips` empty.
+ */
+async function slidingPuzzleOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 50_000
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const N = SLIDING_PUZZLE_ROWS * n;
+  const total = factorial(N);
+  const current = new Uint8Array(N);
+  for (let i = 0; i < N; i++) current[i] = i;
+
+  const path: Perm[] = [new Uint8Array(current)];
+  for (let done = 1; done < total; done++) {
+    nextPermutation(current);
+    path.push(new Uint8Array(current));
+    if (done % chunk === 0) {
+      onProgress?.(done, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+  onProgress?.(total, total);
+  return { path, flips: [] };
+}
+
+/**
+ * The n+1 vertices of the simplex's Petrie polygon sit at the corners of a
+ * regular (n+1)-gon in value order, so placing path[i] uniformly on the circle
+ * reproduces the orthogonal projection. Vertices are length-1 Uint8Arrays
+ * holding 1..n+1.
+ */
+async function simplexOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const total = n + 1;
+  const path: Perm[] = [];
+  for (let i = 0; i < total; i++) {
+    const v = new Uint8Array(1);
+    v[0] = i + 1;
+    path.push(v);
+  }
+  onProgress?.(total, total);
+  return { path, flips: [] };
+}
+
+/**
+ * The n vertices of Kₙ sit at the corners of a regular n-gon in value order,
+ * so placing path[i] uniformly on the circle draws every pair of vertices
+ * joined by a straight chord. Vertices are length-1 Uint8Arrays holding 1..n.
+ */
+async function completeOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void
+): Promise<{ path: Perm[]; flips: number[] }> {
+  const total = n;
+  const path: Perm[] = [];
+  for (let i = 0; i < total; i++) {
+    const v = new Uint8Array(1);
+    v[0] = i + 1;
+    path.push(v);
   }
   onProgress?.(total, total);
   return { path, flips: [] };

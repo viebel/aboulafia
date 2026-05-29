@@ -125,6 +125,15 @@ function point(i: number, total: number, c: number, r: number): [number, number]
   return [c + r * Math.cos(a), c + r * Math.sin(a)];
 }
 
+/**
+ * The effective n for sizing/density heuristics. The sizing constants assume
+ * roughly n! vertices, but the sliding puzzle on a 2 × n grid has (2n)! of
+ * them, so it should be sized like a permutation graph of order 2n.
+ */
+function sizingN(graph: PancakeGraph): number {
+  return graph.kind === "sliding-puzzle" ? 2 * graph.n : graph.n;
+}
+
 /* --------------------------------- canvas --------------------------------- */
 
 interface CanvasDrawOpts {
@@ -154,7 +163,8 @@ export function drawToCanvas(
     panY = 0,
     palette = DEFAULT_PALETTE,
   } = opts;
-  const { n, path, edges } = graph;
+  const { path, edges } = graph;
+  const n = sizingN(graph);
   const total = path.length;
 
   const w = cssWidth * dpr;
@@ -324,7 +334,8 @@ interface SvgOpts {
  */
 export function toSVG(opts: SvgOpts): string {
   const { graph, settings, size, palette = DEFAULT_PALETTE } = opts;
-  const { n, path, edges } = graph;
+  const { path, edges } = graph;
+  const n = sizingN(graph);
   const total = path.length;
   const c = size / 2;
   const r = size * 0.405;
@@ -352,24 +363,34 @@ export function toSVG(opts: SvgOpts): string {
   if (settings.showCayley && edges.length > 0) {
     const passes = parityPasses(settings.parityMode, graph, palette);
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    // Match the canvas renderer: split chords into batched <path> elements
+    // rather than one giant path. A single semi-transparent path composites
+    // all its overlaps exactly once, flattening dense graphs into a solid
+    // fill. Emitting many batches lets opacity accumulate between them, which
+    // turns the overlap density into the same grayscale texture the canvas
+    // shows. Batch size matches drawToCanvas so both backends look identical.
+    const batchSize = n >= 9 ? 15_000 : 60_000;
     for (const pass of passes) {
-      let d = "";
-      for (let t = 0; t < edges.length; t += 3) {
-        const i = edges[t];
-        const j = edges[t + 1];
-        if (hidden && hidden.has(edges[t + 2])) continue;
-        if (pass.filter >= 0) {
-          const p = graph.vertexParity[i] ^ graph.vertexParity[j];
-          if (p !== pass.filter) continue;
+      for (let start = 0; start < edges.length; start += batchSize * 3) {
+        const end = Math.min(edges.length, start + batchSize * 3);
+        let d = "";
+        for (let t = start; t < end; t += 3) {
+          const i = edges[t];
+          const j = edges[t + 1];
+          if (hidden && hidden.has(edges[t + 2])) continue;
+          if (pass.filter >= 0) {
+            const p = graph.vertexParity[i] ^ graph.vertexParity[j];
+            if (p !== pass.filter) continue;
+          }
+          const [ax, ay] = point(i, total, c, r);
+          const [bx, by] = point(j, total, c, r);
+          d += `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
         }
-        const [ax, ay] = point(i, total, c, r);
-        const [bx, by] = point(j, total, c, r);
-        d += `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
+        if (d.length === 0) continue;
+        parts.push(
+          `<path d="${d}" fill="none" stroke="${pass.color}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
+        );
       }
-      if (d.length === 0) continue;
-      parts.push(
-        `<path d="${d}" fill="none" stroke="${pass.color}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
-      );
     }
   }
 
