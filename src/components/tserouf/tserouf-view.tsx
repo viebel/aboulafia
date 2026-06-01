@@ -17,7 +17,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { factorial, key, type Perm } from "@/lib/pancake";
-import { Loader2 } from "lucide-react";
+import { toPng } from "html-to-image";
+import { Download, Loader2 } from "lucide-react";
+import { useTheme } from "next-themes";
 import {
   createContext,
   Fragment,
@@ -112,6 +114,8 @@ export function TseroufView() {
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
   const [running, setRunning] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const renderRef = useRef<HTMLDivElement>(null);
 
   const hebrewLetters = useMemo(() => hebrewLettersFor(letterSet), [letterSet]);
   const baseWord = useMemo(
@@ -185,6 +189,44 @@ export function TseroufView() {
       window.setTimeout(() => setCopied(false), 1600);
     } catch (e) {
       setStatus(`Copy failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const downloadPNG = async () => {
+    const node = renderRef.current;
+    if (!node || words.length === 0) return;
+
+    setExporting(true);
+    setStatus("Generating PNG…");
+    const prevWidth = node.style.width;
+    try {
+      // Shrink the capture box to its content so each pre-chunked line stays on
+      // one row (no flex wrapping) and the left/right margins match.
+      node.style.width = "max-content";
+      const rect = node.getBoundingClientRect();
+      const background = getComputedStyle(document.body).backgroundColor;
+      const dataUrl = await toPng(node, {
+        pixelRatio: 2,
+        width: Math.ceil(rect.width),
+        height: Math.ceil(rect.height),
+        backgroundColor:
+          background && background !== "rgba(0, 0, 0, 0)" ? background : "#ffffff",
+        skipFonts: false,
+      });
+      const a = document.createElement("a");
+      a.href = dataUrl;
+      a.download = `tserouf_${baseWord}_${alphabet}_${layout}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setStatus("Tserouf PNG downloaded.");
+    } catch (e) {
+      setStatus(
+        `PNG export failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    } finally {
+      node.style.width = prevWidth;
+      setExporting(false);
     }
   };
 
@@ -310,6 +352,21 @@ export function TseroufView() {
             {copied ? "Copied" : "copy tserouf to clipboard"}
           </Button>
 
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            onClick={downloadPNG}
+            disabled={running || exporting || words.length === 0}
+          >
+            {exporting ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Download className="h-4 w-4" />
+            )}
+            {exporting ? "Exporting…" : "download tserouf as PNG"}
+          </Button>
+
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
             <Stat
               label="Word"
@@ -340,7 +397,7 @@ export function TseroufView() {
             </div>
           ) : recursiveCell ? (
             <HebrewLettersContext.Provider value={hebrewLetters}>
-              <div className="font-mono text-sm">
+              <div ref={renderRef} className="p-2 font-mono text-sm">
                 {layout === "tree" ? (
                   <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
                 ) : (
@@ -566,6 +623,10 @@ function FlatWordsView({
   const containerRef = useRef<HTMLDivElement>(null);
   const tilesRef = useRef<Map<string, HTMLElement>>(new Map());
   const [edges, setEdges] = useState<EdgeSpec[]>([]);
+  const [overlaySize, setOverlaySize] = useState<{ w: number; h: number }>({
+    w: 0,
+    h: 0,
+  });
 
   const register = useCallback<TileRegister>((word, el) => {
     if (el) tilesRef.current.set(word, el);
@@ -580,6 +641,7 @@ function FlatWordsView({
 
     const measure = () => {
       const cRect = container.getBoundingClientRect();
+      setOverlaySize({ w: cRect.width, h: cRect.height });
       const tiles = tilesRef.current;
       const specs: EdgeSpec[] = [];
       for (let i = 0; i < words.length - 1; i++) {
@@ -626,7 +688,7 @@ function FlatWordsView({
             />
           );
         })}
-        <EdgeOverlay edges={edges} />
+        <EdgeOverlay edges={edges} width={overlaySize.w} height={overlaySize.h} />
       </div>
     </TileRegisterContext.Provider>
   );
@@ -702,11 +764,31 @@ function trimTrailingSpacers(lines: TseroufLine[]): TseroufLine[] {
   return lines.slice(0, end);
 }
 
-function EdgeOverlay({ edges }: { edges: EdgeSpec[] }) {
+function EdgeOverlay({
+  edges,
+  width,
+  height,
+}: {
+  edges: EdgeSpec[];
+  width: number;
+  height: number;
+}) {
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === "dark";
+  const solidStroke = isDark
+    ? "rgba(252, 211, 77, 0.35)"
+    : "rgba(217, 119, 6, 0.45)";
+  const wrapStroke = isDark
+    ? "rgba(252, 211, 77, 0.25)"
+    : "rgba(245, 158, 11, 0.35)";
+  const labelFill = isDark ? "#fcd34d" : "#b45309";
+
   if (edges.length === 0) return null;
   return (
     <svg
       aria-hidden
+      width={width || undefined}
+      height={height || undefined}
       className="pointer-events-none absolute inset-0 z-30 h-full w-full overflow-visible"
     >
       {edges.map((edge, i) => (
@@ -717,11 +799,7 @@ function EdgeOverlay({ edges }: { edges: EdgeSpec[] }) {
           strokeWidth={1.5}
           strokeLinecap="round"
           strokeDasharray={edge.wrap ? "4 3" : undefined}
-          className={
-            edge.wrap
-              ? "stroke-amber-500/35 dark:stroke-amber-300/25"
-              : "stroke-amber-600/45 dark:stroke-amber-300/35"
-          }
+          stroke={edge.wrap ? wrapStroke : solidStroke}
         />
       ))}
       {edges.map((edge, i) =>
@@ -732,7 +810,7 @@ function EdgeOverlay({ edges }: { edges: EdgeSpec[] }) {
             y={edge.labelY}
             textAnchor="middle"
             dominantBaseline="central"
-            className="fill-amber-700 dark:fill-amber-300"
+            fill={labelFill}
             style={{
               fontSize: 10,
               fontFamily: "var(--font-mono)",
