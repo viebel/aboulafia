@@ -21,11 +21,13 @@ import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import {
   buildPancakeGraph,
+  EDGE_DISTANCE_BIN_DEGREES,
   graphEdgeCount,
   graphPresetDescription,
   graphPresetLabel,
   graphMaxN,
   graphVertexCount,
+  type EdgeDistanceBin,
   type PancakeGraph,
   type GraphPreset,
 } from "@/lib/pancake";
@@ -66,9 +68,13 @@ function recommendedEdgeSliders(
   const e = Math.max(1, graphEdgeCount(n, preset));
   const targetAlpha = 2.4 / Math.pow(e, 0.2);
   const targetWidth = 4.2 / Math.pow(e, 0.3);
+  const width =
+    n === 8 && (preset === "pancake-zaks" || preset === "pancake-williams")
+      ? 7
+      : edgeWidthToSlider(targetWidth);
   return {
     alpha: edgeAlphaToSlider(targetAlpha),
-    width: edgeWidthToSlider(targetWidth),
+    width,
   };
 }
 
@@ -85,12 +91,12 @@ const DEFAULT_N = 6;
  * Generators a freshly built graph should hide by default. Most graphs start
  * fully visible (empty list). Pancake graphs use generator id = prefix-reversal
  * length, and each generator is an involution, so it contributes a perfect
- * matching of n!/2 chords. At large n even one matching nearly tiles the disk,
- * so we keep only the full reversal rₙ (id = n) and hide every shorter
- * reversal. The user can re-enable any of them from the generator chips.
+ * matching of n!/2 chords. For n > 6 the graph builder only emits the full
+ * reversal rₙ (id = n) to avoid spending CPU on edges that would be hidden;
+ * this fallback keeps older/full graph payloads focused the same way.
  */
 function defaultHiddenGenerators(graph: PancakeGraph): number[] {
-  if (graph.kind !== "pancake" || graph.n < 9) return [];
+  if (graph.kind !== "pancake" || graph.n <= 6) return [];
   return graph.generators
     .map((gen) => gen.id)
     .filter((id) => id < graph.n);
@@ -490,6 +496,32 @@ export function PancakeGraphView() {
 
   const selectedPresetLabel = graphPresetLabel(preset);
   const selectedPresetDescription = graphPresetDescription(preset);
+  const selectedDistanceHistogram = useMemo(() => {
+    if (!graph) return [];
+    const hidden = new Set(settings.hiddenGenerators);
+    const totals = new Map<number, EdgeDistanceBin>();
+
+    for (const gen of graph.generators) {
+      if (hidden.has(gen.id)) continue;
+      for (const bin of gen.distanceBins ?? []) {
+        const existing = totals.get(bin.minDegrees);
+        if (existing) {
+          existing.count += bin.count;
+        } else {
+          totals.set(bin.minDegrees, { ...bin });
+        }
+      }
+    }
+
+    return Array.from(totals.values()).sort(
+      (a, b) => a.minDegrees - b.minDegrees
+    );
+  }, [graph, settings.hiddenGenerators]);
+  const selectedGeneratorCount = useMemo(() => {
+    if (!graph) return 0;
+    const hidden = new Set(settings.hiddenGenerators);
+    return graph.generators.filter((gen) => !hidden.has(gen.id)).length;
+  }, [graph, settings.hiddenGenerators]);
 
   return (
     <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
@@ -770,6 +802,10 @@ export function PancakeGraphView() {
                   generator,{" "}
                   <span style={{ color: "#f43f5e" }}>red</span> = odd-parity.
                 </p>
+                <DistanceHistogram
+                  bins={selectedDistanceHistogram}
+                  selectedGeneratorCount={selectedGeneratorCount}
+                />
               </div>
             ) : null}
 
@@ -1029,6 +1065,68 @@ function GeneratorChip({
         <span className="text-[9px] leading-none opacity-70">{arcLabel}</span>
       ) : null}
     </button>
+  );
+}
+
+function DistanceHistogram({
+  bins,
+  selectedGeneratorCount,
+}: {
+  bins: EdgeDistanceBin[];
+  selectedGeneratorCount: number;
+}) {
+  const maxCount = bins.reduce((max, bin) => Math.max(max, bin.count), 0);
+  const totalEdges = bins.reduce((sum, bin) => sum + bin.count, 0);
+
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <h3 className="text-xs font-medium">Edge distance histogram</h3>
+          <p className="text-[10px] text-muted-foreground">
+            {EDGE_DISTANCE_BIN_DEGREES}° bins · selected generators only
+          </p>
+        </div>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {selectedGeneratorCount} gen · {NUMBER_FORMAT.format(totalEdges)} edges
+        </span>
+      </div>
+
+      {selectedGeneratorCount === 0 ? (
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          Select at least one generator to see edge distances.
+        </p>
+      ) : bins.length === 0 ? (
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          No edge distance data for the selected generators.
+        </p>
+      ) : (
+        <div className="space-y-1">
+          {bins.map((bin) => {
+            const width = maxCount === 0 ? 0 : (bin.count / maxCount) * 100;
+            return (
+              <div
+                key={bin.minDegrees}
+                className="grid grid-cols-[4.5rem_minmax(0,1fr)_4rem] items-center gap-2 text-[10px]"
+              >
+                <span className="font-mono text-muted-foreground">
+                  {bin.minDegrees}–{bin.maxDegrees}°
+                </span>
+                <div className="h-2 overflow-hidden rounded-full bg-background">
+                  <div
+                    className="h-full rounded-full bg-primary/70"
+                    style={{ width: `${width}%` }}
+                  />
+                </div>
+                <span className="text-right font-mono text-muted-foreground">
+                  {NUMBER_FORMAT.format(bin.count)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 

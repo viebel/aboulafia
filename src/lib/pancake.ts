@@ -226,6 +226,15 @@ export interface PancakeGraph {
   generators: GeneratorInfo[];
 }
 
+export const EDGE_DISTANCE_BIN_DEGREES = 10;
+const EDGE_DISTANCE_BIN_COUNT = 180 / EDGE_DISTANCE_BIN_DEGREES;
+
+export interface EdgeDistanceBin {
+  minDegrees: number;
+  maxDegrees: number;
+  count: number;
+}
+
 /** Display + parity info for a single Cayley generator. */
 export interface GeneratorInfo {
   /** Stable id matching the third entry of each edge triple. */
@@ -240,6 +249,8 @@ export interface GeneratorInfo {
    * placed in `path` order. Undefined when the generator has no edges.
    */
   avgArcDegrees?: number;
+  /** Histogram of edge distances for this generator, bucketed in degrees. */
+  distanceBins?: EdgeDistanceBin[];
 }
 
 interface Generator {
@@ -312,6 +323,8 @@ export async function buildPancakeGraph(
   // measured as the shortest arc along the display circle (in index steps).
   const arcStepSum = new Map<number, number>();
   const arcCount = new Map<number, number>();
+  const arcBinCounts = new Map<number, Uint32Array>();
+  const degreesPerStep = 360 / total;
 
   onProgress?.("edges", 0, total);
   for (let i = 0; i < total; i++) {
@@ -323,6 +336,17 @@ export async function buildPancakeGraph(
         edges[edgeWriteIdx++] = generator.id;
         const rawSteps = j - i;
         const arcSteps = Math.min(rawSteps, total - rawSteps);
+        const arcDegrees = arcSteps * degreesPerStep;
+        const binIndex = Math.min(
+          EDGE_DISTANCE_BIN_COUNT - 1,
+          Math.floor(arcDegrees / EDGE_DISTANCE_BIN_DEGREES)
+        );
+        let bins = arcBinCounts.get(generator.id);
+        if (!bins) {
+          bins = new Uint32Array(EDGE_DISTANCE_BIN_COUNT);
+          arcBinCounts.set(generator.id, bins);
+        }
+        bins[binIndex]++;
         arcStepSum.set(generator.id, (arcStepSum.get(generator.id) ?? 0) + arcSteps);
         arcCount.set(generator.id, (arcCount.get(generator.id) ?? 0) + 1);
         if ((vertexParity[i] ^ vertexParity[j]) === 0) {
@@ -340,11 +364,21 @@ export async function buildPancakeGraph(
   }
   onProgress?.("edges", total, total);
 
-  const degreesPerStep = 360 / total;
   for (const info of generatorInfos) {
     const count = arcCount.get(info.id) ?? 0;
     if (count > 0) {
       info.avgArcDegrees = (arcStepSum.get(info.id)! / count) * degreesPerStep;
+      const bins = arcBinCounts.get(info.id);
+      if (bins) {
+        info.distanceBins = Array.from(bins, (binCount, index) => ({
+          minDegrees: index * EDGE_DISTANCE_BIN_DEGREES,
+          maxDegrees:
+            index === EDGE_DISTANCE_BIN_COUNT - 1
+              ? 180
+              : (index + 1) * EDGE_DISTANCE_BIN_DEGREES,
+          count: binCount,
+        })).filter((bin) => bin.count > 0);
+      }
     }
   }
 
@@ -607,6 +641,10 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
   ) {
     return ((n * (n - 1)) / 2 * factorial(n)) / 2;
   }
+  if (preset === "pancake-zaks" || preset === "pancake-williams") {
+    const generatorCount = n > 6 ? 1 : n - 1;
+    return (generatorCount * factorial(n)) / 2;
+  }
   if (preset === "cyclic-adjacent") return (n * factorial(n)) / 2;
   return ((n - 1) * factorial(n)) / 2;
 }
@@ -653,7 +691,10 @@ function graphKind(preset: GraphPreset): GraphKind {
 function graphGenerators(n: number, preset: GraphPreset): Generator[] {
   if (preset.startsWith("pancake")) {
     const generators: Generator[] = [];
-    for (let k = 2; k <= n; k++) generators.push({ id: k, apply: (p) => flip(p, k) });
+    const firstGenerator = n > 6 ? n : 2;
+    for (let k = firstGenerator; k <= n; k++) {
+      generators.push({ id: k, apply: (p) => flip(p, k) });
+    }
     return generators;
   }
   if (preset === "star") {
