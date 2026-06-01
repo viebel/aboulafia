@@ -39,10 +39,15 @@ export function key(p: Perm): string {
   return s;
 }
 
-/** Reverse the first k elements of p, returning a new Uint8Array. */
+/**
+ * Reverse the last k elements of p (the Zaks 1984 suffix reversal), returning
+ * a new Uint8Array. A suffix reversal of length k < n leaves the leading n-k
+ * symbols fixed, which is why the recursive block decomposition groups by the
+ * first symbols.
+ */
 export function flip(p: Perm, k: number): Perm {
   const q = new Uint8Array(p);
-  for (let i = 0, j = k - 1; i < j; i++, j--) {
+  for (let i = q.length - k, j = q.length - 1; i < j; i++, j--) {
     const t = q[i];
     q[i] = q[j];
     q[j] = t;
@@ -103,19 +108,20 @@ export interface PancakeCycle {
   order: PancakeOrder;
   /** The visited permutations, in cycle order (length = n!). */
   path: Perm[];
-  /** flips[s] is the prefix size used to go from path[s] to path[s+1].
+  /** flips[s] is the suffix size used to go from path[s] to path[s+1].
    *  The final entry closes the cycle (path[n!-1] → path[0]). */
   flips: number[];
 }
 
 /**
  * Walk the pancake graph greedily, taking either the smallest (Zaks) or
- * largest (Williams) available prefix flip that leads somewhere new.
+ * largest (Williams) available suffix reversal that leads somewhere new.
+ * The smallest-first variant is exactly Zaks' original 1984 ordering.
  *
  * Yields control back to the event loop every `chunk` iterations so
  * the UI stays responsive even for large n.
  */
-export async function prefixReversalCycle(
+export async function suffixReversalCycle(
   n: number,
   order: PancakeOrder,
   onProgress?: (done: number, total: number) => void,
@@ -184,7 +190,7 @@ export async function zaksCycle(
   signal?: AbortSignal,
   chunk = 50_000
 ): Promise<PancakeCycle> {
-  return prefixReversalCycle(n, "zaks", onProgress, signal, chunk);
+  return suffixReversalCycle(n, "zaks", onProgress, signal, chunk);
 }
 
 export async function williamsCycle(
@@ -193,7 +199,7 @@ export async function williamsCycle(
   signal?: AbortSignal,
   chunk = 50_000
 ): Promise<PancakeCycle> {
-  return prefixReversalCycle(n, "williams", onProgress, signal, chunk);
+  return suffixReversalCycle(n, "williams", onProgress, signal, chunk);
 }
 
 export interface PancakeGraph {
@@ -224,6 +230,239 @@ export interface PancakeGraph {
   oddEdgeCount: number;
   /** Per-generator metadata, sorted by id. */
   generators: GeneratorInfo[];
+}
+
+/**
+ * A coarsened ("quotient") view of a permutation graph.
+ *
+ * Every permutation is collapsed into the block of permutations sharing its
+ * first `depth` symbols — the coset of the subgroup fixing those leading
+ * positions. With Zaks suffix-reversal semantics this is the recursive
+ * decomposition Pₙ = (blocks, each an isomorphic copy of Pₙ₋d): the short
+ * suffix reversals r₂…rₙ₋d fix the prefix and stay inside a block (intra-block
+ * / self weight), while the longer reversals change a leading symbol and cross
+ * between blocks (inter-block super-edges).
+ *
+ * Collapsing millions of chords into a few hundred weighted super-edges turns
+ * the saturated "black disk" into a readable diagram of the block structure.
+ */
+export interface QuotientGraph {
+  n: number;
+  preset: GraphPreset;
+  /** Number of leading symbols held fixed within a block (1 ≤ depth ≤ n-1). */
+  depth: number;
+  /** Number of blocks = n·(n-1)···(n-depth+1). */
+  blockCount: number;
+  /**
+   * Leading-symbol tuple per block, row-major in display order: for block b,
+   * the symbols at positions [0, …, depth-1] are blockKey[b*depth … b*depth+depth-1].
+   * The first entry of each row is the leading symbol (the primary clustering key).
+   */
+  blockKey: Uint8Array;
+  /**
+   * Inter-block edges, sorted ascending by weight so heavy edges paint last.
+   * Flat triples [blockA, blockB, weight] with blockA < blockB.
+   */
+  superEdges: Float64Array;
+  /** Intra-block (self-loop) edge weight per block, in display order. */
+  selfWeight: Float64Array;
+  maxSuperWeight: number;
+  maxSelfWeight: number;
+  /** Number of inter-block super-edges (superEdges.length / 3). */
+  totalSuperEdges: number;
+}
+
+/**
+ * Presets whose vertices are full permutations of 1..n and therefore admit a
+ * leading-symbol coset quotient. Excludes the hypercube (bit strings), sliding
+ * puzzle, and the single-value polygon graphs (simplex / complete).
+ */
+export function supportsQuotient(preset: GraphPreset): boolean {
+  return (
+    preset === "pancake-zaks" ||
+    preset === "pancake-williams" ||
+    preset === "star" ||
+    preset === "permutohedron" ||
+    preset === "cyclic-adjacent" ||
+    preset === "transposition" ||
+    preset === "kaleidoscope" ||
+    preset === "lexicographic" ||
+    preset === "cayley-complete"
+  );
+}
+
+/**
+ * Quotient depths available for a graph: 1 … n-2. Depth n-1 is degenerate —
+ * the first n-1 symbols determine the whole permutation, so every block would
+ * hold a single vertex and the quotient would just be the original graph.
+ * Deep levels on large n produce very many blocks and render slowly.
+ */
+export function quotientDepthOptions(n: number, preset: GraphPreset): number[] {
+  if (!supportsQuotient(preset)) return [];
+  const opts: number[] = [];
+  for (let d = 1; d <= n - 2; d++) opts.push(d);
+  return opts;
+}
+
+/**
+ * Build the leading-symbol coset quotient of a permutation graph at the given
+ * depth: blocks group permutations sharing their first `depth` symbols.
+ *
+ * Pancake presets deliberately use the FULL suffix-reversal set r₂…rₙ here,
+ * even though `buildPancakeGraph` only materializes rₙ for n > 6: the shorter
+ * reversals are precisely the intra-block edges that reveal the recursion, and
+ * the quotient only needs per-block counts, so it never stores n! edges.
+ */
+export async function buildQuotientGraph(
+  graph: PancakeGraph,
+  depth: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal
+): Promise<QuotientGraph> {
+  throwIfAborted(signal);
+  const { n, preset, path } = graph;
+  if (!supportsQuotient(preset)) {
+    throw new Error(`Quotient view is not available for ${graphPresetLabel(preset)}.`);
+  }
+  if (depth < 1 || depth > n - 1) {
+    throw new Error(`Quotient depth must be between 1 and ${n - 1}.`);
+  }
+
+  const radix = n + 1;
+  // Encode a leading-symbol tuple (position order s₀…s_{depth-1}) as an integer.
+  const codeOf = (vals: ArrayLike<number>): number => {
+    let c = 0;
+    for (let t = 0; t < depth; t++) c = c * radix + vals[t];
+    return c;
+  };
+
+  // Enumerate every injective depth-tuple, then order blocks so that the
+  // leading symbol is the most significant key — this lays blocks sharing a
+  // first symbol (one Pₙ₋₁ copy) on a contiguous arc, exposing the recursion.
+  const tuples: number[][] = [];
+  const cur = new Array<number>(depth);
+  const used = new Uint8Array(n + 1);
+  const enumerate = (pos: number): void => {
+    if (pos === depth) {
+      tuples.push(cur.slice());
+      return;
+    }
+    for (let v = 1; v <= n; v++) {
+      if (used[v]) continue;
+      used[v] = 1;
+      cur[pos] = v;
+      enumerate(pos + 1);
+      used[v] = 0;
+    }
+  };
+  enumerate(0);
+  tuples.sort((a, b) => {
+    for (let t = 0; t < depth; t++) {
+      if (a[t] !== b[t]) return a[t] - b[t];
+    }
+    return 0;
+  });
+
+  const blockCount = tuples.length;
+  const blockKey = new Uint8Array(blockCount * depth);
+  const codeToIndex = new Map<number, number>();
+  for (let b = 0; b < blockCount; b++) {
+    const tup = tuples[b];
+    for (let t = 0; t < depth; t++) blockKey[b * depth + t] = tup[t];
+    codeToIndex.set(codeOf(tup), b);
+  }
+
+  const selfOrdered = new Float64Array(blockCount);
+  const superMap = new Map<number, number>();
+
+  const total = path.length;
+  const isPancake = preset === "pancake-zaks" || preset === "pancake-williams";
+  const genApplies = isPancake
+    ? []
+    : graphGenerators(n, preset).map((g) => g.apply);
+  const keyVals = new Array<number>(depth);
+
+  const accumulate = (vIndex: number, nIndex: number): void => {
+    if (nIndex === vIndex) {
+      selfOrdered[vIndex] += 1;
+      return;
+    }
+    const a = vIndex < nIndex ? vIndex : nIndex;
+    const b = vIndex < nIndex ? nIndex : vIndex;
+    const k = a * blockCount + b;
+    superMap.set(k, (superMap.get(k) ?? 0) + 1);
+  };
+
+  onProgress?.(0, total);
+  for (let i = 0; i < total; i++) {
+    const p = path[i];
+    for (let t = 0; t < depth; t++) keyVals[t] = p[t];
+    const vIndex = codeToIndex.get(codeOf(keyVals))!;
+
+    if (isPancake) {
+      // Neighbor under the suffix reversal r_k = flip(p, k), which reverses the
+      // last k entries. A leading position pos is unchanged when it sits before
+      // the reversed suffix (pos < n-k); inside it, pos maps to p[2n-k-1-pos].
+      for (let kk = 2; kk <= n; kk++) {
+        const lo = n - kk;
+        for (let t = 0; t < depth; t++) {
+          keyVals[t] = t < lo ? p[t] : p[2 * n - kk - 1 - t];
+        }
+        accumulate(vIndex, codeToIndex.get(codeOf(keyVals))!);
+      }
+    } else {
+      for (const apply of genApplies) {
+        const q = apply(p);
+        for (let t = 0; t < depth; t++) keyVals[t] = q[t];
+        accumulate(vIndex, codeToIndex.get(codeOf(keyVals))!);
+      }
+    }
+
+    if ((i + 1) % 50_000 === 0) {
+      onProgress?.(i + 1, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+  onProgress?.(total, total);
+
+  // Every undirected edge is counted twice (once from each endpoint, since the
+  // connection set is closed under inverse), so halve the ordered tallies.
+  const selfWeight = new Float64Array(blockCount);
+  let maxSelfWeight = 0;
+  for (let b = 0; b < blockCount; b++) {
+    const w = selfOrdered[b] / 2;
+    selfWeight[b] = w;
+    if (w > maxSelfWeight) maxSelfWeight = w;
+  }
+
+  const entries: Array<[number, number, number]> = [];
+  let maxSuperWeight = 0;
+  for (const [k, ordered] of superMap) {
+    const w = ordered / 2;
+    entries.push([Math.floor(k / blockCount), k % blockCount, w]);
+    if (w > maxSuperWeight) maxSuperWeight = w;
+  }
+  entries.sort((x, y) => x[2] - y[2]);
+  const superEdges = new Float64Array(entries.length * 3);
+  for (let e = 0; e < entries.length; e++) {
+    superEdges[e * 3] = entries[e][0];
+    superEdges[e * 3 + 1] = entries[e][1];
+    superEdges[e * 3 + 2] = entries[e][2];
+  }
+
+  return {
+    n,
+    preset,
+    depth,
+    blockCount,
+    blockKey,
+    superEdges,
+    selfWeight,
+    maxSuperWeight,
+    maxSelfWeight,
+    totalSuperEdges: entries.length,
+  };
 }
 
 export const EDGE_DISTANCE_BIN_DEGREES = 10;
@@ -290,7 +529,7 @@ export async function buildPancakeGraph(
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
         : await lexicographicOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
-        : await prefixReversalCycle(
+        : await suffixReversalCycle(
           n,
           order,
           (done, total) => onProgress?.("cycle", done, total),
@@ -585,9 +824,9 @@ export function graphPresetLabel(preset: GraphPreset): string {
 export function graphPresetDescription(preset: GraphPreset): string {
   switch (preset) {
     case "pancake-zaks":
-      return "Prefix reversals, minimum new flip";
+      return "Suffix reversals, minimum new flip (Zaks 1984)";
     case "pancake-williams":
-      return "Prefix reversals, maximum new flip";
+      return "Suffix reversals, maximum new flip";
     case "star":
       return "Swap the first position with any other";
     case "permutohedron":
@@ -662,6 +901,7 @@ export function graphMaxN(preset: GraphPreset): number {
   // is O((n!)²). n = 6 already gives 720 vertices, 719 generators, and
   // ~259k edges; n = 7 would be 5040 vertices and ~12.7M edges, so cap here.
   if (preset === "cayley-complete") return 6;
+  if (preset === "pancake-zaks" || preset === "pancake-williams") return 11;
   return preset === "kaleidoscope" ||
     preset === "transposition" ||
     preset === "lexicographic"

@@ -19,7 +19,7 @@ Before editing, read both files. If the requested graph has unusual rendering ne
 1. Add the new preset id to `GraphPreset` in `src/lib/pancake.ts`.
 2. Add or reuse a `GraphKind` value. Reuse an existing kind when behavior is identical; add a new kind only when metrics, rendering, or graph-specific logic needs to distinguish it.
 3. Update `buildPancakeGraph` so the preset uses the right vertex ordering:
-   - Use `prefixReversalCycle` only for pancake-style Hamiltonian cycle presets.
+   - Use `suffixReversalCycle` only for pancake-style Hamiltonian cycle presets.
    - Use `johnsonTrotterOrder` for adjacent-transposition style permutation graphs.
    - Use `lexicographicOrder` for generic permutation graphs without a special cycle.
    - Add a dedicated async ordering helper when the graph is not permutation-based or needs a specific order.

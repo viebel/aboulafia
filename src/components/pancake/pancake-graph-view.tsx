@@ -21,21 +21,29 @@ import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import {
   buildPancakeGraph,
+  buildQuotientGraph,
   EDGE_DISTANCE_BIN_DEGREES,
   graphEdgeCount,
   graphPresetDescription,
   graphPresetLabel,
   graphMaxN,
   graphVertexCount,
+  quotientDepthOptions,
+  supportsQuotient,
   type EdgeDistanceBin,
   type PancakeGraph,
   type GraphPreset,
+  type QuotientGraph,
 } from "@/lib/pancake";
 import {
+  drawQuotientToCanvas,
   drawToCanvas,
   edgeAlphaToSlider,
   edgeWidthToSlider,
+  type EdgeRenderMode,
+  supportsSymmetry,
   toSVG,
+  toSymmetrySVG,
   type ParityMode,
   type RenderSettings,
 } from "@/lib/pancake-render";
@@ -89,7 +97,7 @@ const DEFAULT_N = 6;
 
 /**
  * Generators a freshly built graph should hide by default. Most graphs start
- * fully visible (empty list). Pancake graphs use generator id = prefix-reversal
+ * fully visible (empty list). Pancake graphs use generator id = suffix-reversal
  * length, and each generator is an involution, so it contributes a perfect
  * matching of n!/2 chords. For n > 6 the graph builder only emits the full
  * reversal rₙ (id = n) to avoid spending CPU on edges that would be hidden;
@@ -119,7 +127,21 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "simplex",
 ];
 
-type Renderer = "svg" | "canvas";
+type Renderer = "svg" | "canvas" | "density" | "quotient" | "symmetry";
+
+/** Number of quotient blocks = n·(n-1)···(n-depth+1). */
+function quotientBlockCount(n: number, depth: number): number {
+  let r = 1;
+  for (let i = 0; i < depth; i++) r *= n - i;
+  return r;
+}
+
+/** Quotient depth that best shows the recursive block structure for a graph. */
+function defaultQuotientDepth(n: number, preset: GraphPreset): number {
+  const opts = quotientDepthOptions(n, preset);
+  if (opts.length === 0) return 1;
+  return opts.includes(2) ? 2 : opts[opts.length - 1];
+}
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 64;
 const ZOOM_FACTOR = 1.5;
@@ -163,6 +185,11 @@ export function PancakeGraphView() {
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
+  const [quotientDepth, setQuotientDepth] = useState<number>(() =>
+    defaultQuotientDepth(DEFAULT_N, "pancake-zaks")
+  );
+  const [quotient, setQuotient] = useState<QuotientGraph | null>(null);
+  const [quotientLoading, setQuotientLoading] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
@@ -194,15 +221,6 @@ export function PancakeGraphView() {
   );
 
   useEffect(() => {
-    // Switching graph or n changes the whole layout, so any prior
-    // zoom/pan no longer makes sense — snap the view back to fit.
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-    // Edge density changes too, so move the strength/width sliders to a
-    // density-appropriate recommendation for the new graph.
-    const rec = recommendedEdgeSliders(n, preset);
-    setSettings((s) => ({ ...s, alpha: rec.alpha, width: rec.width }));
-
     const ac = new AbortController();
     const signal = ac.signal;
 
@@ -283,7 +301,7 @@ export function PancakeGraphView() {
   }, []);
 
   useEffect(() => {
-    if (activeRenderer !== "canvas") return;
+    if (activeRenderer !== "canvas" && activeRenderer !== "density") return;
     const canvas = canvasRef.current;
     if (!canvas || !graph) return;
     const { width, height } = stageSize;
@@ -295,9 +313,11 @@ export function PancakeGraphView() {
     canvas.style.height = `${height}px`;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    const edgeMode: EdgeRenderMode =
+      activeRenderer === "density" ? "density" : "line";
     drawToCanvas(ctx, {
       graph,
-      settings,
+      settings: { ...settings, edgeMode },
       cssWidth: width,
       cssHeight: height,
       dpr,
@@ -307,12 +327,91 @@ export function PancakeGraphView() {
     });
   }, [activeRenderer, graph, settings, stageSize, pan.x, pan.y, zoom]);
 
+  // Build the coarsened quotient when that renderer is active. It only needs
+  // per-block counts, so even the n = 10 pancake (3.6M vertices) collapses to a
+  // few hundred weighted super-edges — cheap to draw and full of structure.
   useEffect(() => {
-    if (activeRenderer !== "svg") return;
+    if (activeRenderer !== "quotient") return;
+    // The radio is disabled for unsupported presets and selectPreset switches
+    // away from quotient, so an unsupported graph here means a stale render
+    // pass — bail without touching state.
+    if (!graph || !supportsQuotient(graph.preset)) return;
+    const ac = new AbortController();
+    const signal = ac.signal;
+
+    const run = async () => {
+      setQuotient(null);
+      setQuotientLoading(true);
+      setStatus(`Coarsening (depth ${quotientDepth})…`);
+      try {
+        const q = await buildQuotientGraph(
+          graph,
+          quotientDepth,
+          (done, total) => {
+            if (signal.aborted) return;
+            setStatus(`Coarsening: ${((done / total) * 100).toFixed(0)}%`);
+          },
+          signal
+        );
+        if (signal.aborted) return;
+        setQuotient(q);
+        setStatus(
+          `Quotient drawn — ${NUMBER_FORMAT.format(q.blockCount)} blocks, ${NUMBER_FORMAT.format(q.totalSuperEdges)} super-edges.`
+        );
+      } catch (e) {
+        if (signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
+          return;
+        }
+        setStatus(`Quotient error: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        if (!signal.aborted) setQuotientLoading(false);
+      }
+    };
+
+    const id = setTimeout(() => void run(), 0);
+    return () => {
+      ac.abort();
+      clearTimeout(id);
+    };
+  }, [activeRenderer, graph, quotientDepth]);
+
+  useEffect(() => {
+    if (activeRenderer !== "quotient") return;
+    const canvas = canvasRef.current;
+    if (!canvas || !quotient) return;
+    const { width, height } = stageSize;
+    if (width === 0 || height === 0) return;
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    drawQuotientToCanvas(ctx, {
+      quotient,
+      settings,
+      cssWidth: width,
+      cssHeight: height,
+      dpr,
+      zoom,
+      panX: pan.x,
+      panY: pan.y,
+    });
+  }, [activeRenderer, quotient, settings, stageSize, pan.x, pan.y, zoom]);
+
+  useEffect(() => {
+    if (activeRenderer !== "svg" && activeRenderer !== "symmetry") return;
     const host = svgHostRef.current;
     if (!host || !graph) return;
-    // Square SVG with a viewBox — CSS scales it to fill the stage.
-    const svg = toSVG({ graph, settings, size: SVG_VIEWBOX });
+    // Square SVG with a viewBox — CSS scales it to fill the stage. The symmetry
+    // renderer falls back to the flat one if the graph lacks the n-fold layout.
+    const useSymmetry = activeRenderer === "symmetry" && supportsSymmetry(graph);
+    const svg = (useSymmetry ? toSymmetrySVG : toSVG)({
+      graph,
+      settings,
+      size: SVG_VIEWBOX,
+    });
     host.innerHTML = svg
       .replace(`width="${SVG_VIEWBOX}"`, 'width="100%"')
       .replace(`height="${SVG_VIEWBOX}"`, 'height="100%"');
@@ -324,7 +423,7 @@ export function PancakeGraphView() {
   // into a blur. This only mutates an attribute, so it is cheap enough to
   // run on every zoom/pan tick without regenerating the path data.
   useEffect(() => {
-    if (activeRenderer !== "svg") return;
+    if (activeRenderer !== "svg" && activeRenderer !== "symmetry") return;
     const host = svgHostRef.current;
     const svgEl = host?.querySelector("svg");
     if (!svgEl) return;
@@ -344,12 +443,18 @@ export function PancakeGraphView() {
     setStatus("Generating SVG…");
     setTimeout(() => {
       try {
-        const svg = toSVG({ graph, settings, size: svgExportSize });
+        const useSymmetry =
+          activeRenderer === "symmetry" && supportsSymmetry(graph);
+        const svg = (useSymmetry ? toSymmetrySVG : toSVG)({
+          graph,
+          settings,
+          size: svgExportSize,
+        });
         const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `${graph.preset}_n${graph.n}.svg`;
+        a.download = `${graph.preset}_n${graph.n}${useSymmetry ? "_sym" : ""}.svg`;
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -360,7 +465,7 @@ export function PancakeGraphView() {
         setStatus(`SVG export error: ${msg}`);
       }
     }, 30);
-  }, [graph, settings, svgExportSize]);
+  }, [activeRenderer, graph, settings, svgExportSize]);
 
   const downloadPNG = useCallback(() => {
     if (!graph) return;
@@ -373,13 +478,26 @@ export function PancakeGraphView() {
         const ctx = canvas.getContext("2d");
         if (!ctx) throw new Error("Could not create canvas context.");
 
-        drawToCanvas(ctx, {
-          graph,
-          settings,
-          cssWidth: svgExportSize,
-          cssHeight: svgExportSize,
-          dpr: 1,
-        });
+        if (activeRenderer === "quotient") {
+          if (!quotient) throw new Error("Quotient is still building.");
+          drawQuotientToCanvas(ctx, {
+            quotient,
+            settings,
+            cssWidth: svgExportSize,
+            cssHeight: svgExportSize,
+            dpr: 1,
+          });
+        } else {
+          const edgeMode: EdgeRenderMode =
+            activeRenderer === "density" ? "density" : "line";
+          drawToCanvas(ctx, {
+            graph,
+            settings: { ...settings, edgeMode },
+            cssWidth: svgExportSize,
+            cssHeight: svgExportSize,
+            dpr: 1,
+          });
+        }
 
         canvas.toBlob((blob) => {
           if (!blob) {
@@ -401,17 +519,21 @@ export function PancakeGraphView() {
         setStatus(`PNG export error: ${msg}`);
       }
     }, 30);
-  }, [graph, settings, svgExportSize]);
+  }, [activeRenderer, graph, quotient, settings, svgExportSize]);
 
   const svgDownloadDisabled = useMemo(() => {
     if (!graph) return true;
+    if (activeRenderer === "density" || activeRenderer === "quotient") return true;
+    // The symmetry renderer emits an ~n× smaller file (one sector + rotations),
+    // so it stays exportable exactly where the flat SVG would be too large.
+    if (activeRenderer === "symmetry" && supportsSymmetry(graph)) return false;
     // Gate on vertex count rather than n: the sliding puzzle reaches millions
     // of states at a small n, where an SVG file would be unusably large.
     return (
       graph.kind !== "hypercube" &&
       graphVertexCount(graph.n, graph.preset) >= 300_000
     );
-  }, [graph]);
+  }, [activeRenderer, graph]);
 
   const imageDownloadDisabled = !graph;
 
@@ -420,16 +542,44 @@ export function PancakeGraphView() {
     value: RenderSettings[K]
   ) => setSettings((s) => ({ ...s, [key]: value }));
 
+  const resetViewForGraph = (nextN: number, nextPreset: GraphPreset) => {
+    // Switching graph or n changes the whole layout, so any prior
+    // zoom/pan no longer makes sense — snap the view back to fit.
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+
+    // Edge density changes too, so move the strength/width sliders to a
+    // density-appropriate recommendation for the new graph.
+    const rec = recommendedEdgeSliders(nextN, nextPreset);
+    setSettings((s) => ({ ...s, alpha: rec.alpha, width: rec.width }));
+
+    // Reset the quotient depth to the new graph's best default.
+    setQuotientDepth(defaultQuotientDepth(nextN, nextPreset));
+  };
+
   const selectN = (value: string) => {
-    setN(Number(value) as NValue);
+    const nextN = Number(value) as NValue;
+    setN(nextN);
+    resetViewForGraph(nextN, preset);
   };
 
   const selectPreset = (value: string) => {
     const nextPreset = value as GraphPreset;
+    const nextN = Math.min(DEFAULT_N, graphMaxN(nextPreset)) as NValue;
+    // The quotient view only applies to full-permutation graphs; fall back to
+    // Canvas when the new family does not support it.
+    if (renderer === "quotient" && !supportsQuotient(nextPreset)) {
+      setRenderer("canvas");
+    }
+    // The symmetry renderer only applies to the Zaks pancake layout.
+    if (renderer === "symmetry" && !supportsSymmetry({ preset: nextPreset })) {
+      setRenderer("svg");
+    }
     setPreset(nextPreset);
     // Switching graph family resets n to the default, clamped to the new
     // preset's maximum (some presets, e.g. the sliding puzzle, top out lower).
-    setN(Math.min(DEFAULT_N, graphMaxN(nextPreset)) as NValue);
+    setN(nextN);
+    resetViewForGraph(nextN, nextPreset);
   };
 
   const zoomOut = () => {
@@ -637,6 +787,8 @@ export function PancakeGraphView() {
                 value={activeRenderer}
                 onValueChange={(v) => {
                   if (v === "svg" && !canUseInteractiveSvg) return;
+                  if (v === "quotient" && !supportsQuotient(preset)) return;
+                  if (v === "symmetry" && !supportsSymmetry({ preset })) return;
                   setRenderer(v as Renderer);
                 }}
                 className="grid grid-cols-2 gap-2"
@@ -654,8 +806,79 @@ export function PancakeGraphView() {
                   hint="raster · large n"
                   checked={activeRenderer === "canvas"}
                 />
+                <RendererRadio
+                  value="density"
+                  label="Density"
+                  hint="x-ray · binned"
+                  checked={activeRenderer === "density"}
+                />
+                <RendererRadio
+                  value="quotient"
+                  label="Quotient"
+                  hint="blocks · recursive"
+                  checked={activeRenderer === "quotient"}
+                  disabled={!supportsQuotient(preset)}
+                />
+                <RendererRadio
+                  value="symmetry"
+                  label="Symmetry"
+                  hint="vector · 360/n folds"
+                  checked={activeRenderer === "symmetry"}
+                  disabled={!supportsSymmetry({ preset })}
+                />
               </RadioGroup>
+              {activeRenderer === "density" ? (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Density mode groups nearby chord endpoints into angular bins
+                  and uses log-scaled strokes, so million-edge views do not
+                  saturate to a black disk.
+                </p>
+              ) : null}
+              {activeRenderer === "quotient" ? (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Quotient mode collapses permutations sharing their first{" "}
+                  {quotientDepth} symbol{quotientDepth === 1 ? "" : "s"} into one
+                  block — the recursive decomposition Pₙ = copies of Pₙ₋
+                  {quotientDepth} under Zaks suffix reversals. Node size is
+                  intra-block density; chords are log-weighted inter-block edges;
+                  color groups blocks by leading symbol.
+                </p>
+              ) : null}
+              {activeRenderer === "symmetry" ? (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Symmetry mode exploits the exact 360/n rotational symmetry of
+                  the Zaks layout: it draws a single angular sector and reuses it
+                  via n rotated copies. Identical picture, but the SVG is ~n×
+                  smaller — so large n (≥ 9) stays exportable instead of
+                  producing a multi-megabyte file.
+                </p>
+              ) : null}
             </div>
+
+            {activeRenderer === "quotient" && supportsQuotient(preset) ? (
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                  Coarsen depth
+                </Label>
+                <Select
+                  value={String(quotientDepth)}
+                  onValueChange={(v) => setQuotientDepth(Number(v))}
+                  disabled={running}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="popper">
+                    {quotientDepthOptions(n, preset).map((d) => (
+                      <SelectItem key={d} value={String(d)}>
+                        first {d} symbol{d === 1 ? "" : "s"} —{" "}
+                        {NUMBER_FORMAT.format(quotientBlockCount(n, d))} blocks
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
 
             <div className="space-y-2">
               <div className="flex items-center justify-between">
@@ -837,7 +1060,9 @@ export function PancakeGraphView() {
                 disabled={running || svgDownloadDisabled}
                 title={
                   svgDownloadDisabled
-                    ? "SVG export is unavailable for this many vertices"
+                    ? activeRenderer === "density"
+                      ? "Density rendering is raster-only; use PNG export"
+                      : "SVG export is unavailable for this many vertices"
                     : undefined
                 }
               >
@@ -863,7 +1088,7 @@ export function PancakeGraphView() {
           ref={stageRef}
           className="relative h-[calc(100vh-9rem)] min-h-[680px] w-full bg-white"
         >
-          {running ? (
+          {running || (activeRenderer === "quotient" && quotientLoading) ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-white">
               <Loader2 className="h-12 w-12 animate-spin text-muted-foreground" />
               <div className="flex flex-col items-center gap-1 text-center">
@@ -885,7 +1110,9 @@ export function PancakeGraphView() {
                 onPointerCancel={handlePanEnd}
                 onWheel={handleWheelPan}
               >
-                {activeRenderer === "canvas" ? (
+                {activeRenderer === "canvas" ||
+                activeRenderer === "density" ||
+                activeRenderer === "quotient" ? (
                   <canvas ref={canvasRef} className="block h-full w-full" />
                 ) : (
                   <div

@@ -4,7 +4,7 @@ import type { Metadata } from "next";
 export const metadata: Metadata = {
   title: "Tserouf",
   description:
-    "Display all permutations of an n-letter word in Zaks prefix-reversal order.",
+    "Display all permutations of an n-letter word in Zaks suffix-reversal order.",
 };
 
 export default function TseroufPage() {
