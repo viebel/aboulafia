@@ -18,12 +18,23 @@ import {
 } from "@/components/ui/select";
 import { factorial, key, type Perm } from "@/lib/pancake";
 import { Loader2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  Fragment,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 const N_OPTIONS = [2, 3, 4, 5, 6, 7] as const;
 const WORDS_PER_LINE = 6;
 const HEBREW_LETTERS = ["א", "ב", "ג", "ד", "ה", "ו", "ז"] as const;
+const ELOHIM_LETTERS = ["א", "ל", "ה", "י", "ם"] as const;
+const ELOHIM_N = 5;
 const SOURCE_HEBREW_ROWS = [
   ["שתי אבנים", "בונות", "שני בתים"],
   ["שלש", "בונות", "ששה בתים"],
@@ -47,6 +58,28 @@ const SOURCE_TRANSLATION_OUTRO =
 type NValue = (typeof N_OPTIONS)[number];
 type Alphabet = "latin" | "hebrew";
 type Layout = "flat" | "tree";
+type LetterSet = "sequence" | "elohim";
+
+function hebrewLettersFor(letterSet: LetterSet): readonly string[] {
+  return letterSet === "elohim" ? ELOHIM_LETTERS : HEBREW_LETTERS;
+}
+
+const HebrewLettersContext = createContext<readonly string[]>(HEBREW_LETTERS);
+
+function useHebrewLetters(): readonly string[] {
+  return useContext(HebrewLettersContext);
+}
+
+type TileRegister = (word: string, el: HTMLElement | null) => void;
+const TileRegisterContext = createContext<TileRegister | null>(null);
+
+interface EdgeSpec {
+  path: string;
+  flip?: number;
+  labelX: number;
+  labelY: number;
+  wrap: boolean;
+}
 
 interface ZaksWord {
   word: string;
@@ -74,24 +107,37 @@ export function TseroufView() {
   const [n, setN] = useState<NValue>(3);
   const [alphabet, setAlphabet] = useState<Alphabet>("latin");
   const [layout, setLayout] = useState<Layout>("flat");
+  const [letterSet, setLetterSet] = useState<LetterSet>("sequence");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
   const [running, setRunning] = useState(false);
 
+  const hebrewLetters = useMemo(() => hebrewLettersFor(letterSet), [letterSet]);
   const baseWord = useMemo(
     () => Array.from({ length: n }, (_, i) => String.fromCharCode(97 + i)).join(""),
     [n]
   );
-  const displayBaseWord = displayWord(baseWord, alphabet);
+  const displayBaseWord = displayWord(baseWord, alphabet, hebrewLetters);
   const recursiveCell = useMemo(
     () => (words.length > 0 ? buildRecursiveCells(words, n) : null),
     [n, words]
   );
   const clipboardText = useMemo(
-    () => (recursiveCell ? enumerationClipboardText(recursiveCell, alphabet) : ""),
-    [alphabet, recursiveCell]
+    () =>
+      recursiveCell
+        ? enumerationClipboardText(recursiveCell, alphabet, hebrewLetters)
+        : "",
+    [alphabet, hebrewLetters, recursiveCell]
   );
+
+  const handleLetterSetChange = (value: LetterSet) => {
+    setLetterSet(value);
+    if (value === "elohim") {
+      setN(ELOHIM_N);
+      setAlphabet("hebrew");
+    }
+  };
 
   useEffect(() => {
     const ac = new AbortController();
@@ -169,12 +215,38 @@ export function TseroufView() {
         <CardContent className="space-y-4 px-0">
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Letter set
+            </Label>
+            <Select
+              value={letterSet}
+              onValueChange={(value) => handleLetterSetChange(value as LetterSet)}
+              disabled={running}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="sequence">א ב ג … (sequence)</SelectItem>
+                <SelectItem value="elohim">
+                  <span
+                    dir="rtl"
+                    className="font-[family-name:var(--font-hebrew)]"
+                  >
+                    אלהים
+                  </span>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
               Word length
             </Label>
             <Select
               value={String(n)}
               onValueChange={(value) => setN(Number(value) as NValue)}
-              disabled={running}
+              disabled={running || letterSet === "elohim"}
             >
               <SelectTrigger className="w-full">
                 <SelectValue />
@@ -267,13 +339,15 @@ export function TseroufView() {
               <p className="text-sm">{status}</p>
             </div>
           ) : recursiveCell ? (
-            <div className="font-mono text-sm">
-              {layout === "tree" ? (
-                <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
-              ) : (
-                <FlatWordsView words={words} alphabet={alphabet} n={n} />
-              )}
-            </div>
+            <HebrewLettersContext.Provider value={hebrewLetters}>
+              <div className="font-mono text-sm">
+                {layout === "tree" ? (
+                  <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
+                ) : (
+                  <FlatWordsView words={words} alphabet={alphabet} n={n} />
+                )}
+              </div>
+            </HebrewLettersContext.Provider>
           ) : null}
         </CardContent>
       </Card>
@@ -401,13 +475,14 @@ function TreeBranchLabel({
   alphabet: Alphabet;
 }) {
   const isHebrew = alphabet === "hebrew";
+  const hebrewLetters = useHebrewLetters();
   const depth = n - level;
   const alpha = Math.min(0.34, 0.07 + depth * 0.06);
 
   return (
     <span
       className="relative z-10 inline-flex flex-col items-center gap-0.5"
-      title={prefix ? `Fixed prefix: ${displayWord(prefix, alphabet)}` : "Full set — no letter fixed yet"}
+      title={prefix ? `Fixed prefix: ${displayWord(prefix, alphabet, hebrewLetters)}` : "Full set — no letter fixed yet"}
     >
       <span
         className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border px-2 text-lg leading-none"
@@ -425,7 +500,7 @@ function TreeBranchLabel({
                 : "font-[family-name:var(--font-mystic)]"
             }`}
           >
-            {displayWord(prefix, alphabet)}
+            {displayWord(prefix, alphabet, hebrewLetters)}
           </span>
         ) : (
           <span className="text-muted-foreground">•</span>
@@ -451,16 +526,14 @@ function TreeLeaf({
   return (
     <div
       dir={isHebrew ? "rtl" : "ltr"}
-      className="relative z-10 inline-flex flex-col items-center gap-1 rounded-md p-1.5"
+      className="relative z-10 inline-flex flex-col items-center gap-0.5 rounded-md p-1.5"
       style={{ backgroundColor: "rgba(180, 120, 24, 0.06)" }}
     >
       {words.map((item, i) => (
-        <WordTile
-          key={`${i}-${item.word}`}
-          item={item}
-          stable={stable}
-          alphabet={alphabet}
-        />
+        <Fragment key={`${i}-${item.word}`}>
+          <WordTile item={item} stable={stable} alphabet={alphabet} />
+          <FlipConnector value={item.flip} />
+        </Fragment>
       ))}
     </div>
   );
@@ -490,23 +563,72 @@ function FlatWordsView({
   alphabet: Alphabet;
   n: number;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const tilesRef = useRef<Map<string, HTMLElement>>(new Map());
+  const [edges, setEdges] = useState<EdgeSpec[]>([]);
+
+  const register = useCallback<TileRegister>((word, el) => {
+    if (el) tilesRef.current.set(word, el);
+    else tilesRef.current.delete(word);
+  }, []);
+
   const wordBlocks = useMemo(() => blockWords(words, n), [n, words]);
 
-  return (
-    <div className="flex flex-col items-start gap-5 font-mono text-sm">
-      {wordBlocks.map((block, blockIndex) => {
-        const toneStart = toneStartForBlock(wordBlocks, blockIndex, n);
-        return (
-          <TseroufBlockView
-            key={blockIndex}
-            block={block}
-            n={n}
-            alphabet={alphabet}
-            toneStart={toneStart}
-          />
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const measure = () => {
+      const cRect = container.getBoundingClientRect();
+      const tiles = tilesRef.current;
+      const specs: EdgeSpec[] = [];
+      for (let i = 0; i < words.length - 1; i++) {
+        const aEl = tiles.get(words[i].word);
+        const bEl = tiles.get(words[i + 1].word);
+        if (!aEl || !bEl) continue;
+        specs.push(
+          buildEdge(relRect(aEl, cRect), relRect(bEl, cRect), words[i].flip)
         );
-      })}
-    </div>
+      }
+      setEdges(specs);
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    let cancelled = false;
+    if (typeof document !== "undefined" && document.fonts?.ready) {
+      document.fonts.ready.then(() => {
+        if (!cancelled) measure();
+      });
+    }
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [words, alphabet, n]);
+
+  return (
+    <TileRegisterContext.Provider value={register}>
+      <div
+        ref={containerRef}
+        className="relative flex flex-col items-start gap-16 font-mono text-sm"
+      >
+        {wordBlocks.map((block, blockIndex) => {
+          const toneStart = toneStartForBlock(wordBlocks, blockIndex, n);
+          return (
+            <TseroufBlockView
+              key={blockIndex}
+              block={block}
+              n={n}
+              alphabet={alphabet}
+              toneStart={toneStart}
+            />
+          );
+        })}
+        <EdgeOverlay edges={edges} />
+      </div>
+    </TileRegisterContext.Provider>
   );
 }
 
@@ -521,6 +643,7 @@ function TseroufBlockView({
   alphabet: Alphabet;
   toneStart: number;
 }) {
+  const lines = useMemo(() => trimTrailingSpacers(block.lines), [block]);
   return (
     <section
       className="inline-block rounded-xl p-4"
@@ -529,8 +652,8 @@ function TseroufBlockView({
       }}
     >
       {n >= 6 ? (
-        <div className="flex flex-col items-start gap-3">
-          {subblockUnits(block.lines).map((unit, unitIndex) =>
+        <div className="flex flex-col items-start gap-5">
+          {subblockUnits(lines).map((unit, unitIndex) =>
             unit.type === "spacer" ? (
               <p key={unitIndex} className="h-5" />
             ) : (
@@ -541,7 +664,7 @@ function TseroufBlockView({
                   backgroundColor: tintFor(toneStart + unit.index - 1, 0.075),
                 }}
               >
-                <div className="space-y-3">
+                <div className="space-y-6">
                   {unit.lines.map((line, lineIndex) =>
                     line.type === "spacer" ? (
                       <p key={lineIndex} className="h-5" />
@@ -559,8 +682,8 @@ function TseroufBlockView({
           )}
         </div>
       ) : (
-        <div className="space-y-3">
-          {block.lines.map((line, lineIndex) =>
+        <div className="space-y-6">
+          {lines.map((line, lineIndex) =>
             line.type === "spacer" ? (
               <p key={lineIndex} className="h-5" />
             ) : (
@@ -573,6 +696,115 @@ function TseroufBlockView({
   );
 }
 
+function trimTrailingSpacers(lines: TseroufLine[]): TseroufLine[] {
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].type === "spacer") end--;
+  return lines.slice(0, end);
+}
+
+function EdgeOverlay({ edges }: { edges: EdgeSpec[] }) {
+  if (edges.length === 0) return null;
+  return (
+    <svg
+      aria-hidden
+      className="pointer-events-none absolute inset-0 z-30 h-full w-full overflow-visible"
+    >
+      {edges.map((edge, i) => (
+        <path
+          key={`p-${i}`}
+          d={edge.path}
+          fill="none"
+          strokeWidth={1.5}
+          strokeLinecap="round"
+          strokeDasharray={edge.wrap ? "4 3" : undefined}
+          className={
+            edge.wrap
+              ? "stroke-amber-500/35 dark:stroke-amber-300/25"
+              : "stroke-amber-600/45 dark:stroke-amber-300/35"
+          }
+        />
+      ))}
+      {edges.map((edge, i) =>
+        edge.flip ? (
+          <text
+            key={`t-${i}`}
+            x={edge.labelX}
+            y={edge.labelY}
+            textAnchor="middle"
+            dominantBaseline="central"
+            className="fill-amber-700 dark:fill-amber-300"
+            style={{
+              fontSize: 10,
+              fontFamily: "var(--font-mono)",
+            }}
+          >
+            {edge.flip}
+          </text>
+        ) : null
+      )}
+    </svg>
+  );
+}
+
+function relRect(el: HTMLElement, container: DOMRect) {
+  const r = el.getBoundingClientRect();
+  const left = r.left - container.left;
+  const right = r.right - container.left;
+  const top = r.top - container.top;
+  const bottom = r.bottom - container.top;
+  return {
+    left,
+    right,
+    top,
+    bottom,
+    cx: (left + right) / 2,
+    cy: (top + bottom) / 2,
+    height: r.height,
+  };
+}
+
+type RelRect = ReturnType<typeof relRect>;
+
+function buildEdge(a: RelRect, b: RelRect, flip?: number): EdgeSpec {
+  const sameRow = Math.abs(a.cy - b.cy) < Math.min(a.height, b.height) * 0.6;
+  let sx: number;
+  let ex: number;
+  const sy = a.cy;
+  const ey = b.cy;
+  let c1x: number;
+  let c1y: number;
+  let c2x: number;
+  let c2y: number;
+
+  if (sameRow) {
+    const forward = b.cx >= a.cx;
+    sx = forward ? a.right : a.left;
+    ex = forward ? b.left : b.right;
+    const mx = (sx + ex) / 2;
+    c1x = mx;
+    c1y = sy;
+    c2x = mx;
+    c2y = ey;
+  } else {
+    const wrapLeft = b.cx < a.cx;
+    sx = wrapLeft ? a.right : a.left;
+    ex = wrapLeft ? b.left : b.right;
+    const out = wrapLeft ? 40 : -40;
+    const my = (sy + ey) / 2;
+    c1x = sx + out;
+    c1y = my;
+    c2x = ex - out;
+    c2y = my;
+  }
+
+  const path = `M ${sx} ${sy} C ${c1x} ${c1y} ${c2x} ${c2y} ${ex} ${ey}`;
+  const labelX = 0.125 * sx + 0.375 * c1x + 0.375 * c2x + 0.125 * ex;
+  const labelY =
+    0.125 * sy + 0.375 * c1y + 0.375 * c2y + 0.125 * ey - (sameRow ? 7 : 0);
+
+  return { path, flip, labelX, labelY, wrap: !sameRow };
+}
+
 function WordLine({ line, alphabet }: { line: ZaksWord[]; alphabet: Alphabet }) {
   const stable = stablePositions(line);
   const isHebrew = alphabet === "hebrew";
@@ -580,7 +812,7 @@ function WordLine({ line, alphabet }: { line: ZaksWord[]; alphabet: Alphabet }) 
   return (
     <p
       dir={isHebrew ? "rtl" : "ltr"}
-      className="flex flex-wrap gap-x-4 gap-y-4"
+      className="flex flex-wrap items-center gap-x-7 gap-y-7"
     >
       {line.map((item, itemIndex) => (
         <WordTile
@@ -604,31 +836,47 @@ function WordTile({
   alphabet: Alphabet;
 }) {
   const isHebrew = alphabet === "hebrew";
+  const hebrewLetters = useHebrewLetters();
+  const register = useContext(TileRegisterContext);
+  const word = item.word;
+  const setRef = useCallback(
+    (el: HTMLSpanElement | null) => {
+      register?.(word, el);
+    },
+    [register, word]
+  );
   return (
-    <span className="inline-flex min-w-14 flex-col items-center leading-none">
-      <span
-        dir="ltr"
-        className="h-4 text-[11px] leading-4 text-muted-foreground"
-      >
-        {item.flip ?? ""}
-      </span>
-      <span
-        dir={isHebrew ? "rtl" : "ltr"}
-        title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
-        className={`rounded-md border px-1.5 py-0.5 text-2xl leading-8 [unicode-bidi:isolate] ${parityClassName(
-          item.word
-        )} ${
-          isHebrew
-            ? "font-[family-name:var(--font-hebrew)] font-medium"
-            : "font-[family-name:var(--font-mystic)]"
-        }`}
-      >
-        {Array.from(item.word).map((letter, index) => (
-          <span key={index} className={letterClassName(stable, index)}>
-            {displayLetter(letter, alphabet)}
-          </span>
-        ))}
-      </span>
+    <span
+      ref={setRef}
+      dir={isHebrew ? "rtl" : "ltr"}
+      title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
+      className={`inline-flex rounded-md border px-1.5 py-0.5 text-2xl leading-8 [unicode-bidi:isolate] ${parityClassName(
+        item.word
+      )} ${
+        isHebrew
+          ? "font-[family-name:var(--font-hebrew)] font-medium"
+          : "font-[family-name:var(--font-mystic)]"
+      }`}
+    >
+      {Array.from(item.word).map((letter, index) => (
+        <span key={index} className={letterClassName(stable, index)}>
+          {displayLetter(letter, alphabet, hebrewLetters)}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function FlipConnector({ value }: { value?: number }) {
+  if (!value) return null;
+  return (
+    <span
+      dir="ltr"
+      aria-hidden
+      title={`Reverses the last ${value} letters`}
+      className="inline-flex items-center self-center px-0.5 font-mono text-[10px] leading-none text-amber-700/70 underline decoration-dotted underline-offset-2 dark:text-amber-300/60"
+    >
+      {value}
     </span>
   );
 }
@@ -667,21 +915,34 @@ function isEvenPermutationWord(word: string): boolean {
   return inversions % 2 === 0;
 }
 
-function displayWord(word: string, alphabet: Alphabet): string {
+function displayWord(
+  word: string,
+  alphabet: Alphabet,
+  hebrewLetters: readonly string[]
+): string {
   return Array.from(word)
-    .map((letter) => displayLetter(letter, alphabet))
+    .map((letter) => displayLetter(letter, alphabet, hebrewLetters))
     .join("");
 }
 
-function displayLetter(letter: string, alphabet: Alphabet): string {
+function displayLetter(
+  letter: string,
+  alphabet: Alphabet,
+  hebrewLetters: readonly string[]
+): string {
   if (alphabet === "latin") return letter;
-  return HEBREW_LETTERS[letter.charCodeAt(0) - 97] ?? letter;
+  return hebrewLetters[letter.charCodeAt(0) - 97] ?? letter;
 }
 
-function enumerationClipboardText(root: RecCell, alphabet: Alphabet): string {
+function enumerationClipboardText(
+  root: RecCell,
+  alphabet: Alphabet,
+  hebrewLetters: readonly string[]
+): string {
   const collectWords = (cell: RecCell, out: string[]): void => {
     if (cell.kind === "pair") {
-      for (const item of cell.words) out.push(displayWord(item.word, alphabet));
+      for (const item of cell.words)
+        out.push(displayWord(item.word, alphabet, hebrewLetters));
     } else {
       for (const child of cell.children) collectWords(child, out);
     }
@@ -689,7 +950,9 @@ function enumerationClipboardText(root: RecCell, alphabet: Alphabet): string {
 
   const format = (cell: RecCell): string => {
     if (cell.kind === "pair") {
-      return cell.words.map((w) => displayWord(w.word, alphabet)).join(" ");
+      return cell.words
+        .map((w) => displayWord(w.word, alphabet, hebrewLetters))
+        .join(" ");
     }
     if (cell.level <= 3) {
       const words: string[] = [];
