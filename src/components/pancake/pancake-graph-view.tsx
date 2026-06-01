@@ -47,7 +47,9 @@ import {
   type ParityMode,
   type RenderSettings,
 } from "@/lib/pancake-render";
+import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
 import { AlertTriangle, Download, Loader2, Minus, Plus, RotateCcw } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 import {
   useCallback,
   useEffect,
@@ -77,7 +79,10 @@ function recommendedEdgeSliders(
   const targetAlpha = 2.4 / Math.pow(e, 0.2);
   const targetWidth = 4.2 / Math.pow(e, 0.3);
   const width =
-    n === 8 && (preset === "pancake-zaks" || preset === "pancake-williams")
+    n === 8 &&
+    (preset === "pancake-zaks" ||
+      preset === "pancake-zaks-recursive" ||
+      preset === "pancake-williams")
       ? 7
       : edgeWidthToSlider(targetWidth);
   return {
@@ -113,6 +118,7 @@ type NValue = number;
 
 const GRAPH_PRESETS: GraphPreset[] = [
   "pancake-zaks",
+  "pancake-zaks-recursive",
   "pancake-williams",
   "complete",
   "cayley-complete",
@@ -166,28 +172,85 @@ const PARITY_MODE_LABELS: Record<ParityMode, string> = {
   odd: "Odd only",
 };
 
+const RENDERERS: readonly Renderer[] = [
+  "svg",
+  "canvas",
+  "density",
+  "quotient",
+  "symmetry",
+];
+const PARITY_MODES = Object.keys(PARITY_MODE_LABELS) as ParityMode[];
+const SLIDER_RANGE: readonly number[] = Array.from(
+  { length: 100 },
+  (_, i) => i + 1
+);
+
+/** The n a preset starts at: the global default, clamped to its maximum. */
+function defaultNFor(preset: GraphPreset): NValue {
+  return Math.min(DEFAULT_N, graphMaxN(preset)) as NValue;
+}
+
+interface GraphState {
+  n: NValue;
+  preset: GraphPreset;
+  renderer: Renderer;
+  parityMode: ParityMode;
+  alpha: number;
+  width: number;
+  quotientDepth: number;
+}
+
+/** Restore the explorer's controls from the URL query string (deep linking). */
+function readGraphState(params: URLSearchParams | null): GraphState {
+  const preset = readEnumParam(params, "g", GRAPH_PRESETS, "pancake-zaks");
+  const allowedN = N_OPTIONS.filter((opt) => opt <= graphMaxN(preset));
+  const n = readIntParam(params, "n", allowedN, defaultNFor(preset)) as NValue;
+
+  let renderer = readEnumParam(params, "r", RENDERERS, "svg");
+  if (renderer === "quotient" && !supportsQuotient(preset)) renderer = "svg";
+  if (renderer === "symmetry" && !supportsSymmetry({ preset })) renderer = "svg";
+
+  const rec = recommendedEdgeSliders(n, preset);
+
+  return {
+    n,
+    preset,
+    renderer,
+    parityMode: readEnumParam(params, "parity", PARITY_MODES, "off"),
+    alpha: readIntParam(params, "alpha", SLIDER_RANGE, rec.alpha),
+    width: readIntParam(params, "width", SLIDER_RANGE, rec.width),
+    quotientDepth: readIntParam(
+      params,
+      "depth",
+      quotientDepthOptions(n, preset),
+      defaultQuotientDepth(n, preset)
+    ),
+  };
+}
+
 export function PancakeGraphView() {
-  const [n, setN] = useState<NValue>(DEFAULT_N);
-  const [preset, setPreset] = useState<GraphPreset>("pancake-zaks");
-  const [renderer, setRenderer] = useState<Renderer>("svg");
+  const searchParams = useSearchParams();
+  const initial = useMemo(() => readGraphState(searchParams), [searchParams]);
+  const [n, setN] = useState<NValue>(initial.n);
+  const [preset, setPreset] = useState<GraphPreset>(initial.preset);
+  const [renderer, setRenderer] = useState<Renderer>(initial.renderer);
   const [graph, setGraph] = useState<PancakeGraph | null>(null);
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [status, setStatus] = useState<string>("Ready.");
   const [running, setRunning] = useState(false);
 
   const [settings, setSettings] = useState<RenderSettings>({
-    ...recommendedEdgeSliders(6, "pancake-zaks"),
+    alpha: initial.alpha,
+    width: initial.width,
     showCayley: true,
     showCycle: true,
     showVertices: true,
     showLabels: false,
-    parityMode: "off",
+    parityMode: initial.parityMode,
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
-  const [quotientDepth, setQuotientDepth] = useState<number>(() =>
-    defaultQuotientDepth(DEFAULT_N, "pancake-zaks")
-  );
+  const [quotientDepth, setQuotientDepth] = useState<number>(initial.quotientDepth);
   const [quotient, setQuotient] = useState<QuotientGraph | null>(null);
   const [quotientLoading, setQuotientLoading] = useState(false);
   const [zoom, setZoom] = useState(1);
@@ -219,6 +282,28 @@ export function PancakeGraphView() {
     () => N_OPTIONS.filter((option) => option <= graphMaxN(preset)),
     [preset]
   );
+
+  // Reflect every control in the URL so a given view can be shared and
+  // restored, including default values.
+  useEffect(() => {
+    writeUrlParams({
+      g: preset,
+      n: String(n),
+      r: renderer,
+      parity: settings.parityMode,
+      alpha: String(settings.alpha),
+      width: String(settings.width),
+      depth: String(quotientDepth),
+    });
+  }, [
+    n,
+    preset,
+    renderer,
+    settings.parityMode,
+    settings.alpha,
+    settings.width,
+    quotientDepth,
+  ]);
 
   useEffect(() => {
     const ac = new AbortController();

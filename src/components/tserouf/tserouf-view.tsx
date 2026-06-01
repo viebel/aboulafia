@@ -17,8 +17,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { factorial, key, type Perm } from "@/lib/pancake";
+import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
 import { toPng } from "html-to-image";
 import { Download, Loader2 } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
   createContext,
@@ -61,6 +63,35 @@ type NValue = (typeof N_OPTIONS)[number];
 type Alphabet = "latin" | "hebrew";
 type Layout = "flat" | "tree";
 type LetterSet = "sequence" | "elohim";
+
+const DEFAULT_N: NValue = 3;
+const ALPHABETS: readonly Alphabet[] = ["latin", "hebrew"];
+const LAYOUTS: readonly Layout[] = ["flat", "tree"];
+const LETTER_SETS: readonly LetterSet[] = ["sequence", "elohim"];
+
+interface TseroufState {
+  n: NValue;
+  alphabet: Alphabet;
+  layout: Layout;
+  letterSet: LetterSet;
+}
+
+function readTseroufState(params: URLSearchParams | null): TseroufState {
+  const letterSet = readEnumParam(params, "set", LETTER_SETS, "sequence");
+  const layout = readEnumParam(params, "layout", LAYOUTS, "flat");
+
+  // The "elohim" set is a fixed 5-letter Hebrew word, so it pins n and alphabet.
+  if (letterSet === "elohim") {
+    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet };
+  }
+
+  return {
+    n: readIntParam(params, "n", N_OPTIONS, DEFAULT_N) as NValue,
+    alphabet: readEnumParam(params, "alphabet", ALPHABETS, "latin"),
+    layout,
+    letterSet,
+  };
+}
 
 function hebrewLettersFor(letterSet: LetterSet): readonly string[] {
   return letterSet === "elohim" ? ELOHIM_LETTERS : HEBREW_LETTERS;
@@ -106,10 +137,12 @@ type RecCell =
   | { kind: "group"; level: number; children: RecCell[] };
 
 export function TseroufView() {
-  const [n, setN] = useState<NValue>(3);
-  const [alphabet, setAlphabet] = useState<Alphabet>("latin");
-  const [layout, setLayout] = useState<Layout>("flat");
-  const [letterSet, setLetterSet] = useState<LetterSet>("sequence");
+  const searchParams = useSearchParams();
+  const initial = useMemo(() => readTseroufState(searchParams), [searchParams]);
+  const [n, setN] = useState<NValue>(initial.n);
+  const [alphabet, setAlphabet] = useState<Alphabet>(initial.alphabet);
+  const [layout, setLayout] = useState<Layout>(initial.layout);
+  const [letterSet, setLetterSet] = useState<LetterSet>(initial.letterSet);
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
@@ -142,6 +175,17 @@ export function TseroufView() {
       setAlphabet("hebrew");
     }
   };
+
+  // Reflect every control in the URL so the view can be shared/restored,
+  // including default values.
+  useEffect(() => {
+    writeUrlParams({
+      set: letterSet,
+      n: String(n),
+      alphabet,
+      layout,
+    });
+  }, [n, alphabet, layout, letterSet]);
 
   useEffect(() => {
     const ac = new AbortController();

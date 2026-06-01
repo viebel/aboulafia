@@ -1,5 +1,6 @@
 import { TseroufView } from "@/components/tserouf/tserouf-view";
 import type { Metadata } from "next";
+import { Suspense } from "react";
 
 export const metadata: Metadata = {
   title: "Tserouf",
@@ -10,7 +11,9 @@ export const metadata: Metadata = {
 export default function TseroufPage() {
   return (
     <div className="mx-auto w-full max-w-[1600px] px-4 py-4 sm:px-6">
-      <TseroufView />
+      <Suspense fallback={null}>
+        <TseroufView />
+      </Suspense>
     </div>
   );
 }
