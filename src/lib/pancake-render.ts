@@ -669,14 +669,18 @@ export function toSVG(opts: SvgOpts): string {
 
 /**
  * Presets whose layout has an exact n-fold rotational symmetry that the
- * Symmetry renderer can exploit. The Zaks suffix-reversal cycle splits into n
- * consecutive blocks of (n-1)! permutations sharing a leading symbol, and the
- * whole edge set is invariant under a shift of one block — i.e. a 360/n
- * rotation. (Verified empirically for every generator rₖ and for the edge
- * parity, so hidden-generator and parity filtering stay exact.)
+ * Symmetry renderer can exploit. Both Zaks orderings (the greedy smallest-flip
+ * walk and the explicit recursion) split into n consecutive blocks of (n-1)!
+ * permutations sharing a leading symbol, and the whole edge set is invariant
+ * under a shift of one block — i.e. a 360/n rotation. (Verified empirically for
+ * every generator rₖ and for the edge parity, so hidden-generator and parity
+ * filtering stay exact.)
  */
 export function supportsSymmetry(graph: Pick<PancakeGraph, "preset">): boolean {
-  return graph.preset === "pancake-zaks";
+  return (
+    graph.preset === "pancake-zaks" ||
+    graph.preset === "pancake-zaks-recursive"
+  );
 }
 
 /**

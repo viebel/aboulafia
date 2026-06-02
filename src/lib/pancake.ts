@@ -78,6 +78,7 @@ export function reverseBlock(p: Perm, start: number, end: number): Perm {
 export type PancakeOrder = "zaks" | "williams";
 export type GraphPreset =
   | "pancake-zaks"
+  | "pancake-zaks-recursive"
   | "pancake-williams"
   | "star"
   | "permutohedron"
@@ -202,6 +203,95 @@ export async function williamsCycle(
   return suffixReversalCycle(n, "williams", onProgress, signal, chunk);
 }
 
+/**
+ * Zaks' explicit recursive Hamiltonian cycle (1984), an alternative to the
+ * greedy smallest-flip walk in `suffixReversalCycle`. The flip sequence is
+ * built directly from the recurrence (rₖ = suffix reversal of length k):
+ *
+ *   path₃   = r₃ r₂ r₃ r₂ r₃
+ *   pathₙ   = (pathₙ₋₁ rₙ)^(n−1) pathₙ₋₁
+ *   cycleₙ  = pathₙ rₙ
+ *
+ * `pathₙ` is a Hamiltonian path through all n! permutations; the closing flip
+ * returns to the identity (rₙ for n ≥ 4, r₂ for the n = 3 base — we detect it
+ * by searching rather than hard-coding, which also covers n = 2).
+ *
+ * The flip sizes never exceed n, so the whole sequence fits in a `Uint8Array`
+ * of n!−1 bytes — far cheaper than the greedy walk's `seen` set.
+ */
+function zaksRecursiveFlips(n: number): Uint8Array {
+  const len = factorial(n) - 1;
+  const seq = new Uint8Array(Math.max(len, 0));
+  let idx = 0;
+  const emit = (level: number): void => {
+    if (level <= 2) {
+      seq[idx++] = 2;
+      return;
+    }
+    if (level === 3) {
+      seq[idx++] = 3;
+      seq[idx++] = 2;
+      seq[idx++] = 3;
+      seq[idx++] = 2;
+      seq[idx++] = 3;
+      return;
+    }
+    for (let i = 0; i < level - 1; i++) {
+      emit(level - 1);
+      seq[idx++] = level;
+    }
+    emit(level - 1);
+  };
+  if (len > 0) emit(n);
+  return seq;
+}
+
+export async function zaksRecursiveCycle(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 50_000
+): Promise<PancakeCycle> {
+  throwIfAborted(signal);
+  const total = factorial(n);
+  const start = new Uint8Array(n);
+  for (let i = 0; i < n; i++) start[i] = i + 1;
+
+  const flipSeq = zaksRecursiveFlips(n);
+  const seen = new Set<string>([key(start)]);
+  const path: Perm[] = [start];
+  const flips: number[] = [];
+
+  let p = start;
+  for (let s = 0; s < flipSeq.length; s++) {
+    const k = flipSeq[s];
+    p = flip(p, k);
+    const pk = key(p);
+    if (seen.has(pk)) {
+      throw new Error("Zaks recursive construction revisited a permutation — should be impossible.");
+    }
+    seen.add(pk);
+    flips.push(k);
+    path.push(p);
+    if ((s + 1) % chunk === 0) {
+      onProgress?.(s + 1, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+
+  const startKey = key(start);
+  for (let k = 2; k <= n; k++) {
+    if (key(flip(p, k)) === startKey) {
+      flips.push(k);
+      break;
+    }
+  }
+
+  onProgress?.(total, total);
+  return { order: "zaks", path, flips };
+}
+
 export interface PancakeGraph {
   n: number;
   preset: GraphPreset;
@@ -280,6 +370,7 @@ export interface QuotientGraph {
 export function supportsQuotient(preset: GraphPreset): boolean {
   return (
     preset === "pancake-zaks" ||
+    preset === "pancake-zaks-recursive" ||
     preset === "pancake-williams" ||
     preset === "star" ||
     preset === "permutohedron" ||
@@ -376,7 +467,10 @@ export async function buildQuotientGraph(
   const superMap = new Map<number, number>();
 
   const total = path.length;
-  const isPancake = preset === "pancake-zaks" || preset === "pancake-williams";
+  const isPancake =
+    preset === "pancake-zaks" ||
+    preset === "pancake-zaks-recursive" ||
+    preset === "pancake-williams";
   const genApplies = isPancake
     ? []
     : graphGenerators(n, preset).map((g) => g.apply);
@@ -525,6 +619,12 @@ export async function buildPancakeGraph(
       ? await simplexOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : preset === "complete"
       ? await completeOrder(n, (done, total) => onProgress?.("cycle", done, total))
+      : preset === "pancake-zaks-recursive"
+      ? await zaksRecursiveCycle(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
       : order === undefined
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
@@ -794,6 +894,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
   switch (preset) {
     case "pancake-zaks":
       return "Pancake graph — Zaks";
+    case "pancake-zaks-recursive":
+      return "Pancake graph — Zaks (recursive)";
     case "pancake-williams":
       return "Pancake graph — Williams";
     case "star":
@@ -825,6 +927,8 @@ export function graphPresetDescription(preset: GraphPreset): string {
   switch (preset) {
     case "pancake-zaks":
       return "Suffix reversals, minimum new flip (Zaks 1984)";
+    case "pancake-zaks-recursive":
+      return "Suffix reversals, Zaks' explicit recursion pathₙ = (pathₙ₋₁ rₙ)ⁿ⁻¹ pathₙ₋₁";
     case "pancake-williams":
       return "Suffix reversals, maximum new flip";
     case "star":
@@ -880,7 +984,11 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
   ) {
     return ((n * (n - 1)) / 2 * factorial(n)) / 2;
   }
-  if (preset === "pancake-zaks" || preset === "pancake-williams") {
+  if (
+    preset === "pancake-zaks" ||
+    preset === "pancake-zaks-recursive" ||
+    preset === "pancake-williams"
+  ) {
     const generatorCount = n > 6 ? 1 : n - 1;
     return (generatorCount * factorial(n)) / 2;
   }
@@ -901,7 +1009,12 @@ export function graphMaxN(preset: GraphPreset): number {
   // is O((n!)²). n = 6 already gives 720 vertices, 719 generators, and
   // ~259k edges; n = 7 would be 5040 vertices and ~12.7M edges, so cap here.
   if (preset === "cayley-complete") return 6;
-  if (preset === "pancake-zaks" || preset === "pancake-williams") return 11;
+  if (
+    preset === "pancake-zaks" ||
+    preset === "pancake-zaks-recursive" ||
+    preset === "pancake-williams"
+  )
+    return 11;
   return preset === "kaleidoscope" ||
     preset === "transposition" ||
     preset === "lexicographic"
