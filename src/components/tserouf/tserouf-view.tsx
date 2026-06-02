@@ -17,9 +17,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { factorial, key, type Perm } from "@/lib/pancake";
+import { renderTseroufWav, TseroufPlayer } from "@/lib/tserouf-audio";
 import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
 import { toPng } from "html-to-image";
-import { Download, Loader2 } from "lucide-react";
+import {
+  Download,
+  Loader2,
+  Music,
+  Pause,
+  Play,
+  RotateCcw,
+} from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
@@ -39,6 +47,10 @@ const WORDS_PER_LINE = 6;
 const HEBREW_LETTERS = ["א", "ב", "ג", "ד", "ה", "ו", "ז"] as const;
 const ELOHIM_LETTERS = ["א", "ל", "ה", "י", "ם"] as const;
 const ELOHIM_N = 5;
+const AMASH_LETTERS = ["א", "מ", "ש"] as const;
+const AMASH_N = 3;
+const YHW_LETTERS = ["י", "ה", "ו"] as const;
+const YHW_N = 3;
 const SOURCE_HEBREW_ROWS = [
   ["שתי אבנים", "בונות", "שני בתים"],
   ["שלש", "בונות", "ששה בתים"],
@@ -62,12 +74,12 @@ const SOURCE_TRANSLATION_OUTRO =
 type NValue = (typeof N_OPTIONS)[number];
 type Alphabet = "latin" | "hebrew";
 type Layout = "flat" | "tree";
-type LetterSet = "sequence" | "elohim";
+type LetterSet = "sequence" | "elohim" | "amash" | "yhw";
 
 const DEFAULT_N: NValue = 3;
 const ALPHABETS: readonly Alphabet[] = ["latin", "hebrew"];
 const LAYOUTS: readonly Layout[] = ["flat", "tree"];
-const LETTER_SETS: readonly LetterSet[] = ["sequence", "elohim"];
+const LETTER_SETS: readonly LetterSet[] = ["sequence", "elohim", "amash", "yhw"];
 
 interface TseroufState {
   n: NValue;
@@ -85,6 +97,16 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet };
   }
 
+  // The "amash" set is the three mother letters, a fixed 3-letter Hebrew word.
+  if (letterSet === "amash") {
+    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet };
+  }
+
+  // The "yhw" set is a fixed 3-letter Hebrew word.
+  if (letterSet === "yhw") {
+    return { n: YHW_N, alphabet: "hebrew", layout, letterSet };
+  }
+
   return {
     n: readIntParam(params, "n", N_OPTIONS, DEFAULT_N) as NValue,
     alphabet: readEnumParam(params, "alphabet", ALPHABETS, "latin"),
@@ -94,7 +116,10 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
 }
 
 function hebrewLettersFor(letterSet: LetterSet): readonly string[] {
-  return letterSet === "elohim" ? ELOHIM_LETTERS : HEBREW_LETTERS;
+  if (letterSet === "elohim") return ELOHIM_LETTERS;
+  if (letterSet === "amash") return AMASH_LETTERS;
+  if (letterSet === "yhw") return YHW_LETTERS;
+  return HEBREW_LETTERS;
 }
 
 const HebrewLettersContext = createContext<readonly string[]>(HEBREW_LETTERS);
@@ -105,6 +130,9 @@ function useHebrewLetters(): readonly string[] {
 
 type TileRegister = (word: string, el: HTMLElement | null) => void;
 const TileRegisterContext = createContext<TileRegister | null>(null);
+
+// The permutation currently sounding during playback, so tiles can highlight.
+const PlayingWordContext = createContext<string | null>(null);
 
 interface EdgeSpec {
   path: string;
@@ -148,7 +176,13 @@ export function TseroufView() {
   const [copied, setCopied] = useState(false);
   const [running, setRunning] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [playState, setPlayState] = useState<"stopped" | "playing" | "paused">(
+    "stopped"
+  );
+  const [playingWord, setPlayingWord] = useState<string | null>(null);
+  const [renderingAudio, setRenderingAudio] = useState(false);
   const renderRef = useRef<HTMLDivElement>(null);
+  const playerRef = useRef<TseroufPlayer | null>(null);
 
   const hebrewLetters = useMemo(() => hebrewLettersFor(letterSet), [letterSet]);
   const baseWord = useMemo(
@@ -172,6 +206,12 @@ export function TseroufView() {
     setLetterSet(value);
     if (value === "elohim") {
       setN(ELOHIM_N);
+      setAlphabet("hebrew");
+    } else if (value === "amash") {
+      setN(AMASH_N);
+      setAlphabet("hebrew");
+    } else if (value === "yhw") {
+      setN(YHW_N);
       setAlphabet("hebrew");
     }
   };
@@ -274,6 +314,82 @@ export function TseroufView() {
     }
   };
 
+  const stopPlayback = useCallback(() => {
+    playerRef.current?.stop();
+    setPlayState("stopped");
+    setPlayingWord(null);
+  }, []);
+
+  const startPlayback = () => {
+    if (words.length === 0) return;
+    if (!playerRef.current) playerRef.current = new TseroufPlayer();
+    setPlayState("playing");
+    setStatus("Playing the music of Tserouf…");
+    playerRef.current.play(words, {
+      loop: true,
+      onStep: (index) => setPlayingWord(words[index]?.word ?? null),
+      onEnd: () => {
+        setPlayState("stopped");
+        setPlayingWord(null);
+        setStatus("Tserouf playback finished.");
+      },
+    });
+  };
+
+  const togglePlay = () => {
+    if (playState === "playing") {
+      playerRef.current?.pause();
+      setPlayState("paused");
+      setStatus("Paused.");
+      return;
+    }
+    if (playState === "paused") {
+      playerRef.current?.resume();
+      setPlayState("playing");
+      setStatus("Playing the music of Tserouf…");
+      return;
+    }
+    startPlayback();
+  };
+
+  const resetPlayback = () => {
+    stopPlayback();
+    setStatus("Ready.");
+  };
+
+  const downloadAudio = async () => {
+    if (words.length === 0) return;
+    setRenderingAudio(true);
+    setStatus("Rendering audio…");
+    try {
+      const blob = await renderTseroufWav(words);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `tserouf_${baseWord}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus("Audio file downloaded.");
+    } catch (e) {
+      setStatus(
+        `Audio render failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    } finally {
+      setRenderingAudio(false);
+    }
+  };
+
+  // Stop any playback when the sequence changes or the view unmounts.
+  useEffect(() => {
+    stopPlayback();
+  }, [words, stopPlayback]);
+
+  useEffect(() => {
+    return () => playerRef.current?.dispose();
+  }, []);
+
   return (
     <div className="space-y-6">
       <SourcePassage />
@@ -321,6 +437,22 @@ export function TseroufView() {
                     אלהים
                   </span>
                 </SelectItem>
+                <SelectItem value="amash">
+                  <span
+                    dir="rtl"
+                    className="font-[family-name:var(--font-hebrew)]"
+                  >
+                    אמש
+                  </span>
+                </SelectItem>
+                <SelectItem value="yhw">
+                  <span
+                    dir="rtl"
+                    className="font-[family-name:var(--font-hebrew)]"
+                  >
+                    יהו
+                  </span>
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -332,7 +464,12 @@ export function TseroufView() {
             <Select
               value={String(n)}
               onValueChange={(value) => setN(Number(value) as NValue)}
-              disabled={running || letterSet === "elohim"}
+              disabled={
+                running ||
+                letterSet === "elohim" ||
+                letterSet === "amash" ||
+                letterSet === "yhw"
+              }
             >
               <SelectTrigger className="w-full">
                 <SelectValue />
@@ -411,6 +548,53 @@ export function TseroufView() {
             {exporting ? "Exporting…" : "download tserouf as PNG"}
           </Button>
 
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              variant={playState !== "stopped" ? "default" : "outline"}
+              className="flex-1"
+              onClick={togglePlay}
+              disabled={running || words.length === 0}
+            >
+              {playState === "playing" ? (
+                <Pause className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              {playState === "playing"
+                ? "pause"
+                : playState === "paused"
+                ? "resume"
+                : "play the music of Tserouf"}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              aria-label="Reset playback"
+              title="Reset"
+              onClick={resetPlayback}
+              disabled={running || playState === "stopped"}
+            >
+              <RotateCcw className="h-4 w-4" />
+            </Button>
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            onClick={downloadAudio}
+            disabled={running || renderingAudio || words.length === 0}
+          >
+            {renderingAudio ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Music className="h-4 w-4" />
+            )}
+            {renderingAudio ? "Rendering…" : "download audio (WAV)"}
+          </Button>
+
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
             <Stat
               label="Word"
@@ -441,13 +625,15 @@ export function TseroufView() {
             </div>
           ) : recursiveCell ? (
             <HebrewLettersContext.Provider value={hebrewLetters}>
-              <div ref={renderRef} className="p-2 font-mono text-sm">
-                {layout === "tree" ? (
-                  <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
-                ) : (
-                  <FlatWordsView words={words} alphabet={alphabet} n={n} />
-                )}
-              </div>
+              <PlayingWordContext.Provider value={playingWord}>
+                <div ref={renderRef} className="p-2 font-mono text-sm">
+                  {layout === "tree" ? (
+                    <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
+                  ) : (
+                    <FlatWordsView words={words} alphabet={alphabet} n={n} />
+                  )}
+                </div>
+              </PlayingWordContext.Provider>
             </HebrewLettersContext.Provider>
           ) : null}
         </CardContent>
@@ -960,21 +1146,38 @@ function WordTile({
   const isHebrew = alphabet === "hebrew";
   const hebrewLetters = useHebrewLetters();
   const register = useContext(TileRegisterContext);
+  const playingWord = useContext(PlayingWordContext);
   const word = item.word;
+  const isActive = playingWord === word;
+  const elRef = useRef<HTMLSpanElement | null>(null);
   const setRef = useCallback(
     (el: HTMLSpanElement | null) => {
+      elRef.current = el;
       register?.(word, el);
     },
     [register, word]
   );
+  useEffect(() => {
+    if (isActive) {
+      elRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [isActive]);
   return (
     <span
       ref={setRef}
       dir={isHebrew ? "rtl" : "ltr"}
       title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
-      className={`inline-flex rounded-md border px-1.5 py-0.5 text-2xl leading-8 [unicode-bidi:isolate] ${parityClassName(
+      className={`inline-flex rounded-md border px-1.5 py-0.5 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] ${parityClassName(
         item.word
       )} ${
+        isActive
+          ? `ring-2 ring-offset-1 ring-offset-background ${
+              isEvenPermutationWord(item.word)
+                ? "ring-sky-500 dark:ring-sky-300"
+                : "ring-rose-500 dark:ring-rose-300"
+            }`
+          : ""
+      } ${
         isHebrew
           ? "font-[family-name:var(--font-hebrew)] font-medium"
           : "font-[family-name:var(--font-mystic)]"
