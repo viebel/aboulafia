@@ -22,8 +22,13 @@
  */
 
 import { permutahedronCompressionOrder } from "./permutahedron-compression";
+import {
+  asymmetricTreeCycleOrder,
+  asymmetricTreeEdges,
+} from "./asymmetric-tree-cycle";
 
 export { permutahedronCompressionFactor } from "./permutahedron-compression";
+export { asymmetricTreeCompressionFactor } from "./asymmetric-tree-cycle";
 
 export type Perm = Uint8Array<ArrayBuffer>;
 
@@ -641,6 +646,12 @@ export async function buildPancakeGraph(
           (done, total) => onProgress?.("cycle", done, total),
           signal
         )
+      : preset === "asymmetric-tree"
+      ? await asymmetricTreeCycleOrder(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
       : order === undefined
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
@@ -1247,6 +1258,9 @@ export function graphMaxN(preset: GraphPreset): number {
   // is O((n!)²). n = 6 already gives 720 vertices, 719 generators, and
   // ~259k edges; n = 7 would be 5040 vertices and ~12.7M edges, so cap here.
   if (preset === "cayley-complete") return 6;
+  // The symmetric Hamilton-cycle layout is built for small orders only (the
+  // quotient search is meant for n ≤ 8); beyond that the cycle is not computed.
+  if (preset === "asymmetric-tree") return 8;
   if (
     preset === "pancake-zaks" ||
     preset === "pancake-zaks-recursive" ||
@@ -1279,25 +1293,6 @@ function graphKind(preset: GraphPreset): GraphKind {
     return preset;
   }
   return "pancake";
-}
-
-/**
- * Edges of the asymmetric transposition tree on positions 1..n, as ordered
- * pairs [a, b] with a < b. A path 1–2–…–(n-1) plus a leaf n hung off vertex 3
- * (a 3-leg spider). For n ≥ 7 the three legs have distinct lengths, so the
- * tree is rigid (Aut = 1); for n ≤ 4 it degenerates to the plain path
- * 1–2–…–n. The result always spans all n positions, so the transpositions
- * generate Sₙ and the Cayley graph is connected.
- */
-function asymmetricTreeEdges(n: number): Array<[number, number]> {
-  const edges: Array<[number, number]> = [];
-  if (n <= 4) {
-    for (let i = 1; i <= n - 1; i++) edges.push([i, i + 1]);
-    return edges;
-  }
-  for (let i = 1; i <= n - 2; i++) edges.push([i, i + 1]);
-  edges.push([3, n]);
-  return edges;
 }
 
 function graphGenerators(n: number, preset: GraphPreset): Generator[] {
