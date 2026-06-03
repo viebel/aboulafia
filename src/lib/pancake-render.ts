@@ -14,7 +14,6 @@
 import {
   factorial,
   forEachZaksFundamentalEdge,
-  zaksBlock0,
   type PancakeGraph,
   type QuotientGraph,
 } from "./pancake";
@@ -29,6 +28,23 @@ import {
 export type ParityMode = "off" | "both" | "even" | "odd";
 export type EdgeRenderMode = "line" | "density";
 
+/**
+ * Color scheme for the Symmetry renderer, used to visualize the dihedral (Dₙ)
+ * symmetry of the Zaks pancake layout (the two generators ρ: i ↦ i+(n-1)! and
+ * ω: i ↦ (n!-1)-i acting on the index ring ℤ/n!):
+ *   - "parity"  → the default edge coloring (by endpoint parity).
+ *   - "orbit"   → one hue per Cₙ rotation orbit. The orbit of a chord {i,j} is
+ *                 the n chords {i+kB, j+kB} (B = (n-1)!); the symmetry renderer
+ *                 draws one representative per orbit and rotates it n times, so
+ *                 giving each representative its own hue makes every color class
+ *                 a clean rotated n-set — the decisive Cₙ test.
+ *   - "blocks"  → band the n! dots into n arcs of (n-1)! by leading symbol (one
+ *                 ρ-block / Pₙ₋₁ copy each) and split the chords into the two
+ *                 superimposed families: short within-block reversals (r₂…rₙ₋₁)
+ *                 and long between-block full reversals (rₙ).
+ */
+export type SymmetryColoring = "parity" | "orbit" | "blocks";
+
 export interface RenderSettings {
   alpha: number;
   width: number;
@@ -40,6 +56,16 @@ export interface RenderSettings {
   edgeMode?: EdgeRenderMode;
   /** Generator ids whose edges should be skipped at render time. */
   hiddenGenerators: number[];
+  /** Symmetry-renderer color scheme (defaults to "parity"). */
+  symmetryColoring?: SymmetryColoring;
+  /**
+   * Draw the Dₙ overlay on the Symmetry renderer: the n radial sector lines at
+   * the ρ-block boundaries, a shaded fundamental 360/n wedge, and the ω mirror
+   * axis (through the midpoints of the edges fixed by the reflection). This is
+   * the only annotation that confirms the full dihedral group rather than just
+   * the rotation Cₙ.
+   */
+  showDihedralAxes?: boolean;
 }
 
 export interface Palette {
@@ -51,6 +77,18 @@ export interface Palette {
   cayleyOddStroke: string;
   cycleStroke: string;
   labelFill: string;
+  /** Bright fill for vertex dots when index labels are shown (legibility). */
+  labelVertexFill: string;
+  /** ω mirror axis (the decisive reflection line). */
+  dihedralAxis: string;
+  /** ρ-block boundary / sector lines. */
+  dihedralSector: string;
+  /** Fundamental 360/n wedge shading. */
+  dihedralWedge: string;
+  /** Short within-block reversals (r₂…rₙ₋₁) in the "blocks" color scheme. */
+  blockWithinStroke: string;
+  /** Long between-block full reversals (rₙ) in the "blocks" color scheme. */
+  blockBetweenStroke: string;
 }
 
 export const DEFAULT_PALETTE: Palette = {
@@ -63,6 +101,14 @@ export const DEFAULT_PALETTE: Palette = {
   cayleyOddStroke: "#f43f5e",
   cycleStroke: "#666666",
   labelFill: "#111111",
+  // Bright dot behind index labels so the dark digits stay readable (the normal
+  // near-black dots make label text illegible).
+  labelVertexFill: "#cbd5e1", // slate-300
+  dihedralAxis: "#7c3aed", // violet-600
+  dihedralSector: "#94a3b8", // slate-400
+  dihedralWedge: "#7c3aed", // violet-600 (low alpha when filled)
+  blockWithinStroke: "#0ea5e9", // sky-500 — short, local chords
+  blockBetweenStroke: "#111827", // gray-900 — long rₙ skeleton
 };
 
 interface SizingConstants {
@@ -142,6 +188,467 @@ function sizingN(graph: PancakeGraph): number {
   return graph.kind === "sliding-puzzle" ? 2 * graph.n : graph.n;
 }
 
+/* --------------------------- dihedral symmetry ---------------------------- */
+
+/** Opaque HSL stroke color (alpha is applied separately when compositing). */
+function hsl(hue: number, sat = 72, light = 50): string {
+  return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
+}
+
+/**
+ * Hue for the q-th Cₙ orbit (0 ≤ q < count). One color per rotation orbit, so
+ * a clean rotated n-set proves the rotation. The golden-angle stride keeps
+ * adjacent representatives visually distinct even when count is large.
+ */
+function orbitColor(q: number): string {
+  // Golden-angle hopping decorrelates neighbors; the modulo keeps it in [0,360).
+  const hue = (q * 137.508) % 360;
+  return hsl(hue, 70, 48);
+}
+
+/** Hue for a ρ-block (leading-symbol arc), 0 ≤ block < n. `light` brightens it
+ * (used for banded vertex dots under index labels so dark digits stay legible). */
+function blockColor(block: number, n: number, light = false): string {
+  return hsl((block / Math.max(1, n)) * 360, light ? 72 : 65, light ? 78 : 47);
+}
+
+/**
+ * The angular offset of the ρ-block boundaries (and of the ω axis). A boundary
+ * sits between vertex bB-1 and bB, i.e. at angle 2πb/n - π/n!. The reflection
+ * ω: i ↦ (n!-1)-i maps angle θ ↦ -2π/n! - θ, whose axis is the b = 0 boundary
+ * line at -π/n! (through the midpoint of the fixed v_{n!-1}-v₀ edge).
+ */
+function dihedralOffset(total: number): number {
+  return -Math.PI / total;
+}
+
+interface DihedralOverlayGeom {
+  n: number;
+  total: number;
+  c: number;
+  cy: number;
+  r: number;
+  scale: number;
+}
+
+/**
+ * Draw the Dₙ overlay onto a canvas: a shaded fundamental wedge, the n radial
+ * ρ-block boundary lines, and the dashed ω mirror axis (a full diameter).
+ */
+function drawDihedralOverlayToCanvas(
+  ctx: CanvasRenderingContext2D,
+  geom: DihedralOverlayGeom,
+  palette: Palette
+): void {
+  const { n, total, c, cy, r, scale } = geom;
+  const off = dihedralOffset(total);
+  const step = (2 * Math.PI) / n;
+
+  ctx.save();
+  ctx.setLineDash([]);
+
+  // Shaded fundamental 360/n wedge (block 0 = one ρ-orbit fundamental domain).
+  ctx.beginPath();
+  ctx.moveTo(c, cy);
+  ctx.arc(c, cy, r, off, off + step);
+  ctx.closePath();
+  ctx.fillStyle = withAlpha(palette.dihedralWedge, 0.1);
+  ctx.fill();
+
+  // Radial ρ-block boundary lines (the n sector spokes).
+  ctx.lineWidth = Math.max(0.8, 1.1 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.9);
+  for (let b = 0; b < n; b++) {
+    const a = off + step * b;
+    ctx.beginPath();
+    ctx.moveTo(c, cy);
+    ctx.lineTo(c + r * Math.cos(a), cy + r * Math.sin(a));
+    ctx.stroke();
+  }
+
+  // ω mirror axis: a dashed diameter through the two fixed edge-midpoints.
+  ctx.lineWidth = Math.max(1.4, 1.9 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralAxis, 0.95);
+  ctx.setLineDash([8 * scale, 6 * scale]);
+  const ext = r * 1.04;
+  ctx.beginPath();
+  ctx.moveTo(c + ext * Math.cos(off), cy + ext * Math.sin(off));
+  ctx.lineTo(c + ext * Math.cos(off + Math.PI), cy + ext * Math.sin(off + Math.PI));
+  ctx.stroke();
+
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+/** Apply an alpha to a hex (#rrggbb) or `hsl(...)` color string. */
+function applyAlpha(color: string, alpha: number): string {
+  const a = Math.max(0, Math.min(1, alpha));
+  if (color.startsWith("hsl(")) {
+    return color.replace("hsl(", "hsla(").replace(/\)\s*$/, `, ${a})`);
+  }
+  return withAlpha(color, a);
+}
+
+/**
+ * The active dihedral color scheme for a graph, or null when it does not apply
+ * (non-Zaks preset, or the default "parity" scheme). Used by the flat Canvas /
+ * SVG renderers, which only honor orbit/blocks coloring on the rotationally
+ * symmetric Zaks layouts.
+ */
+function dihedralColoring(
+  graph: Pick<PancakeGraph, "preset">,
+  settings: RenderSettings
+): Exclude<SymmetryColoring, "parity"> | null {
+  const c = settings.symmetryColoring ?? "parity";
+  if (c === "parity") return null;
+  return supportsSymmetry(graph) ? c : null;
+}
+
+/**
+ * Canonical id of a chord's Cₙ orbit: the lexicographically smallest rotated
+ * index pair, encoded lo·total+hi. Two chords share an orbit iff one maps to
+ * the other under a shift i ↦ i+kB (B = (n-1)!), so this is rotation-invariant.
+ */
+function canonicalOrbitCode(
+  i: number,
+  j: number,
+  n: number,
+  total: number,
+  B: number
+): number {
+  let best = Infinity;
+  for (let k = 0; k < n; k++) {
+    const a = (i + k * B) % total;
+    const b = (j + k * B) % total;
+    const lo = a < b ? a : b;
+    const hi = a < b ? b : a;
+    const code = lo * total + hi;
+    if (code < best) best = code;
+  }
+  return best;
+}
+
+// Canonical-orbit-code → orbit index q, in the SAME order the Symmetry renderer
+// assigns hues (forEachZaksFundamentalEdge enumeration). Sharing this map makes
+// the flat Canvas/SVG orbit coloring, the Symmetry view, and the orbit table
+// all agree on a hue per orbit. Cached per n (independent of any graph build).
+const orbitQMapCache = new Map<number, Map<number, number>>();
+function orbitQMapFor(n: number): Map<number, number> {
+  const cached = orbitQMapCache.get(n);
+  if (cached) return cached;
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const map = new Map<number, number>();
+  let q = 0;
+  forEachZaksFundamentalEdge(n, (e) => {
+    map.set(canonicalOrbitCode(e.i, e.j, n, total, B), q);
+    q++;
+  });
+  orbitQMapCache.set(n, map);
+  return map;
+}
+
+// One color per edge (Cₙ-orbit hue), cached on the graph's edge array — a fresh
+// build allocates a new Uint32Array, so identity is a safe, GC-friendly key.
+// Recomputing on every zoom/pan would be wasteful (it is O(n · edges)).
+const orbitColorCache = new WeakMap<Uint32Array, string[]>();
+
+/**
+ * Assign every (flat) edge the hue of its Cₙ rotation orbit, so all n members
+ * get one color — the same "clean rotated n-set" the Symmetry renderer shows,
+ * but for the full disk. For pancake-zaks the hue index comes from the shared
+ * fundamental-edge map (so flat/symmetry/table colors match); other symmetric
+ * layouts (e.g. the recursive Zaks order, whose index ring differs) fall back
+ * to a first-seen ordering.
+ */
+function orbitColorsForGraph(graph: PancakeGraph): string[] {
+  const cached = orbitColorCache.get(graph.edges);
+  if (cached) return cached;
+  const { n, edges, preset } = graph;
+  const total = graph.path.length;
+  const B = total / n;
+  const numEdges = edges.length / 3;
+  const colors = new Array<string>(numEdges);
+  if (preset === "pancake-zaks") {
+    const qmap = orbitQMapFor(n);
+    for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
+      const code = canonicalOrbitCode(edges[t], edges[t + 1], n, total, B);
+      colors[e] = orbitColor(qmap.get(code) ?? 0);
+    }
+  } else {
+    const keyToOrbit = new Map<number, number>();
+    let nextOrbit = 0;
+    for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
+      const code = canonicalOrbitCode(edges[t], edges[t + 1], n, total, B);
+      let orbit = keyToOrbit.get(code);
+      if (orbit === undefined) {
+        orbit = nextOrbit++;
+        keyToOrbit.set(code, orbit);
+      }
+      colors[e] = orbitColor(orbit);
+    }
+  }
+  orbitColorCache.set(graph.edges, colors);
+  return colors;
+}
+
+/** One Cₙ orbit of chords for the orbit table: its hue, generator, and the
+ *  n (or n/2 for antipodal "diameter" chords) index pairs that make it up. */
+export interface OrbitInfo {
+  /** Hue matching the rendered orbit coloring (opaque). */
+  color: string;
+  /** Suffix-reversal length rₖ shared by every chord in the orbit. */
+  gen: number;
+  /** Antipodal diameter orbit (size n/2) vs a generic orbit (size n). */
+  half: boolean;
+  /** The orbit's index pairs {i, j}, each sorted, then sorted as a list. */
+  pairs: Array<[number, number]>;
+}
+
+/**
+ * Build the Cₙ orbit table for the pancake-zaks layout straight from the
+ * recursive fundamental sector — one orbit per representative, expanded to its
+ * full set of rotated index pairs {i+kB, j+kB} mod n!. O((n-1)!), so it never
+ * needs the materialized n! graph. Hues match the Symmetry / flat renderers.
+ */
+export function computeZaksOrbits(n: number): OrbitInfo[] {
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const orbits: OrbitInfo[] = [];
+  let q = 0;
+  forEachZaksFundamentalEdge(n, (e) => {
+    const color = orbitColor(q);
+    q++;
+    const repeats = e.half ? n / 2 : n;
+    const pairs: Array<[number, number]> = [];
+    for (let k = 0; k < repeats; k++) {
+      const a = (e.i + k * B) % total;
+      const b = (e.j + k * B) % total;
+      pairs.push(a < b ? [a, b] : [b, a]);
+    }
+    pairs.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+    orbits.push({ color, gen: e.gen, half: e.half, pairs });
+  });
+  orbits.sort((a, b) => a.gen - b.gen || a.pairs[0][0] - b.pairs[0][0]);
+  return orbits;
+}
+
+/**
+ * Enumerate the fundamental sector of the Zaks layout once and split it into
+ * paintable masks according to the chosen color scheme. Each mask is rotated
+ * `repeats` times by the canvas compositor, reproducing the full n!-vertex disk
+ * from the O((n-1)!) fundamental domain.
+ */
+function buildSectorMasks(
+  n: number,
+  coloring: SymmetryColoring,
+  settings: RenderSettings,
+  palette: Palette,
+  total: number,
+  c: number,
+  cy: number,
+  r: number
+): ZaksSymmetryMask[] {
+  const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+  const halfTurns = n % 2 === 0 ? n / 2 : 0;
+  const seg = (e: { i: number; j: number }): [number, number, number, number] => {
+    const [ax, ay] = pointXY(e.i, total, c, cy, r);
+    const [bx, by] = pointXY(e.j, total, c, cy, r);
+    return [ax, ay, bx, by];
+  };
+
+  if (coloring === "orbit") {
+    // One hue per orbit: each fundamental representative is its own color, and
+    // the n (or n/2) rotated copies inherit it — so every color class is a
+    // clean rotated n-set.
+    const fullCoords: number[] = [];
+    const fullColors: string[] = [];
+    const halfCoords: number[] = [];
+    const halfColors: string[] = [];
+    let q = 0;
+    forEachZaksFundamentalEdge(n, (e) => {
+      const color = orbitColor(q);
+      q++;
+      if (hidden && hidden.has(e.gen)) return;
+      const [ax, ay, bx, by] = seg(e);
+      if (e.half) {
+        halfCoords.push(ax, ay, bx, by);
+        halfColors.push(color);
+      } else {
+        fullCoords.push(ax, ay, bx, by);
+        fullColors.push(color);
+      }
+    });
+    const masks: ZaksSymmetryMask[] = [
+      { repeats: n, coords: Float32Array.from(fullCoords), color: null, colors: fullColors },
+    ];
+    if (halfTurns > 0 && halfCoords.length > 0) {
+      masks.push({
+        repeats: halfTurns,
+        coords: Float32Array.from(halfCoords),
+        color: null,
+        colors: halfColors,
+      });
+    }
+    return masks;
+  }
+
+  if (coloring === "blocks") {
+    // Split the two superimposed chord families: short within-block reversals
+    // (r₂…rₙ₋₁, which keep the leading symbol) vs the long between-block full
+    // reversal rₙ that forms the near-diametral n-gon/n-gram skeleton.
+    const withinFull: number[] = [];
+    const betweenFull: number[] = [];
+    const betweenHalf: number[] = [];
+    forEachZaksFundamentalEdge(n, (e) => {
+      if (hidden && hidden.has(e.gen)) return;
+      const [ax, ay, bx, by] = seg(e);
+      if (e.gen < n) {
+        withinFull.push(ax, ay, bx, by);
+      } else if (e.half) {
+        betweenHalf.push(ax, ay, bx, by);
+      } else {
+        betweenFull.push(ax, ay, bx, by);
+      }
+    });
+    const masks: ZaksSymmetryMask[] = [];
+    // Within-block chords first (light), then the rₙ skeleton on top (dark).
+    if (withinFull.length > 0) {
+      masks.push({
+        repeats: n,
+        coords: Float32Array.from(withinFull),
+        color: palette.blockWithinStroke,
+        colors: null,
+      });
+    }
+    if (betweenFull.length > 0) {
+      masks.push({
+        repeats: n,
+        coords: Float32Array.from(betweenFull),
+        color: palette.blockBetweenStroke,
+        colors: null,
+      });
+    }
+    if (halfTurns > 0 && betweenHalf.length > 0) {
+      masks.push({
+        repeats: halfTurns,
+        coords: Float32Array.from(betweenHalf),
+        color: palette.blockBetweenStroke,
+        colors: null,
+      });
+    }
+    return masks;
+  }
+
+  // Default: parity coloring (mirrors parityPasses / the legacy buckets).
+  const mode = settings.parityMode;
+  const neutralF: number[] = [];
+  const neutralH: number[] = [];
+  const evenF: number[] = [];
+  const evenH: number[] = [];
+  const oddF: number[] = [];
+  const oddH: number[] = [];
+  let evenWeight = 0;
+  let oddWeight = 0;
+  forEachZaksFundamentalEdge(n, (e) => {
+    const orbit = e.half ? n / 2 : n;
+    if (e.parityXor === 0) evenWeight += orbit;
+    else oddWeight += orbit;
+    if (hidden && hidden.has(e.gen)) return;
+    let full: number[];
+    let half: number[];
+    if (mode === "off") {
+      full = neutralF;
+      half = neutralH;
+    } else if (mode === "even") {
+      if (e.parityXor !== 0) return;
+      full = evenF;
+      half = evenH;
+    } else if (mode === "odd") {
+      if (e.parityXor !== 1) return;
+      full = oddF;
+      half = oddH;
+    } else if (e.parityXor === 0) {
+      full = evenF;
+      half = evenH;
+    } else {
+      full = oddF;
+      half = oddH;
+    }
+    const [ax, ay, bx, by] = seg(e);
+    if (e.half) half.push(ax, ay, bx, by);
+    else full.push(ax, ay, bx, by);
+  });
+  const mk = (color: string, f: number[], hh: number[]): ZaksSymmetryMask[] => {
+    const out: ZaksSymmetryMask[] = [];
+    if (f.length > 0) out.push({ repeats: n, coords: Float32Array.from(f), color, colors: null });
+    if (halfTurns > 0 && hh.length > 0) {
+      out.push({ repeats: halfTurns, coords: Float32Array.from(hh), color, colors: null });
+    }
+    return out;
+  };
+  if (mode === "off") return mk(palette.cayleyStroke, neutralF, neutralH);
+  if (mode === "even") return mk(palette.cayleyEvenStroke, evenF, evenH);
+  if (mode === "odd") return mk(palette.cayleyOddStroke, oddF, oddH);
+  return evenWeight >= oddWeight
+    ? [...mk(palette.cayleyEvenStroke, evenF, evenH), ...mk(palette.cayleyOddStroke, oddF, oddH)]
+    : [...mk(palette.cayleyOddStroke, oddF, oddH), ...mk(palette.cayleyEvenStroke, evenF, evenH)];
+}
+
+/** SVG fragment for the Dₙ overlay (same geometry as the canvas version). */
+function dihedralOverlaySVG(
+  geom: { n: number; total: number; c: number; r: number; scale: number },
+  palette: Palette
+): string {
+  const { n, total, c, r, scale } = geom;
+  const off = dihedralOffset(total);
+  const step = (2 * Math.PI) / n;
+  const parts: string[] = [];
+
+  const wx0 = c + r * Math.cos(off);
+  const wy0 = c + r * Math.sin(off);
+  const wx1 = c + r * Math.cos(off + step);
+  const wy1 = c + r * Math.sin(off + step);
+  const large = step > Math.PI ? 1 : 0;
+  parts.push(
+    `<path d="M${c},${c}L${wx0.toFixed(2)},${wy0.toFixed(2)}A${r.toFixed(2)},${r.toFixed(
+      2
+    )} 0 ${large} 1 ${wx1.toFixed(2)},${wy1.toFixed(2)}Z" fill="${palette.dihedralWedge}" fill-opacity="0.1"/>`
+  );
+
+  for (let b = 0; b < n; b++) {
+    const a = off + step * b;
+    const x = c + r * Math.cos(a);
+    const y = c + r * Math.sin(a);
+    parts.push(
+      `<line x1="${c}" y1="${c}" x2="${x.toFixed(2)}" y2="${y.toFixed(
+        2
+      )}" stroke="${palette.dihedralSector}" stroke-width="${Math.max(
+        0.8,
+        1.1 * scale
+      )}" stroke-opacity="0.9"/>`
+    );
+  }
+
+  const ext = r * 1.04;
+  const ax0 = c + ext * Math.cos(off);
+  const ay0 = c + ext * Math.sin(off);
+  const ax1 = c + ext * Math.cos(off + Math.PI);
+  const ay1 = c + ext * Math.sin(off + Math.PI);
+  parts.push(
+    `<line x1="${ax0.toFixed(2)}" y1="${ay0.toFixed(2)}" x2="${ax1.toFixed(
+      2
+    )}" y2="${ay1.toFixed(2)}" stroke="${palette.dihedralAxis}" stroke-width="${Math.max(
+      1.4,
+      1.9 * scale
+    )}" stroke-opacity="0.95" stroke-dasharray="${(8 * scale).toFixed(2)},${(
+      6 * scale
+    ).toFixed(2)}"/>`
+  );
+
+  return parts.join("");
+}
+
 /* --------------------------------- canvas --------------------------------- */
 
 interface CanvasDrawOpts {
@@ -196,6 +703,10 @@ export function drawToCanvas(
   const k = constantsFor(n, scale);
   const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
   const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
+  // Orbit/blocks coloring applies only to the Zaks layouts and only in line
+  // mode (the density binning has no per-edge identity to color).
+  const coloring =
+    settings.edgeMode === "density" ? null : dihedralColoring(graph, settings);
 
   ctx.lineCap = "round";
 
@@ -229,6 +740,47 @@ export function drawToCanvas(
         edgeAlpha,
         edgeWidth,
       });
+    } else if (coloring) {
+      // Group edges by color and stroke one path per color, so overlaps within
+      // a color composite once (no darkening) and the orbit count never makes
+      // this a per-edge stroke storm.
+      const groups = new Map<string, number[]>();
+      const orbitColors = coloring === "orbit" ? orbitColorsForGraph(graph) : null;
+      for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
+        if (hidden && hidden.has(edges[t + 2])) continue;
+        const color =
+          coloring === "orbit"
+            ? orbitColors![e]
+            : edges[t + 2] < graph.n
+              ? palette.blockWithinStroke
+              : palette.blockBetweenStroke;
+        let arr = groups.get(color);
+        if (!arr) {
+          arr = [];
+          groups.set(color, arr);
+        }
+        const [ax, ay] = pointXY(edges[t], total, c, cy, r);
+        const [bx, by] = pointXY(edges[t + 1], total, c, cy, r);
+        arr.push(ax, ay, bx, by);
+      }
+      // For blocks, draw the short within-block chords first so the long rₙ
+      // skeleton paints on top; orbit hues have no meaningful z-order.
+      const order =
+        coloring === "blocks"
+          ? [palette.blockWithinStroke, palette.blockBetweenStroke].filter((co) =>
+              groups.has(co)
+            )
+          : [...groups.keys()];
+      for (const color of order) {
+        const arr = groups.get(color)!;
+        ctx.strokeStyle = applyAlpha(color, edgeAlpha);
+        ctx.beginPath();
+        for (let m = 0; m < arr.length; m += 4) {
+          ctx.moveTo(arr[m], arr[m + 1]);
+          ctx.lineTo(arr[m + 2], arr[m + 3]);
+        }
+        ctx.stroke();
+      }
     } else {
       // Very large paths can be discarded by browser canvas implementations.
       // Stroke in batches so P9/P10 do not build a multi-million segment path.
@@ -261,26 +813,56 @@ export function drawToCanvas(
   }
 
   if (settings.showVertices) {
-    // Plain solid dots — same gray as the edges (color + alpha).
-    ctx.fillStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
     const dotRadius = Math.max(0.5, k.vertexRadius);
-    for (let i = 0; i < total; i++) {
-      const [x, y] = pointXY(i, total, c, cy, r);
-      ctx.beginPath();
-      ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
-      ctx.fill();
+    const labelMode = settings.showLabels && n <= 5;
+    if (coloring === "blocks") {
+      // Band the dots into n arcs by leading symbol (one ρ-block per arc).
+      const B = total / graph.n;
+      const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
+      let curBlock = -1;
+      for (let i = 0; i < total; i++) {
+        const block = Math.floor(i / B);
+        if (block !== curBlock) {
+          curBlock = block;
+          ctx.fillStyle = applyAlpha(blockColor(block, graph.n, labelMode), bandAlpha);
+        }
+        const [x, y] = pointXY(i, total, c, cy, r);
+        ctx.beginPath();
+        ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    } else {
+      // Plain dots: faint gray like the edges, but a bright disc under labels.
+      ctx.fillStyle = labelMode
+        ? withAlpha(palette.labelVertexFill, 0.95)
+        : withAlpha(palette.cayleyStroke, edgeAlpha);
+      for (let i = 0; i < total; i++) {
+        const [x, y] = pointXY(i, total, c, cy, r);
+        ctx.beginPath();
+        ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
+        ctx.fill();
+      }
     }
   }
 
   if (settings.showLabels && n <= 5) {
+    // Index labels: the position i on the Zaks ring (what ρ and ω act on).
     ctx.fillStyle = palette.labelFill;
     ctx.font = `${(total <= 24 ? 12 : 6) * dpr}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     for (let i = 0; i < total; i++) {
       const [x, y] = pointXY(i, total, c, cy, r);
-      ctx.fillText(permLabel(path[i]), x, y);
+      ctx.fillText(String(i), x, y);
     }
+  }
+
+  if (
+    settings.showDihedralAxes &&
+    settings.edgeMode !== "density" &&
+    supportsSymmetry(graph)
+  ) {
+    drawDihedralOverlayToCanvas(ctx, { n: graph.n, total, c, cy, r, scale }, palette);
   }
 
   ctx.restore();
@@ -298,10 +880,26 @@ function pointXY(i: number, total: number, cx: number, cy: number, r: number): [
  * recomputation. Only n, canvas size, parity mode and hidden generators affect
  * it (captured in `key`).
  */
+/**
+ * One paintable layer of the fundamental sector: a flat [ax,ay,bx,by,…] coord
+ * list, rotated `repeats` times (n for generic orbits, n/2 for antipodal "half"
+ * orbits). `color` strokes the whole layer in one tone; when it is null the
+ * per-segment `colors` are used instead (one entry per coords/4 segment — used
+ * by the Cₙ-orbit rainbow so each orbit keeps its own hue across rotations).
+ */
+export interface ZaksSymmetryMask {
+  repeats: number;
+  coords: Float32Array;
+  color: string | null;
+  colors: string[] | null;
+}
+
 export interface ZaksSymmetrySectors {
   key: string;
-  buckets: { color: string; full: Float32Array; half: Float32Array }[];
+  masks: ZaksSymmetryMask[];
   vertices: Float32Array;
+  /** Band the dots per-rotation by ρ-block hue (the "blocks" color scheme). */
+  bandVertices: boolean;
 }
 
 interface ZaksSymmetryCanvasOpts {
@@ -381,7 +979,6 @@ export function drawZaksSymmetryToCanvas(
   const k = constantsFor(n, scale);
   const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
   const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
-  const halfTurns = n % 2 === 0 ? n / 2 : 0;
   const step = (2 * Math.PI) / n;
   ctx.lineCap = "round";
 
@@ -393,75 +990,16 @@ export function drawZaksSymmetryToCanvas(
     ctx.stroke();
   }
 
-  // Recompute the sector only when geometry, parity mode or hidden set changes;
+  // Recompute the sector only when geometry, coloring or hidden set changes;
   // zoom/pan/alpha/width reuse the cache, keeping interaction enumeration-free.
+  const coloring: SymmetryColoring = settings.symmetryColoring ?? "parity";
   const hiddenKey = [...new Set(settings.hiddenGenerators)]
     .sort((a, b) => a - b)
     .join(",");
-  const key = `${n}|${w}x${h}|${settings.parityMode}|${hiddenKey}`;
+  const key = `${n}|${w}x${h}|${coloring}|${settings.parityMode}|${hiddenKey}`;
   let sectors = cache?.current && cache.current.key === key ? cache.current : null;
   if (!sectors) {
-    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
-    const mode = settings.parityMode;
-    const neutralF: number[] = [];
-    const neutralH: number[] = [];
-    const evenF: number[] = [];
-    const evenH: number[] = [];
-    const oddF: number[] = [];
-    const oddH: number[] = [];
-    let evenWeight = 0;
-    let oddWeight = 0;
-    forEachZaksFundamentalEdge(n, (e) => {
-      const orbit = e.half ? n / 2 : n;
-      if (e.parityXor === 0) evenWeight += orbit;
-      else oddWeight += orbit;
-      if (hidden && hidden.has(e.gen)) return;
-      let full: number[];
-      let half: number[];
-      if (mode === "off") {
-        full = neutralF;
-        half = neutralH;
-      } else if (mode === "even") {
-        if (e.parityXor !== 0) return;
-        full = evenF;
-        half = evenH;
-      } else if (mode === "odd") {
-        if (e.parityXor !== 1) return;
-        full = oddF;
-        half = oddH;
-      } else if (e.parityXor === 0) {
-        full = evenF;
-        half = evenH;
-      } else {
-        full = oddF;
-        half = oddH;
-      }
-      const [ax, ay] = pointXY(e.i, total, c, cy, r);
-      const [bx, by] = pointXY(e.j, total, c, cy, r);
-      if (e.half) half.push(ax, ay, bx, by);
-      else full.push(ax, ay, bx, by);
-    });
-    const mk = (color: string, f: number[], hh: number[]) => ({
-      color,
-      full: Float32Array.from(f),
-      half: Float32Array.from(hh),
-    });
-    const buckets =
-      mode === "off"
-        ? [mk(palette.cayleyStroke, neutralF, neutralH)]
-        : mode === "even"
-          ? [mk(palette.cayleyEvenStroke, evenF, evenH)]
-          : mode === "odd"
-            ? [mk(palette.cayleyOddStroke, oddF, oddH)]
-            : evenWeight >= oddWeight
-              ? [
-                  mk(palette.cayleyEvenStroke, evenF, evenH),
-                  mk(palette.cayleyOddStroke, oddF, oddH),
-                ]
-              : [
-                  mk(palette.cayleyOddStroke, oddF, oddH),
-                  mk(palette.cayleyEvenStroke, evenF, evenH),
-                ];
+    const masks = buildSectorMasks(n, coloring, settings, palette, total, c, cy, r);
     const vertices =
       settings.showVertices && total <= SYMMETRY_VERTEX_LIMIT
         ? (() => {
@@ -474,7 +1012,7 @@ export function drawZaksSymmetryToCanvas(
             return v;
           })()
         : new Float32Array(0);
-    sectors = { key, buckets, vertices };
+    sectors = { key, masks, vertices, bandVertices: coloring === "blocks" };
     if (cache) cache.current = sectors;
   }
 
@@ -489,25 +1027,33 @@ export function drawZaksSymmetryToCanvas(
       // Stroke the offscreen in batches (opaque, so batching does not darken),
       // keeping any single path well under the size some canvases will drop.
       const batch = n >= 9 ? 15_000 : 60_000;
-      const compositeSector = (
-        coords: Float32Array,
-        color: string,
-        repeats: number
-      ) => {
+      const compositeMask = (mask: ZaksSymmetryMask) => {
+        const { coords, color, colors, repeats } = mask;
         if (coords.length === 0 || repeats <= 0) return;
         sctx.setTransform(1, 0, 0, 1, 0, 0);
         sctx.clearRect(0, 0, w, h);
         sctx.lineCap = "round";
         sctx.lineWidth = edgeWidth;
-        sctx.strokeStyle = color;
-        for (let start = 0; start < coords.length; start += batch * 4) {
-          const end = Math.min(coords.length, start + batch * 4);
-          sctx.beginPath();
-          for (let t = start; t < end; t += 4) {
+        if (color) {
+          sctx.strokeStyle = color;
+          for (let start = 0; start < coords.length; start += batch * 4) {
+            const end = Math.min(coords.length, start + batch * 4);
+            sctx.beginPath();
+            for (let t = start; t < end; t += 4) {
+              sctx.moveTo(coords[t], coords[t + 1]);
+              sctx.lineTo(coords[t + 2], coords[t + 3]);
+            }
+            sctx.stroke();
+          }
+        } else if (colors) {
+          // Per-orbit hue: each segment strokes in its own color.
+          for (let t = 0, s = 0; t < coords.length; t += 4, s++) {
+            sctx.strokeStyle = colors[s];
+            sctx.beginPath();
             sctx.moveTo(coords[t], coords[t + 1]);
             sctx.lineTo(coords[t + 2], coords[t + 3]);
+            sctx.stroke();
           }
-          sctx.stroke();
         }
         for (let s = 0; s < repeats; s++) {
           ctx.save();
@@ -519,22 +1065,28 @@ export function drawZaksSymmetryToCanvas(
           ctx.restore();
         }
       };
-      for (const bucket of sectors.buckets) {
-        compositeSector(bucket.full, bucket.color, n);
-        compositeSector(bucket.half, bucket.color, halfTurns);
-      }
+      for (const mask of sectors.masks) compositeMask(mask);
     }
   }
 
   if (settings.showVertices && sectors.vertices.length > 0) {
-    ctx.fillStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
     const dotRadius = Math.max(0.5, k.vertexRadius);
     const verts = sectors.vertices;
+    const labelMode = settings.showLabels && n <= 5;
+    // Banded dots (blocks mode) need to read at any edge alpha, so they get a
+    // boosted opacity floor; plain dots stay at the edge alpha.
+    const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
+    const plainFill = labelMode
+      ? withAlpha(palette.labelVertexFill, 0.95)
+      : withAlpha(palette.cayleyStroke, edgeAlpha);
     for (let s = 0; s < n; s++) {
       ctx.save();
       ctx.translate(c, cy);
       ctx.rotate(step * s);
       ctx.translate(-c, -cy);
+      ctx.fillStyle = sectors.bandVertices
+        ? applyAlpha(blockColor(s, n, labelMode), bandAlpha)
+        : plainFill;
       ctx.beginPath();
       for (let i = 0; i < verts.length; i += 2) {
         ctx.moveTo(verts[i] + dotRadius, verts[i + 1]);
@@ -545,23 +1097,19 @@ export function drawZaksSymmetryToCanvas(
     }
   }
 
+  if (settings.showDihedralAxes) {
+    drawDihedralOverlayToCanvas(ctx, { n, total, c, cy, r, scale }, palette);
+  }
+
   if (settings.showLabels && n <= 5) {
+    // Index labels: the position i on the Zaks ring (what ρ and ω act on).
     ctx.fillStyle = palette.labelFill;
     ctx.font = `${(total <= 24 ? 12 : 6) * dpr}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    const block0 = zaksBlock0(n);
     for (let i = 0; i < total; i++) {
-      const b = Math.floor(i / B);
-      const o = i % B;
-      const p = new Uint8Array(block0[o]);
-      for (let t = 0; t < b; t++) {
-        for (let sym = 0; sym < p.length; sym++) p[sym] = (p[sym] % n) + 1;
-      }
-      let label = "";
-      for (let sym = 0; sym < p.length; sym++) label += p[sym];
       const [x, y] = pointXY(i, total, c, cy, r);
-      ctx.fillText(label, x, y);
+      ctx.fillText(String(i), x, y);
     }
   }
 
@@ -840,12 +1388,6 @@ function withAlpha(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 }
 
-function permLabel(p: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < p.length; i++) s += p[i];
-  return s;
-}
-
 /* ----------------------------------- svg ---------------------------------- */
 
 interface SvgOpts {
@@ -889,7 +1431,42 @@ export function toSVG(opts: SvgOpts): string {
     );
   }
 
-  if (settings.showCayley && edges.length > 0) {
+  const coloring = dihedralColoring(graph, settings);
+
+  if (settings.showCayley && edges.length > 0 && coloring) {
+    // Group chords by color (one <path> per color) so overlaps within a color
+    // composite once, mirroring the canvas renderer.
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    const orbitColors = coloring === "orbit" ? orbitColorsForGraph(graph) : null;
+    const groups = new Map<string, string>();
+    for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
+      if (hidden && hidden.has(edges[t + 2])) continue;
+      const color =
+        coloring === "orbit"
+          ? orbitColors![e]
+          : edges[t + 2] < graph.n
+            ? palette.blockWithinStroke
+            : palette.blockBetweenStroke;
+      const [ax, ay] = point(edges[t], total, c, r);
+      const [bx, by] = point(edges[t + 1], total, c, r);
+      groups.set(
+        color,
+        (groups.get(color) ?? "") +
+          `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`
+      );
+    }
+    const order =
+      coloring === "blocks"
+        ? [palette.blockWithinStroke, palette.blockBetweenStroke].filter((co) =>
+            groups.has(co)
+          )
+        : [...groups.keys()];
+    for (const color of order) {
+      parts.push(
+        `<path d="${groups.get(color)!}" fill="none" stroke="${color}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
+      );
+    }
+  } else if (settings.showCayley && edges.length > 0) {
     const passes = parityPasses(settings.parityMode, graph, palette);
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
     // Match the canvas renderer: split chords into batched <path> elements
@@ -925,12 +1502,22 @@ export function toSVG(opts: SvgOpts): string {
 
   if (settings.showVertices) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
+    const labelMode = settings.showLabels && n <= 5;
+    const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
+    const B = total / graph.n;
     for (let i = 0; i < total; i++) {
       const [x, y] = point(i, total, c, r);
+      const fill =
+        coloring === "blocks"
+          ? blockColor(Math.floor(i / B), graph.n, labelMode)
+          : labelMode
+            ? palette.labelVertexFill
+            : palette.cayleyStroke;
+      const fillOpacity = coloring === "blocks" ? bandAlpha : labelMode ? 0.95 : edgeAlpha;
       parts.push(
         `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotRadius.toFixed(
           2
-        )}" fill="${palette.cayleyStroke}" fill-opacity="${edgeAlpha}"/>`
+        )}" fill="${fill}" fill-opacity="${fillOpacity}"/>`
       );
     }
     if (settings.showLabels && n <= 5) {
@@ -938,10 +1525,14 @@ export function toSVG(opts: SvgOpts): string {
       for (let i = 0; i < total; i++) {
         const [x, y] = point(i, total, c, r);
         parts.push(
-          `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${permLabel(path[i])}</text>`
+          `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
         );
       }
     }
+  }
+
+  if (settings.showDihedralAxes && supportsSymmetry(graph)) {
+    parts.push(dihedralOverlaySVG({ n: graph.n, total, c, r, scale }, palette));
   }
 
   parts.push("</svg>");
@@ -1038,10 +1629,54 @@ export function toSymmetrySVG(opts: SvgOpts): string {
     for (let s = 0; s < repeats; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
   };
 
-  if (settings.showCayley && edges.length > 0) {
+  const coloring: SymmetryColoring = settings.symmetryColoring ?? "parity";
+  const halfTurns = n % 2 === 0 ? n / 2 : 0;
+  // Fundamental-domain classification of an edge (i < j, i < B): returns
+  // "full" (rotate n), "half" (antipodal diameter, rotate n/2) or null (the
+  // non-canonical sibling / outside block 0, skipped).
+  const domainClass = (i: number, j: number): "full" | "half" | null => {
+    if (i >= B) return null;
+    if (j < B) return "full";
+    const v = j % B;
+    if (i < v) return "full";
+    if (i === v && halfTurns) return "half";
+    return null;
+  };
+
+  if (settings.showCayley && edges.length > 0 && coloring === "orbit") {
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    let q = 0;
+    for (let t = 0; t < edges.length; t += 3) {
+      const i = edges[t];
+      const j = edges[t + 1];
+      const cls = domainClass(i, j);
+      if (!cls) continue;
+      const color = orbitColor(q);
+      q++;
+      if (hidden && hidden.has(edges[t + 2])) continue;
+      emitFragment(seg(i, j), color, cls === "half" ? halfTurns : n);
+    }
+  } else if (settings.showCayley && edges.length > 0 && coloring === "blocks") {
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    let within = "";
+    let betweenFull = "";
+    let betweenHalf = "";
+    for (let t = 0; t < edges.length; t += 3) {
+      const i = edges[t];
+      const j = edges[t + 1];
+      const cls = domainClass(i, j);
+      if (!cls) continue;
+      if (hidden && hidden.has(edges[t + 2])) continue;
+      if (edges[t + 2] < n) within += seg(i, j);
+      else if (cls === "half") betweenHalf += seg(i, j);
+      else betweenFull += seg(i, j);
+    }
+    emitFragment(within, palette.blockWithinStroke, n);
+    emitFragment(betweenFull, palette.blockBetweenStroke, n);
+    emitFragment(betweenHalf, palette.blockBetweenStroke, halfTurns);
+  } else if (settings.showCayley && edges.length > 0) {
     const passes = parityPasses(settings.parityMode, graph, palette);
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
-    const halfTurns = n % 2 === 0 ? n / 2 : 0;
 
     for (const pass of passes) {
       let dFull = ""; // orbit size n
@@ -1054,15 +1689,9 @@ export function toSymmetrySVG(opts: SvgOpts): string {
           const p = graph.vertexParity[i] ^ graph.vertexParity[j];
           if (p !== pass.filter) continue;
         }
-        // Fundamental-domain rule (edges are stored with i < j).
-        if (i >= B) continue;
-        if (j < B) {
-          dFull += seg(i, j);
-        } else {
-          const v = j % B;
-          if (i < v) dFull += seg(i, j);
-          else if (i === v && halfTurns) dHalf += seg(i, j);
-        }
+        const cls = domainClass(i, j);
+        if (cls === "full") dFull += seg(i, j);
+        else if (cls === "half") dHalf += seg(i, j);
       }
       emitFragment(dFull, pass.color, n);
       emitFragment(dHalf, pass.color, halfTurns);
@@ -1077,12 +1706,28 @@ export function toSymmetrySVG(opts: SvgOpts): string {
       const [x, y] = point(i, total, c, r);
       dots += `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotRadius.toFixed(
         2
-      )}" fill="${palette.cayleyStroke}" fill-opacity="${edgeAlpha}"/>`;
+      )}"/>`;
     }
     if (dots.length > 0) {
       const id = `s${fragId++}`;
       defs.push(`<g id="${id}">${dots}</g>`);
-      for (let s = 0; s < n; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
+      const labelMode = settings.showLabels && n <= 5;
+      if (coloring === "blocks") {
+        const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
+        for (let s = 0; s < n; s++) {
+          uses.push(
+            `<use href="#${id}" fill="${blockColor(s, n, labelMode)}" fill-opacity="${bandAlpha}"${rotate(s)}/>`
+          );
+        }
+      } else {
+        const dotFill = labelMode ? palette.labelVertexFill : palette.cayleyStroke;
+        const dotOpacity = labelMode ? 0.95 : edgeAlpha;
+        for (let s = 0; s < n; s++) {
+          uses.push(
+            `<use href="#${id}" fill="${dotFill}" fill-opacity="${dotOpacity}"${rotate(s)}/>`
+          );
+        }
+      }
     }
   }
 
@@ -1091,13 +1736,17 @@ export function toSymmetrySVG(opts: SvgOpts): string {
     parts.push(uses.join(""));
   }
 
-  // Labels are only legible for tiny n, where the full set is cheap anyway.
+  if (settings.showDihedralAxes) {
+    parts.push(dihedralOverlaySVG({ n, total, c, r, scale }, palette));
+  }
+
+  // Index labels (only legible for tiny n): the position i on the Zaks ring.
   if (settings.showLabels && n <= 5) {
     const fs = total <= 24 ? 12 : 6;
     for (let i = 0; i < total; i++) {
       const [x, y] = point(i, total, c, r);
       parts.push(
-        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${permLabel(path[i])}</text>`
+        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
       );
     }
   }
@@ -1166,7 +1815,35 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     for (let s = 0; s < repeats; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
   };
 
-  if (settings.showCayley) {
+  const coloring: SymmetryColoring = settings.symmetryColoring ?? "parity";
+
+  if (settings.showCayley && coloring === "orbit") {
+    // One hue per Cₙ orbit: each fundamental representative is its own fragment,
+    // and its n (or n/2) rotated copies inherit the hue.
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    let q = 0;
+    forEachZaksFundamentalEdge(n, (e) => {
+      const color = orbitColor(q);
+      q++;
+      if (hidden && hidden.has(e.gen)) return;
+      emitFragment(seg(e.i, e.j), color, e.half ? halfTurns : n);
+    });
+  } else if (settings.showCayley && coloring === "blocks") {
+    // Two chord families: short within-block reversals vs the long rₙ skeleton.
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    let within = "";
+    let betweenFull = "";
+    let betweenHalf = "";
+    forEachZaksFundamentalEdge(n, (e) => {
+      if (hidden && hidden.has(e.gen)) return;
+      if (e.gen < n) within += seg(e.i, e.j);
+      else if (e.half) betweenHalf += seg(e.i, e.j);
+      else betweenFull += seg(e.i, e.j);
+    });
+    emitFragment(within, palette.blockWithinStroke, n);
+    emitFragment(betweenFull, palette.blockBetweenStroke, n);
+    emitFragment(betweenHalf, palette.blockBetweenStroke, halfTurns);
+  } else if (settings.showCayley) {
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
     // Parity buckets mirror parityPasses: "off" → one neutral bucket; "even"/
     // "odd" → that bucket only; "both" → both, ordered by total edge count so
@@ -1219,12 +1896,29 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
       const [x, y] = point(i, total, c, r);
       dots += `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotRadius.toFixed(
         2
-      )}" fill="${palette.cayleyStroke}" fill-opacity="${edgeAlpha}"/>`;
+      )}"/>`;
     }
     if (dots.length > 0) {
       const id = `s${fragId++}`;
       defs.push(`<g id="${id}">${dots}</g>`);
-      for (let s = 0; s < n; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
+      const labelMode = settings.showLabels && n <= 5;
+      if (coloring === "blocks") {
+        // Band the dots: rotation s carries the ρ-block's hue.
+        const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
+        for (let s = 0; s < n; s++) {
+          uses.push(
+            `<use href="#${id}" fill="${blockColor(s, n, labelMode)}" fill-opacity="${bandAlpha}"${rotate(s)}/>`
+          );
+        }
+      } else {
+        const dotFill = labelMode ? palette.labelVertexFill : palette.cayleyStroke;
+        const dotOpacity = labelMode ? 0.95 : edgeAlpha;
+        for (let s = 0; s < n; s++) {
+          uses.push(
+            `<use href="#${id}" fill="${dotFill}" fill-opacity="${dotOpacity}"${rotate(s)}/>`
+          );
+        }
+      }
     }
   }
 
@@ -1233,24 +1927,18 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     parts.push(uses.join(""));
   }
 
-  // Labels are only legible (and only emitted) for tiny n; reconstruct the full
-  // ordering from block 0 via the cyclic relabeling φ: vertex b·B+o is φᵇ
-  // applied to block-0 vertex o.
+  if (settings.showDihedralAxes) {
+    parts.push(dihedralOverlaySVG({ n, total, c, r, scale }, palette));
+  }
+
+  // Index labels (only emitted for tiny n): the position i on the Zaks ring,
+  // i.e. the value the generators ρ and ω act on.
   if (settings.showLabels && n <= 5) {
-    const block0 = zaksBlock0(n);
     const fs = total <= 24 ? 12 : 6;
     for (let i = 0; i < total; i++) {
-      const b = Math.floor(i / B);
-      const o = i % B;
-      const p = new Uint8Array(block0[o]);
-      for (let t = 0; t < b; t++) {
-        for (let s = 0; s < p.length; s++) p[s] = (p[s] % n) + 1;
-      }
-      let label = "";
-      for (let s = 0; s < p.length; s++) label += p[s];
       const [x, y] = point(i, total, c, r);
       parts.push(
-        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${label}</text>`
+        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
       );
     }
   }

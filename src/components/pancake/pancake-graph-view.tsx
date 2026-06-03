@@ -50,8 +50,11 @@ import {
   toSVG,
   toSymmetrySVG,
   toZaksSymmetrySVG,
+  computeZaksOrbits,
+  type OrbitInfo,
   type ParityMode,
   type RenderSettings,
+  type SymmetryColoring,
 } from "@/lib/pancake-render";
 import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
 import { AlertTriangle, Download, Loader2, Minus, Plus, RotateCcw } from "lucide-react";
@@ -188,6 +191,15 @@ const RENDERERS: readonly Renderer[] = [
   "symmetry",
 ];
 const PARITY_MODES = Object.keys(PARITY_MODE_LABELS) as ParityMode[];
+
+const SYMMETRY_COLORING_LABELS: Record<SymmetryColoring, string> = {
+  parity: "Parity (default)",
+  orbit: "Cₙ orbit (rainbow)",
+  blocks: "Blocks (first symbol)",
+};
+const SYMMETRY_COLORINGS = Object.keys(
+  SYMMETRY_COLORING_LABELS
+) as SymmetryColoring[];
 const SLIDER_RANGE: readonly number[] = Array.from(
   { length: 100 },
   (_, i) => i + 1
@@ -203,6 +215,9 @@ interface GraphState {
   preset: GraphPreset;
   renderer: Renderer;
   parityMode: ParityMode;
+  symmetryColoring: SymmetryColoring;
+  showDihedralAxes: boolean;
+  showLabels: boolean;
   alpha: number;
   width: number;
   quotientDepth: number;
@@ -225,6 +240,9 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     preset,
     renderer,
     parityMode: readEnumParam(params, "parity", PARITY_MODES, "off"),
+    symmetryColoring: readEnumParam(params, "sc", SYMMETRY_COLORINGS, "parity"),
+    showDihedralAxes: readEnumParam(params, "ax", ["0", "1"], "0") === "1",
+    showLabels: readEnumParam(params, "lbl", ["0", "1"], "0") === "1",
     alpha: readIntParam(params, "alpha", SLIDER_RANGE, rec.alpha),
     width: readIntParam(params, "width", SLIDER_RANGE, rec.width),
     quotientDepth: readIntParam(
@@ -257,8 +275,10 @@ export function PancakeGraphView() {
     showCayley: true,
     showCycle: true,
     showVertices: true,
-    showLabels: false,
+    showLabels: initial.showLabels,
     parityMode: initial.parityMode,
+    symmetryColoring: initial.symmetryColoring,
+    showDihedralAxes: initial.showDihedralAxes,
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
@@ -321,6 +341,9 @@ export function PancakeGraphView() {
       n: String(n),
       r: renderer,
       parity: settings.parityMode,
+      sc: settings.symmetryColoring,
+      ax: settings.showDihedralAxes ? "1" : null,
+      lbl: settings.showLabels ? "1" : null,
       alpha: String(settings.alpha),
       width: String(settings.width),
       depth: String(quotientDepth),
@@ -330,6 +353,9 @@ export function PancakeGraphView() {
     preset,
     renderer,
     settings.parityMode,
+    settings.symmetryColoring,
+    settings.showDihedralAxes,
+    settings.showLabels,
     settings.alpha,
     settings.width,
     quotientDepth,
@@ -640,7 +666,7 @@ export function PancakeGraphView() {
       .join(",");
     const key = `${graph.n}|${Math.floor(width * dpr)}x${Math.floor(
       height * dpr
-    )}|${settings.parityMode}|${hiddenKey}`;
+    )}|${settings.symmetryColoring ?? "parity"}|${settings.parityMode}|${hiddenKey}`;
     const cacheMiss = symSectorCacheRef.current?.key !== key;
 
     if (!cacheMiss || !showRenderProgress) {
@@ -937,6 +963,18 @@ export function PancakeGraphView() {
     return graph.generators.filter((gen) => !hidden.has(gen.id)).length;
   }, [graph, settings.hiddenGenerators]);
 
+  // Cₙ orbit table: only meaningful for the pancake-zaks layout, where the
+  // index ring matches the fundamental-sector enumeration, and only legible at
+  // small n (the same range the orbit coloring itself stays readable).
+  const orbitTable = useMemo<OrbitInfo[]>(
+    () => (preset === "pancake-zaks" && n <= 5 ? computeZaksOrbits(n) : []),
+    [preset, n]
+  );
+  const showOrbitTable =
+    orbitTable.length > 0 &&
+    (settings.symmetryColoring ?? "parity") === "orbit" &&
+    (renderer === "symmetry" || renderer === "canvas" || renderer === "svg");
+
   return (
     <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
       <Card className="self-start lg:sticky lg:top-4">
@@ -1129,6 +1167,68 @@ export function PancakeGraphView() {
               ) : null}
             </div>
 
+            {(activeRenderer === "symmetry" ||
+              activeRenderer === "canvas" ||
+              activeRenderer === "svg") &&
+            supportsSymmetry({ preset }) ? (
+              <div className="space-y-2 rounded-md border border-violet-200 bg-violet-50/40 p-2.5">
+                <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                  Dihedral color scheme
+                </Label>
+                <Select
+                  value={settings.symmetryColoring ?? "parity"}
+                  onValueChange={(v) =>
+                    setS("symmetryColoring", v as SymmetryColoring)
+                  }
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {SYMMETRY_COLORINGS.map((mode) => (
+                      <SelectItem key={mode} value={mode}>
+                        {SYMMETRY_COLORING_LABELS[mode]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  {settings.symmetryColoring === "orbit" ? (
+                    <>
+                      One hue per <span className="font-medium">Cₙ orbit</span>{" "}
+                      (ρ: i ↦ i+(n-1)!): each color class is a clean rotated
+                      n-set at 360/n steps — the decisive rotation test.
+                    </>
+                  ) : settings.symmetryColoring === "blocks" ? (
+                    <>
+                      Dots banded into n arcs by leading symbol (one ρ-block
+                      each). Chords split into{" "}
+                      <span style={{ color: "#0ea5e9" }}>short within-block</span>{" "}
+                      reversals and the{" "}
+                      <span style={{ color: "#111827" }}>long rₙ skeleton</span>.
+                    </>
+                  ) : (
+                    <>Edges colored by endpoint parity (the default scheme).</>
+                  )}
+                </p>
+                <label className="flex cursor-pointer items-center gap-2 pt-0.5 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-violet-600"
+                    checked={settings.showDihedralAxes ?? false}
+                    onChange={(e) =>
+                      setS("showDihedralAxes", e.target.checked)
+                    }
+                  />
+                  <span>
+                    Dₙ axis &amp; wedge —{" "}
+                    <span style={{ color: "#7c3aed" }}>ω mirror</span> + sector
+                    lines
+                  </span>
+                </label>
+              </div>
+            ) : null}
+
             {activeRenderer === "quotient" && supportsQuotient(preset) ? (
               <div className="space-y-2">
                 <Label className="text-xs uppercase tracking-wider text-muted-foreground">
@@ -1237,6 +1337,24 @@ export function PancakeGraphView() {
                 </p>
               ) : null}
             </div>
+
+            {n <= 5 ? (
+              <div className="space-y-1">
+                <label className="flex cursor-pointer items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-primary"
+                    checked={settings.showLabels}
+                    onChange={(e) => setS("showLabels", e.target.checked)}
+                  />
+                  <span>Index labels</span>
+                </label>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Number each vertex by its position i on the ring (0…n!−1) —
+                  the value ρ and ω act on. Only for n ≤ 5.
+                </p>
+              </div>
+            ) : null}
 
             {graph && graph.generators.length > 0 ? (
               <div className="space-y-2">
@@ -1357,6 +1475,7 @@ export function PancakeGraphView() {
         </CardContent>
       </Card>
 
+      <div className="min-w-0 space-y-4">
       <Card className="overflow-hidden p-0">
         <div
           ref={stageRef}
@@ -1502,7 +1621,69 @@ export function PancakeGraphView() {
           )}
         </div>
       </Card>
+      {showOrbitTable ? <OrbitTable orbits={orbitTable} n={n} /> : null}
+      </div>
     </div>
+  );
+}
+
+function OrbitTable({ orbits, n }: { orbits: OrbitInfo[]; n: number }) {
+  return (
+    <Card>
+      <CardHeader className="space-y-1">
+        <CardTitle className="text-base">Cₙ orbits — index pairs</CardTitle>
+        <CardDescription>
+          Each row is one rotation orbit: the {n} chords{" "}
+          <span className="font-mono">{"{i+k·(n−1)!, j+k·(n−1)!}"}</span> (mod n!)
+          that share a color. {orbits.length} orbits · vertices indexed 0…
+          {NUMBER_FORMAT.format(factorial(n) - 1)} in Zaks order.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="max-h-[360px] overflow-auto rounded-md border">
+          <table className="w-full border-collapse text-xs">
+            <thead className="sticky top-0 bg-muted/80 backdrop-blur">
+              <tr className="text-left text-muted-foreground">
+                <th className="px-2 py-1.5 font-medium">color</th>
+                <th className="px-2 py-1.5 font-medium">rₖ</th>
+                <th className="px-2 py-1.5 font-medium">size</th>
+                <th className="px-2 py-1.5 font-medium">index pairs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orbits.map((orbit, idx) => (
+                <tr key={idx} className="border-t align-top">
+                  <td className="px-2 py-1.5">
+                    <span
+                      className="inline-block h-3 w-3 rounded-full ring-1 ring-black/10"
+                      style={{ backgroundColor: orbit.color }}
+                    />
+                  </td>
+                  <td className="px-2 py-1.5 font-mono">r{orbit.gen}</td>
+                  <td className="px-2 py-1.5 font-mono text-muted-foreground">
+                    {orbit.pairs.length}
+                    {orbit.half ? " ◊" : ""}
+                  </td>
+                  <td className="px-2 py-1.5 font-mono leading-relaxed">
+                    {orbit.pairs.map(([i, j], k) => (
+                      <span key={k} className="mr-2 inline-block whitespace-nowrap">
+                        {"{"}
+                        {i},{j}
+                        {"}"}
+                      </span>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="pt-2 text-[11px] leading-snug text-muted-foreground">
+          ◊ = antipodal &ldquo;diameter&rdquo; orbit (size n/2). Colors match the
+          orbit-colored graph above.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 
