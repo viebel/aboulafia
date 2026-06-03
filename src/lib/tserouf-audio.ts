@@ -39,6 +39,30 @@ function isEvenPermutation(word: string): boolean {
   return inversions % 2 === 0;
 }
 
+export type InstrumentId =
+  | "guitar"
+  | "piano"
+  | "harpsichord"
+  | "saxophone"
+  | "clarinet"
+  | "marimba"
+  | "vibraphone"
+  | "musicbox";
+
+// Instruments offered in the UI. All are synthesized (no samples). Plucked and
+// mallet/bell timbres suit permutation music well — every note is a clear,
+// discrete point (think Reich/Glass minimalism, or Bach on harpsichord).
+export const INSTRUMENTS: { id: InstrumentId; label: string }[] = [
+  { id: "guitar", label: "Classical guitar" },
+  { id: "piano", label: "Piano" },
+  { id: "harpsichord", label: "Harpsichord" },
+  { id: "saxophone", label: "Saxophone" },
+  { id: "clarinet", label: "Clarinet (klezmer)" },
+  { id: "marimba", label: "Marimba" },
+  { id: "vibraphone", label: "Vibraphone" },
+  { id: "musicbox", label: "Music box" },
+];
+
 export interface TseroufNote {
   word: string;
   // Suffix-reversal length used to reach the *next* word. Larger = deeper
@@ -48,13 +72,18 @@ export interface TseroufNote {
 
 export interface TseroufPlayOptions {
   stepSeconds?: number;
+  // Seconds per sung letter for the chant/meditation engine (ignored by the
+  // melodic invention engine, which uses stepSeconds).
+  noteSeconds?: number;
   loop?: boolean;
+  instrument?: InstrumentId;
   onStep?: (wordIndex: number) => void;
   onEnd?: () => void;
 }
 
 export interface TseroufRenderOptions {
   stepSeconds?: number;
+  instrument?: InstrumentId;
   // Cap the rendered content so files stay reasonable for large permutation
   // counts. The closing reverb tail is added on top.
   maxSeconds?: number;
@@ -75,7 +104,9 @@ interface Synth {
   even: Voice;
   odd: Voice;
   center: Voice;
-  pluckCache: Map<number, AudioBuffer>;
+  instrument: InstrumentId;
+  // Per-note buffers, cached by instrument + pitch (only a few distinct pitches).
+  bufferCache: Map<string, AudioBuffer>;
 }
 
 function makeVoice(
@@ -160,55 +191,350 @@ function buildSynth(ctx: BaseAudioContext): Synth {
   // Cadences land in the centre, in the middle register, full and shared.
   const center = makeVoice(ctx, master, 0, 4000, 0);
 
-  return { ctx, master, even, odd, center, pluckCache: new Map() };
+  return {
+    ctx,
+    master,
+    even,
+    odd,
+    center,
+    instrument: "guitar",
+    bufferCache: new Map(),
+  };
 }
 
-// Karplus-Strong plucked-string synthesis, cached per pitch.
-function pluckBuffer(synth: Synth, freq: number): AudioBuffer {
-  const cacheKey = Math.round(freq * 50);
-  const cached = synth.pluckCache.get(cacheKey);
-  if (cached) return cached;
-
-  const ctx = synth.ctx;
-  const sr = ctx.sampleRate;
-  const seconds = 3.2;
-  const total = Math.floor(sr * seconds);
-  const delay = Math.max(2, Math.round(sr / freq));
-  const buffer = ctx.createBuffer(1, total, sr);
-  const data = buffer.getChannelData(0);
-
-  // Excitation: a short noise burst, low-passed so the attack is soft and
-  // round like a nylon string plucked with the flesh of the finger.
-  let lp = 0;
-  for (let i = 0; i < delay; i++) {
-    const white = Math.random() * 2 - 1;
-    lp = 0.55 * white + 0.45 * lp;
-    data[i] = lp;
-  }
-
-  // Feedback loop with an averaging low-pass = the vibrating, damping string.
-  const decay = freq < 200 ? 0.9975 : 0.9965;
-  for (let i = delay; i < total; i++) {
-    const prev = data[i - delay];
-    const prev2 = i - delay - 1 >= 0 ? data[i - delay - 1] : prev;
-    data[i] = decay * 0.5 * (prev + prev2);
-  }
-
+function normalize(data: Float32Array, target = 0.9): void {
   let peak = 0;
-  for (let i = 0; i < total; i++) {
+  for (let i = 0; i < data.length; i++) {
     const a = Math.abs(data[i]);
     if (a > peak) peak = a;
   }
   if (peak > 0) {
-    const norm = 0.9 / peak;
-    for (let i = 0; i < total; i++) data[i] *= norm;
+    const g = target / peak;
+    for (let i = 0; i < data.length; i++) data[i] *= g;
   }
+}
 
-  synth.pluckCache.set(cacheKey, buffer);
+// Karplus-Strong plucked string (guitar, harpsichord). A noise burst feeds a
+// damped feedback delay line = a vibrating string. `smooth` controls how dark
+// the pluck is; `decay*` how long it sustains.
+function karplusBuffer(
+  ctx: BaseAudioContext,
+  freq: number,
+  decayLow: number,
+  decayHigh: number,
+  smooth: number,
+  seconds: number
+): AudioBuffer {
+  const sr = ctx.sampleRate;
+  const total = Math.floor(sr * seconds);
+  const delay = Math.max(2, Math.round(sr / freq));
+  const buffer = ctx.createBuffer(1, total, sr);
+  const d = buffer.getChannelData(0);
+  let lp = 0;
+  for (let i = 0; i < delay; i++) {
+    const w = Math.random() * 2 - 1;
+    lp = smooth * w + (1 - smooth) * lp;
+    d[i] = lp;
+  }
+  const decay = freq < 200 ? decayLow : decayHigh;
+  for (let i = delay; i < total; i++) {
+    const prev = d[i - delay];
+    const prev2 = i - delay - 1 >= 0 ? d[i - delay - 1] : prev;
+    d[i] = decay * 0.5 * (prev + prev2);
+  }
+  normalize(d);
   return buffer;
 }
 
-// Schedules one plucked note and returns the time it stops sounding.
+interface Harmonic {
+  ratio: number;
+  gain: number;
+  decay: number;
+}
+
+// Struck/mallet/bell tones (piano, marimba, vibraphone, music box) as a sum of
+// decaying partials, with optional inharmonicity, a hammer transient and a
+// tremolo (vibraphone).
+function additiveBuffer(
+  ctx: BaseAudioContext,
+  freq: number,
+  seconds: number,
+  partials: Harmonic[],
+  inharm: number,
+  tremoloHz: number,
+  tremoloDepth: number,
+  hammer: number
+): AudioBuffer {
+  const sr = ctx.sampleRate;
+  const total = Math.floor(sr * seconds);
+  const buffer = ctx.createBuffer(1, total, sr);
+  const d = buffer.getChannelData(0);
+  const nyq = sr * 0.45;
+  for (let i = 0; i < total; i++) {
+    const t = i / sr;
+    let s = 0;
+    for (const p of partials) {
+      const f = freq * p.ratio * Math.sqrt(1 + inharm * p.ratio * p.ratio);
+      if (f >= nyq) continue;
+      s += p.gain * Math.exp(-t * p.decay) * Math.sin(2 * Math.PI * f * t);
+    }
+    if (tremoloDepth > 0) {
+      s *= 1 - tremoloDepth + tremoloDepth * 0.5 * (1 + Math.sin(2 * Math.PI * tremoloHz * t));
+    }
+    d[i] = s;
+  }
+  if (hammer > 0) {
+    const aN = Math.floor(sr * 0.006);
+    for (let i = 0; i < aN && i < total; i++) {
+      d[i] += hammer * (Math.random() * 2 - 1) * (1 - i / aN);
+    }
+  }
+  normalize(d);
+  return buffer;
+}
+
+// Adds one sinusoidal partial with a two-stage exponential decay, computed by
+// recurrence (rotating phasor + per-sample decay multiply) so we can stack many
+// partials and strings cheaply — no per-sample sin()/exp().
+function addPartial(
+  d: Float32Array,
+  sr: number,
+  freq: number,
+  amp: number,
+  decayFast: number,
+  decaySlow: number,
+  mixFast: number
+): void {
+  const dphi = (2 * Math.PI * freq) / sr;
+  const cw = Math.cos(dphi);
+  const sw = Math.sin(dphi);
+  // Random initial phase so partials/strings don't all align into a click.
+  const ph0 = Math.random() * 2 * Math.PI;
+  let x = Math.cos(ph0);
+  let y = Math.sin(ph0);
+  const rF = Math.exp(-decayFast / sr);
+  const rS = Math.exp(-decaySlow / sr);
+  let eF = mixFast;
+  let eS = 1 - mixFast;
+  for (let i = 0; i < d.length; i++) {
+    d[i] += amp * (eF + eS) * x;
+    const nx = x * cw - y * sw;
+    y = x * sw + y * cw;
+    x = nx;
+    eF *= rF;
+    eS *= rS;
+  }
+}
+
+// Acoustic grand piano (Keith Jarrett-ish): warm, singing, percussive but
+// round. The realism comes from (1) inharmonicity (stiff strings stretch the
+// partials sharp), (2) THREE slightly detuned strings per note beating into a
+// living chorus, (3) a TWO-STAGE decay — a quick thud over a long singing
+// aftersound — with treble dying faster than the fundamental, and (4) a soft,
+// rounded hammer instead of a sharp click.
+function pianoBuffer(ctx: BaseAudioContext, freq: number): AudioBuffer {
+  const sr = ctx.sampleRate;
+  const seconds = Math.max(2.6, Math.min(5.0, 1100 / freq));
+  const total = Math.floor(sr * seconds);
+  const buffer = ctx.createBuffer(1, total, sr);
+  const d = buffer.getChannelData(0);
+  const nyq = sr * 0.45;
+  const N = Math.max(1, Math.min(16, Math.floor(nyq / freq)));
+  // More inharmonicity in the bass, like a real soundboard.
+  const B = freq < 160 ? 0.0011 : freq < 320 ? 0.0006 : 0.0003;
+  const detunesCents = [-0.7, 0, 0.8]; // three strings -> gentle beating
+
+  for (const cents of detunesCents) {
+    const f0 = freq * Math.pow(2, cents / 1200);
+    for (let k = 1; k <= N; k++) {
+      const fk = f0 * k * Math.sqrt(1 + B * k * k);
+      if (fk >= nyq) break;
+      const amp = Math.pow(k, -0.85); // warm, gentle rolloff
+      const dFast = 3.0 + k * 1.2; // quick initial transient, brighter on top
+      const dSlow = 0.32 + k * 0.26; // long singing tail, treble fades first
+      addPartial(d, sr, fk, amp, dFast, dSlow, 0.45);
+    }
+  }
+
+  // Rounded hammer: a short, heavily low-passed noise thud (felt, not click).
+  const aN = Math.floor(sr * 0.011);
+  let lp = 0;
+  for (let i = 0; i < aN && i < total; i++) {
+    const noise = Math.random() * 2 - 1;
+    lp = 0.2 * noise + 0.8 * lp;
+    d[i] += 0.3 * lp * Math.pow(1 - i / aN, 2);
+  }
+
+  normalize(d);
+  return buffer;
+}
+
+// Tenor saxophone (Coltrane-ish): warm and vocal, not a buzzy sawtooth. The
+// spectrum is shaped by reed/bore formant resonances (so low and mid partials
+// dominate and the top rolls off), with an expressive vibrato that swells in
+// over the note, plus a little breath. Steady amplitude — the note envelope
+// shapes its length.
+function reedBuffer(ctx: BaseAudioContext, freq: number, seconds: number): AudioBuffer {
+  const sr = ctx.sampleRate;
+  const total = Math.floor(sr * seconds);
+  const buffer = ctx.createBuffer(1, total, sr);
+  const d = buffer.getChannelData(0);
+  const nyq = sr * 0.45;
+  const maxK = Math.max(1, Math.min(20, Math.floor(nyq / freq)));
+
+  // Tenor-sax formant regions: a strong low body, a mid "honk", an upper edge.
+  const formants = [
+    { f: 600, bw: 130, g: 1.0 },
+    { f: 1100, bw: 220, g: 0.65 },
+    { f: 2700, bw: 500, g: 0.3 },
+  ];
+  const amps = new Float32Array(maxK + 1);
+  for (let k = 1; k <= maxK; k++) {
+    const fk = freq * k;
+    let r = 0;
+    for (const F of formants) {
+      const x = (fk - F.f) / F.bw;
+      r += F.g / (1 + x * x);
+    }
+    amps[k] = r * Math.pow(220 / Math.max(fk, 110), 0.22); // gentle warm tilt
+  }
+
+  const vibHz = 5.5;
+  const vibMax = Math.pow(2, 22 / 1200) - 1; // up to ~22 cents, jazz-expressive
+  let phase = 0;
+  let bn = 0;
+  for (let i = 0; i < total; i++) {
+    const t = i / sr;
+    const onset = Math.min(1, t / 0.35); // vibrato swells in, vocal/Coltrane
+    const vib = 1 + vibMax * onset * Math.sin(2 * Math.PI * vibHz * t);
+    phase += (2 * Math.PI * freq * vib) / sr;
+    let s = 0;
+    for (let k = 1; k <= maxK; k++) s += amps[k] * Math.sin(k * phase);
+    const w = Math.random() * 2 - 1;
+    bn = 0.07 * w + 0.93 * bn;
+    s += 0.16 * bn;
+    d[i] = s;
+  }
+  normalize(d, 0.9);
+  return buffer;
+}
+
+// Klezmer clarinet (Yom-ish): a cylindrical bore closed at the reed favours
+// ODD harmonics, giving the hollow, woody, "vocal" clarinet tone. Plus the
+// expressive touches of klezmer playing: a quick pitch bend up into each note
+// (the "krekhts" sob) and a vibrato that swells in. Sustained — the note
+// envelope shapes its length.
+function clarinetBuffer(ctx: BaseAudioContext, freq: number, seconds: number): AudioBuffer {
+  const sr = ctx.sampleRate;
+  const total = Math.floor(sr * seconds);
+  const buffer = ctx.createBuffer(1, total, sr);
+  const d = buffer.getChannelData(0);
+  const nyq = sr * 0.45;
+  const maxK = Math.max(1, Math.min(20, Math.floor(nyq / freq)));
+
+  const amps = new Float32Array(maxK + 1);
+  for (let k = 1; k <= maxK; k++) {
+    const odd = k % 2 === 1;
+    // Odd partials strong; even partials much weaker -> hollow clarinet colour.
+    const base = odd ? Math.pow(k, -0.8) : 0.12 * Math.pow(k, -1);
+    const fk = freq * k;
+    const ring = 1 + 0.5 * Math.exp(-Math.pow((fk - 1800) / 900, 2)); // reedy ring
+    amps[k] = base * ring;
+  }
+
+  const vibHz = 5;
+  const vibMax = Math.pow(2, 18 / 1200) - 1; // ~18 cents
+  const scoopCents = 35;
+  const scoopSec = 0.05;
+  let phase = 0;
+  let bn = 0;
+  for (let i = 0; i < total; i++) {
+    const t = i / sr;
+    const onset = Math.min(1, t / 0.3);
+    // Klezmer bend-in: start ~35 cents flat and slide up to pitch.
+    const scoop =
+      t < scoopSec ? Math.pow(2, (-scoopCents * (1 - t / scoopSec)) / 1200) : 1;
+    const vib = 1 + vibMax * onset * Math.sin(2 * Math.PI * vibHz * t);
+    phase += (2 * Math.PI * freq * vib * scoop) / sr;
+    let s = 0;
+    for (let k = 1; k <= maxK; k++) s += amps[k] * Math.sin(k * phase);
+    const w = Math.random() * 2 - 1;
+    bn = 0.06 * w + 0.94 * bn;
+    s += 0.08 * bn; // a little reed air, cleaner than the sax
+    d[i] = s;
+  }
+  normalize(d, 0.9);
+  return buffer;
+}
+
+const MARIMBA: Harmonic[] = [
+  { ratio: 1, gain: 1, decay: 5 },
+  { ratio: 3.9, gain: 0.4, decay: 9 },
+  { ratio: 9.2, gain: 0.12, decay: 13 },
+];
+const VIBES: Harmonic[] = [
+  { ratio: 1, gain: 1, decay: 0.8 },
+  { ratio: 4, gain: 0.5, decay: 1.4 },
+  { ratio: 9.4, gain: 0.18, decay: 2.2 },
+];
+const MUSICBOX: Harmonic[] = [
+  { ratio: 1, gain: 1, decay: 2.4 },
+  { ratio: 2, gain: 0.5, decay: 3.2 },
+  { ratio: 3.01, gain: 0.35, decay: 4.0 },
+  { ratio: 4.2, gain: 0.22, decay: 5.2 },
+  { ratio: 5.4, gain: 0.15, decay: 6.5 },
+];
+
+function makeInstrumentBuffer(
+  ctx: BaseAudioContext,
+  id: InstrumentId,
+  freq: number
+): AudioBuffer {
+  switch (id) {
+    case "guitar":
+      return karplusBuffer(ctx, freq, 0.9975, 0.9965, 0.55, 3.2);
+    case "harpsichord":
+      return karplusBuffer(ctx, freq, 0.994, 0.991, 0.12, 2.4);
+    case "piano":
+      return pianoBuffer(ctx, freq);
+    case "marimba":
+      return additiveBuffer(ctx, freq, 1.4, MARIMBA, 0, 0, 0, 0.25);
+    case "vibraphone":
+      return additiveBuffer(ctx, freq, 4.0, VIBES, 0, 5, 0.3, 0.05);
+    case "musicbox":
+      return additiveBuffer(ctx, freq, 2.2, MUSICBOX, 0.0012, 0, 0, 0.08);
+    case "saxophone":
+      return reedBuffer(ctx, freq, 4.0);
+    case "clarinet":
+      return clarinetBuffer(ctx, freq, 4.0);
+  }
+}
+
+function instrumentBuffer(synth: Synth, freq: number): AudioBuffer {
+  const key = `${synth.instrument}:${Math.round(freq * 50)}`;
+  const cached = synth.bufferCache.get(key);
+  if (cached) return cached;
+  const buffer = makeInstrumentBuffer(synth.ctx, synth.instrument, freq);
+  synth.bufferCache.set(key, buffer);
+  return buffer;
+}
+
+const SUSTAINED: Partial<Record<InstrumentId, boolean>> = {
+  saxophone: true,
+  clarinet: true,
+};
+const DEFAULT_ATTACK: Record<InstrumentId, number> = {
+  guitar: 0.004,
+  harpsichord: 0.003,
+  piano: 0.003,
+  saxophone: 0.04,
+  clarinet: 0.03,
+  marimba: 0.002,
+  vibraphone: 0.004,
+  musicbox: 0.003,
+};
+
+// Schedules one note and returns the time it stops sounding.
 function pluckNote(
   synth: Synth,
   voice: Voice,
@@ -216,22 +542,36 @@ function pluckNote(
   time: number,
   velocity: number,
   ringSeconds: number,
-  attack = 0.004
+  attack?: number
 ): number {
   const ctx = synth.ctx;
   const src = ctx.createBufferSource();
-  src.buffer = pluckBuffer(synth, freq * voice.transpose);
+  src.buffer = instrumentBuffer(synth, freq * voice.transpose);
   src.detune.value = (Math.random() - 0.5) * 8;
 
+  const atk = attack ?? DEFAULT_ATTACK[synth.instrument];
   const gain = ctx.createGain();
-  gain.gain.setValueAtTime(0.0001, time);
-  gain.gain.linearRampToValueAtTime(velocity, time + attack);
-  gain.gain.setTargetAtTime(0.0001, time + ringSeconds * 0.6, ringSeconds * 0.5);
+  let end: number;
+
+  if (SUSTAINED[synth.instrument]) {
+    // Hold at full level for the note's length, then release — a sustained reed.
+    const hold = time + Math.max(ringSeconds, atk + 0.05);
+    gain.gain.setValueAtTime(0.0001, time);
+    gain.gain.linearRampToValueAtTime(velocity, time + atk);
+    gain.gain.setValueAtTime(velocity, hold);
+    gain.gain.linearRampToValueAtTime(0.0001, hold + 0.1);
+    end = hold + 0.14;
+  } else {
+    // Struck/plucked: quick attack, then a gentle decay/release.
+    gain.gain.setValueAtTime(0.0001, time);
+    gain.gain.linearRampToValueAtTime(velocity, time + atk);
+    gain.gain.setTargetAtTime(0.0001, time + ringSeconds * 0.6, ringSeconds * 0.5);
+    end = time + ringSeconds + 0.2;
+  }
 
   src.connect(gain);
   gain.connect(voice.in);
   src.start(time);
-  const end = time + ringSeconds + 0.2;
   src.stop(end);
   return end;
 }
@@ -360,6 +700,7 @@ export class TseroufPlayer {
   private notes: TseroufNote[] = [];
   private stepSeconds = 0.18;
   private loop = false;
+  private instrument: InstrumentId = "guitar";
   private onStep?: (wordIndex: number) => void;
   private onEnd?: () => void;
 
@@ -390,6 +731,8 @@ export class TseroufPlayer {
     this.notes = notes;
     this.stepSeconds = options.stepSeconds ?? 0.18;
     this.loop = options.loop ?? false;
+    if (options.instrument) this.instrument = options.instrument;
+    this.synth!.instrument = this.instrument;
     this.onStep = options.onStep;
     this.onEnd = options.onEnd;
 
@@ -422,6 +765,18 @@ export class TseroufPlayer {
     this.playing = true;
     void this.ctx.resume();
     this.timer = window.setInterval(() => this.tick(), LOOKAHEAD_MS);
+  }
+
+  // Switches the instrument; takes effect on subsequently scheduled notes.
+  setInstrument(instrument: InstrumentId): void {
+    this.instrument = instrument;
+    if (this.synth) this.synth.instrument = instrument;
+  }
+
+  // Changes the tempo (seconds per note); takes effect on the next scheduled
+  // words, so it can be adjusted live during playback.
+  setStepSeconds(stepSeconds: number): void {
+    this.stepSeconds = stepSeconds;
   }
 
   stop(): void {
@@ -548,6 +903,7 @@ export async function renderTseroufWav(
       .webkitOfflineAudioContext;
   const offline = new OfflineCtor(2, length, sampleRate);
   const synth = buildSynth(offline);
+  synth.instrument = options.instrument ?? "guitar";
 
   let startTime = lead;
   for (let i = 0; i < count; i++) {
@@ -559,7 +915,7 @@ export async function renderTseroufWav(
   return encodeWav(rendered);
 }
 
-function encodeWav(buffer: AudioBuffer): Blob {
+export function encodeWav(buffer: AudioBuffer): Blob {
   const numCh = buffer.numberOfChannels;
   const sr = buffer.sampleRate;
   const frames = buffer.length;

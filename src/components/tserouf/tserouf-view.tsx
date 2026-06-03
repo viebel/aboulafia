@@ -17,7 +17,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { factorial, key, type Perm } from "@/lib/pancake";
-import { renderTseroufWav, TseroufPlayer } from "@/lib/tserouf-audio";
+import {
+  INSTRUMENTS,
+  renderTseroufWav,
+  TseroufPlayer,
+  type InstrumentId,
+} from "@/lib/tserouf-audio";
+import { renderTseroufDroneWav, TseroufDronePlayer } from "@/lib/tserouf-drone";
 import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
 import { toPng } from "html-to-image";
 import {
@@ -80,31 +86,70 @@ const DEFAULT_N: NValue = 3;
 const ALPHABETS: readonly Alphabet[] = ["latin", "hebrew"];
 const LAYOUTS: readonly Layout[] = ["flat", "tree"];
 const LETTER_SETS: readonly LetterSet[] = ["sequence", "elohim", "amash", "yhw"];
+const INSTRUMENT_IDS = INSTRUMENTS.map((i) => i.id) as readonly InstrumentId[];
+const DEFAULT_INSTRUMENT: InstrumentId = "guitar";
+
+// The drone is a different *engine*, not a timbre: instead of a melodic
+// two-part invention it plays each permutation as a bloom of just-intonation
+// overtones over a continuous drone (see lib/tserouf-drone.ts), for an
+// ecstatic/meditative listening. It lives alongside the instruments in the
+// same selector for convenience.
+const DRONE_CHOICE = "drone" as const;
+type SoundChoice = InstrumentId | typeof DRONE_CHOICE;
+const SOUND_IDS = [...INSTRUMENT_IDS, DRONE_CHOICE] as readonly SoundChoice[];
+type SoundKind = "invention" | "drone";
+const soundKindFor = (choice: SoundChoice): SoundKind =>
+  choice === DRONE_CHOICE ? "drone" : "invention";
+
+// A single speed control, as a percentage of each engine's natural tempo (the
+// two engines have very different default note lengths, so one *relative* knob
+// scales both while keeping their character). 100% = default.
+const SPEED_MIN = 50;
+const SPEED_MAX = 200;
+const SPEED_STEP = 10;
+const SPEED_OPTIONS: readonly number[] = Array.from(
+  { length: (SPEED_MAX - SPEED_MIN) / SPEED_STEP + 1 },
+  (_, i) => SPEED_MIN + i * SPEED_STEP
+);
+const DEFAULT_SPEED = 100;
+const BASE_STEP_SECONDS = 0.18; // invention: seconds per note at 100%
+const BASE_NOTE_SECONDS = 0.66; // meditation/chant: seconds per note at 100%
+const stepSecondsForSpeed = (speed: number) => BASE_STEP_SECONDS / (speed / 100);
+const noteSecondsForSpeed = (speed: number) => BASE_NOTE_SECONDS / (speed / 100);
 
 interface TseroufState {
   n: NValue;
   alphabet: Alphabet;
   layout: Layout;
   letterSet: LetterSet;
+  instrument: SoundChoice;
+  speed: number;
 }
 
 function readTseroufState(params: URLSearchParams | null): TseroufState {
   const letterSet = readEnumParam(params, "set", LETTER_SETS, "sequence");
   const layout = readEnumParam(params, "layout", LAYOUTS, "flat");
+  const instrument = readEnumParam(
+    params,
+    "instrument",
+    SOUND_IDS,
+    DEFAULT_INSTRUMENT
+  );
+  const speed = readIntParam(params, "speed", SPEED_OPTIONS, DEFAULT_SPEED);
 
   // The "elohim" set is a fixed 5-letter Hebrew word, so it pins n and alphabet.
   if (letterSet === "elohim") {
-    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet };
+    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, speed };
   }
 
   // The "amash" set is the three mother letters, a fixed 3-letter Hebrew word.
   if (letterSet === "amash") {
-    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet };
+    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, speed };
   }
 
   // The "yhw" set is a fixed 3-letter Hebrew word.
   if (letterSet === "yhw") {
-    return { n: YHW_N, alphabet: "hebrew", layout, letterSet };
+    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, speed };
   }
 
   return {
@@ -112,6 +157,8 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     alphabet: readEnumParam(params, "alphabet", ALPHABETS, "latin"),
     layout,
     letterSet,
+    instrument,
+    speed,
   };
 }
 
@@ -171,6 +218,8 @@ export function TseroufView() {
   const [alphabet, setAlphabet] = useState<Alphabet>(initial.alphabet);
   const [layout, setLayout] = useState<Layout>(initial.layout);
   const [letterSet, setLetterSet] = useState<LetterSet>(initial.letterSet);
+  const [instrument, setInstrument] = useState<SoundChoice>(initial.instrument);
+  const [speed, setSpeed] = useState<number>(initial.speed);
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
@@ -182,7 +231,8 @@ export function TseroufView() {
   const [playingWord, setPlayingWord] = useState<string | null>(null);
   const [renderingAudio, setRenderingAudio] = useState(false);
   const renderRef = useRef<HTMLDivElement>(null);
-  const playerRef = useRef<TseroufPlayer | null>(null);
+  const playerRef = useRef<TseroufPlayer | TseroufDronePlayer | null>(null);
+  const playerKindRef = useRef<SoundKind | null>(null);
 
   const hebrewLetters = useMemo(() => hebrewLettersFor(letterSet), [letterSet]);
   const baseWord = useMemo(
@@ -224,8 +274,10 @@ export function TseroufView() {
       n: String(n),
       alphabet,
       layout,
+      instrument,
+      speed: String(speed),
     });
-  }, [n, alphabet, layout, letterSet]);
+  }, [n, alphabet, layout, letterSet, instrument, speed]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -322,11 +374,26 @@ export function TseroufView() {
 
   const startPlayback = () => {
     if (words.length === 0) return;
-    if (!playerRef.current) playerRef.current = new TseroufPlayer();
+    const kind = soundKindFor(instrument);
+    // The drone and the invention are different engines; swap the player if the
+    // selected kind no longer matches the one we built last time.
+    if (!playerRef.current || playerKindRef.current !== kind) {
+      playerRef.current?.dispose();
+      playerRef.current =
+        kind === "drone" ? new TseroufDronePlayer() : new TseroufPlayer();
+      playerKindRef.current = kind;
+    }
     setPlayState("playing");
-    setStatus("Playing the music of Tserouf…");
+    setStatus(
+      kind === "drone"
+        ? "Playing the zikr drone of Tserouf…"
+        : "Playing the music of Tserouf…"
+    );
     playerRef.current.play(words, {
       loop: true,
+      instrument: kind === "invention" ? (instrument as InstrumentId) : undefined,
+      stepSeconds: stepSecondsForSpeed(speed),
+      noteSeconds: noteSecondsForSpeed(speed),
       onStep: (index) => setPlayingWord(words[index]?.word ?? null),
       onEnd: () => {
         setPlayState("stopped");
@@ -357,16 +424,46 @@ export function TseroufView() {
     setStatus("Ready.");
   };
 
+  const handleSpeedChange = (value: number) => {
+    setSpeed(value);
+    const player = playerRef.current;
+    if (player instanceof TseroufPlayer) {
+      player.setStepSeconds(stepSecondsForSpeed(value));
+    } else if (player instanceof TseroufDronePlayer) {
+      player.setNoteSeconds(noteSecondsForSpeed(value));
+    }
+  };
+
+  const handleInstrumentChange = (value: SoundChoice) => {
+    setInstrument(value);
+    const kind = soundKindFor(value);
+    // Live-swap the timbre when staying within the melodic engine; otherwise
+    // the engine itself must change, so stop and let the next play rebuild it.
+    if (kind === "invention" && playerRef.current instanceof TseroufPlayer) {
+      playerRef.current.setInstrument(value as InstrumentId);
+    } else if (playerKindRef.current !== null && kind !== playerKindRef.current) {
+      stopPlayback();
+    }
+  };
+
   const downloadAudio = async () => {
     if (words.length === 0) return;
     setRenderingAudio(true);
     setStatus("Rendering audio…");
     try {
-      const blob = await renderTseroufWav(words);
+      const blob =
+        soundKindFor(instrument) === "drone"
+          ? await renderTseroufDroneWav(words, {
+              noteSeconds: noteSecondsForSpeed(speed),
+            })
+          : await renderTseroufWav(words, {
+              instrument: instrument as InstrumentId,
+              stepSeconds: stepSecondsForSpeed(speed),
+            });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `tserouf_${baseWord}.wav`;
+      a.download = `tserouf_${baseWord}_${instrument}.wav`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -547,6 +644,53 @@ export function TseroufView() {
             )}
             {exporting ? "Exporting…" : "download tserouf as PNG"}
           </Button>
+
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Instrument
+            </Label>
+            <Select
+              value={instrument}
+              onValueChange={(value) =>
+                handleInstrumentChange(value as SoundChoice)
+              }
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {INSTRUMENTS.map((inst) => (
+                  <SelectItem key={inst.id} value={inst.id}>
+                    {inst.label}
+                  </SelectItem>
+                ))}
+                <SelectItem value={DRONE_CHOICE}>
+                  Zikr drone (meditation)
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                Speed
+              </Label>
+              <span className="text-xs tabular-nums text-muted-foreground">
+                {speed}%
+              </span>
+            </div>
+            <input
+              type="range"
+              min={SPEED_MIN}
+              max={SPEED_MAX}
+              step={SPEED_STEP}
+              value={speed}
+              onChange={(e) => handleSpeedChange(Number(e.target.value))}
+              className="w-full accent-primary"
+              aria-label="Playback speed"
+            />
+          </div>
 
           <div className="flex gap-2">
             <Button
