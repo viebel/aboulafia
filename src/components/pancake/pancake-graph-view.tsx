@@ -20,6 +20,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import {
+  asymmetricTreeCompressionFactor,
   buildPancakeGraph,
   buildZaksSymmetryGraph,
   buildQuotientGraph,
@@ -200,6 +201,13 @@ const SYMMETRY_COLORING_LABELS: Record<SymmetryColoring, string> = {
 const SYMMETRY_COLORINGS = Object.keys(
   SYMMETRY_COLORING_LABELS
 ) as SymmetryColoring[];
+
+// Generous allowed list for the piece/axis indices; the renderer clamps to the
+// valid count for the current n, so the exact upper bound is not critical.
+const DOMAIN_INDEX_RANGE: readonly number[] = Array.from(
+  { length: 44 },
+  (_, i) => i
+);
 const SLIDER_RANGE: readonly number[] = Array.from(
   { length: 100 },
   (_, i) => i + 1
@@ -217,6 +225,10 @@ interface GraphState {
   parityMode: ParityMode;
   symmetryColoring: SymmetryColoring;
   showDihedralAxes: boolean;
+  showSymmetryAxes: boolean;
+  showFundamentalDomain: boolean;
+  domainPiece: number;
+  domainAxis: number;
   showLabels: boolean;
   alpha: number;
   width: number;
@@ -242,6 +254,10 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     parityMode: readEnumParam(params, "parity", PARITY_MODES, "off"),
     symmetryColoring: readEnumParam(params, "sc", SYMMETRY_COLORINGS, "parity"),
     showDihedralAxes: readEnumParam(params, "ax", ["0", "1"], "0") === "1",
+    showSymmetryAxes: readEnumParam(params, "sym", ["0", "1"], "0") === "1",
+    showFundamentalDomain: readEnumParam(params, "fd", ["0", "1"], "0") === "1",
+    domainPiece: readIntParam(params, "dp", DOMAIN_INDEX_RANGE, 0),
+    domainAxis: readIntParam(params, "da", DOMAIN_INDEX_RANGE, 0),
     showLabels: readEnumParam(params, "lbl", ["0", "1"], "0") === "1",
     alpha: readIntParam(params, "alpha", SLIDER_RANGE, rec.alpha),
     width: readIntParam(params, "width", SLIDER_RANGE, rec.width),
@@ -279,6 +295,10 @@ export function PancakeGraphView() {
     parityMode: initial.parityMode,
     symmetryColoring: initial.symmetryColoring,
     showDihedralAxes: initial.showDihedralAxes,
+    showSymmetryAxes: initial.showSymmetryAxes,
+    showFundamentalDomain: initial.showFundamentalDomain,
+    domainPiece: initial.domainPiece,
+    domainAxis: initial.domainAxis,
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
@@ -288,6 +308,11 @@ export function PancakeGraphView() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
+  // What a click on the graph selects for the fundamental domain, so the axis
+  // and the wedge can be picked independently.
+  const [domainClickTarget, setDomainClickTarget] = useState<
+    "piece" | "axis" | "both"
+  >("piece");
 
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -302,6 +327,13 @@ export function PancakeGraphView() {
     panX: number;
     panY: number;
   } | null>(null);
+  // True once a pointer interaction moved enough to count as a drag, so the
+  // ensuing click does not also trigger a fundamental-domain selection.
+  const pointerDraggedRef = useRef(false);
+  // Active while interacting with the axis handle near the rim; records the
+  // press point so a small movement reads as a click (step) vs a drag (free).
+  const axisDragRef = useRef(false);
+  const axisDownRef = useRef<{ x: number; y: number } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
   const estimatedVertices = graphVertexCount(n, preset);
@@ -343,6 +375,10 @@ export function PancakeGraphView() {
       parity: settings.parityMode,
       sc: settings.symmetryColoring,
       ax: settings.showDihedralAxes ? "1" : null,
+      sym: settings.showSymmetryAxes ? "1" : null,
+      fd: settings.showFundamentalDomain ? "1" : null,
+      dp: settings.showFundamentalDomain ? String(settings.domainPiece) : null,
+      da: settings.showFundamentalDomain ? String(settings.domainAxis) : null,
       lbl: settings.showLabels ? "1" : null,
       alpha: String(settings.alpha),
       width: String(settings.width),
@@ -355,6 +391,10 @@ export function PancakeGraphView() {
     settings.parityMode,
     settings.symmetryColoring,
     settings.showDihedralAxes,
+    settings.showSymmetryAxes,
+    settings.showFundamentalDomain,
+    settings.domainPiece,
+    settings.domainAxis,
     settings.showLabels,
     settings.alpha,
     settings.width,
@@ -886,7 +926,22 @@ export function PancakeGraphView() {
   };
 
   const handlePanStart = (event: PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || zoom <= 1) return;
+    pointerDraggedRef.current = false;
+    if (event.button !== 0) return;
+    // Grab the axis when pressing near the rim (the axis handle band), so the
+    // user can drag the axis around the circle. Takes precedence over panning.
+    if (settings.showFundamentalDomain) {
+      const g = pointerGeom(event);
+      if (g && g.radius > 0 && g.dist > 0.72 * g.radius) {
+        // Grab the rim: a small movement is a click (step/jump on release),
+        // a larger one is a free drag (handled in move).
+        axisDragRef.current = true;
+        axisDownRef.current = { x: event.clientX, y: event.clientY };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        return;
+      }
+    }
+    if (zoom <= 1) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     panStartRef.current = {
       pointerId: event.pointerId,
@@ -899,8 +954,25 @@ export function PancakeGraphView() {
   };
 
   const handlePanMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (axisDragRef.current) {
+      const start = axisDownRef.current;
+      if (
+        start &&
+        Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4
+      ) {
+        pointerDraggedRef.current = true; // promoted to a free drag
+      }
+      if (pointerDraggedRef.current) {
+        const g = pointerGeom(event);
+        if (g) setS("domainAxis", axisFromAngle(g.angle));
+      }
+      return;
+    }
     const start = panStartRef.current;
     if (!start || start.pointerId !== event.pointerId) return;
+    if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) {
+      pointerDraggedRef.current = true;
+    }
     setPan({
       x: start.panX + event.clientX - start.x,
       y: start.panY + event.clientY - start.y,
@@ -908,6 +980,33 @@ export function PancakeGraphView() {
   };
 
   const handlePanEnd = (event: PointerEvent<HTMLDivElement>) => {
+    if (axisDragRef.current) {
+      axisDragRef.current = false;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      // A click (no drag): jump to the nearest axis, or — when already on it
+      // (e.g. clicking an arrow) — step one toward the click's side.
+      if (!pointerDraggedRef.current) {
+        const g = pointerGeom(event);
+        if (g) {
+          const cur = (((settings.domainAxis ?? 0) % n) + n) % n;
+          const nearest = axisFromAngle(g.angle);
+          if (nearest !== cur) {
+            setS("domainAxis", nearest);
+          } else {
+            const off = -Math.PI / factorial(n);
+            const d0 = ((g.angle - (off + cur * (Math.PI / n))) % Math.PI + Math.PI) % Math.PI;
+            const d = d0 > Math.PI / 2 ? d0 - Math.PI : d0;
+            if (Math.abs(d) > 1e-3) {
+              setS("domainAxis", (cur + (d > 0 ? 1 : -1) + n) % n);
+            }
+          }
+        }
+      }
+      pointerDraggedRef.current = true; // suppress the trailing onClick
+      return;
+    }
     const start = panStartRef.current;
     if (!start || start.pointerId !== event.pointerId) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -975,6 +1074,54 @@ export function PancakeGraphView() {
     (settings.symmetryColoring ?? "parity") === "orbit" &&
     (renderer === "symmetry" || renderer === "canvas" || renderer === "svg");
 
+  const domainPieceCount = n;
+
+  // Geometry of a pointer event relative to the drawing: the drawing is
+  // centered in the stage (offset by the pan), and zoom scales about that
+  // center, so the angle/radius around it are computed directly. The drawing
+  // radius is ~0.405·min(stage) and scales with zoom (matches the renderers).
+  const pointerGeom = (event: PointerEvent<HTMLDivElement>) => {
+    const el = stageRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const dx = event.clientX - rect.left - (rect.width / 2 + pan.x);
+    const dy = event.clientY - rect.top - (rect.height / 2 + pan.y);
+    return {
+      angle: Math.atan2(dy, dx),
+      dist: Math.hypot(dx, dy),
+      radius: 0.405 * Math.min(rect.width, rect.height) * zoom,
+    };
+  };
+
+  const axisFromAngle = (angle: number) => {
+    const off = -Math.PI / factorial(n);
+    const relAxis = ((angle - off) % Math.PI + Math.PI) % Math.PI;
+    return Math.round(relAxis / (Math.PI / n)) % n;
+  };
+
+  const pieceFromAngle = (angle: number) => {
+    const off = -Math.PI / factorial(n);
+    const wedge = (2 * Math.PI) / n;
+    const rel = ((angle - off) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+    return Math.min(n - 1, Math.floor(rel / wedge));
+  };
+
+  // Clicking near the rim grabs the axis (see the pan handlers); interior
+  // clicks set the piece (and/or axis) per the "Click sets" mode.
+  const handleStageClick = (event: PointerEvent<HTMLDivElement>) => {
+    if (!settings.showFundamentalDomain) return;
+    if (pointerDraggedRef.current) return;
+    const g = pointerGeom(event);
+    if (!g || g.dist < 6) return;
+    const piece = pieceFromAngle(g.angle);
+    const axis = axisFromAngle(g.angle);
+    setSettings((s) => ({
+      ...s,
+      domainPiece: domainClickTarget === "axis" ? s.domainPiece : piece,
+      domainAxis: domainClickTarget === "piece" ? s.domainAxis : axis,
+    }));
+  };
+
   return (
     <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
       <Card className="self-start lg:sticky lg:top-4">
@@ -1024,6 +1171,20 @@ export function PancakeGraphView() {
                       {permutahedronCompressionFactor(n)}-fold
                     </span>{" "}
                     rotational symmetry (compression κ = {permutahedronCompressionFactor(n)}).
+                  </>
+                ) : preset === "asymmetric-tree" ? (
+                  <>
+                    {" "}
+                    Laid out on a Hamilton cycle invariant under a left
+                    translation of order{" "}
+                    <span className="font-medium">
+                      {asymmetricTreeCompressionFactor(n)}
+                    </span>
+                    , so the drawing has{" "}
+                    <span className="font-medium">
+                      {asymmetricTreeCompressionFactor(n)}-fold
+                    </span>{" "}
+                    rotational symmetry.
                   </>
                 ) : null}
               </p>
@@ -1211,6 +1372,20 @@ export function PancakeGraphView() {
                     <>Edges colored by endpoint parity (the default scheme).</>
                   )}
                 </p>
+              </div>
+            ) : null}
+
+            {(activeRenderer === "symmetry" ||
+              activeRenderer === "canvas" ||
+              activeRenderer === "svg") &&
+            supportsSymmetry({ preset }) ? (
+              <div className="space-y-2 rounded-md border border-violet-200 bg-violet-50/40 p-2.5">
+                <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                  Symmetry overlays
+                </Label>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Drawn on top of any color scheme.
+                </p>
                 <label className="flex cursor-pointer items-center gap-2 pt-0.5 text-xs">
                   <input
                     type="checkbox"
@@ -1223,9 +1398,95 @@ export function PancakeGraphView() {
                   <span>
                     Dₙ axis &amp; wedge —{" "}
                     <span style={{ color: "#7c3aed" }}>ω mirror</span> + sector
-                    lines
+                    lines +{" "}
+                    <span style={{ color: "#059669" }}>Cₙ rotation</span>
                   </span>
                 </label>
+                <label className="flex cursor-pointer items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-violet-600"
+                    checked={settings.showSymmetryAxes ?? false}
+                    onChange={(e) =>
+                      setS("showSymmetryAxes", e.target.checked)
+                    }
+                  />
+                  <span>
+                    Axes of symmetry — all n Dₙ mirror lines (
+                    <span style={{ color: "#7c3aed" }}>alternating</span>{" "}
+                    <span style={{ color: "#ea580c" }}>colors</span> so neighbors
+                    differ)
+                  </span>
+                </label>
+              </div>
+            ) : null}
+
+            {(activeRenderer === "symmetry" ||
+              activeRenderer === "canvas" ||
+              activeRenderer === "svg") &&
+            supportsSymmetry({ preset }) ? (
+              <div className="space-y-2 rounded-md border border-violet-200 bg-violet-50/40 p-2.5">
+                <label className="flex cursor-pointer items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-violet-600"
+                    checked={settings.showFundamentalDomain ?? false}
+                    onChange={(e) =>
+                      setS("showFundamentalDomain", e.target.checked)
+                    }
+                  />
+                  <span className="font-medium">Fundamental domain</span>
+                </label>
+                {settings.showFundamentalDomain ? (
+                  <div className="space-y-2.5 pl-5">
+                    <p className="text-[11px] leading-snug text-muted-foreground">
+                      Highlight one 360/n{" "}
+                      <span style={{ color: "#7c3aed" }}>sector</span> (a Cₙ
+                      fundamental domain) and tile the disk with its n rotation
+                      images. Use the steppers, drag the rim handle to move the{" "}
+                      <span style={{ color: "#059669" }}>axis</span>, or click
+                      the graph (&ldquo;Click sets&rdquo; chooses what a click
+                      moves).
+                    </p>
+                    <IndexStepper
+                      label="Sector"
+                      value={
+                        (((settings.domainPiece ?? 0) % domainPieceCount) +
+                          domainPieceCount) %
+                        domainPieceCount
+                      }
+                      count={domainPieceCount}
+                      onChange={(v) => setS("domainPiece", v)}
+                    />
+                    <IndexStepper
+                      label="Axis"
+                      value={(((settings.domainAxis ?? 0) % n) + n) % n}
+                      count={n}
+                      onChange={(v) => setS("domainAxis", v)}
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] text-muted-foreground">
+                        Click sets
+                      </span>
+                      <div className="inline-flex overflow-hidden rounded-md border">
+                        {(["piece", "axis", "both"] as const).map((target) => (
+                          <button
+                            key={target}
+                            type="button"
+                            onClick={() => setDomainClickTarget(target)}
+                            className={`px-2 py-0.5 text-[11px] capitalize transition-colors ${
+                              domainClickTarget === target
+                                ? "bg-violet-600 text-white"
+                                : "bg-background hover:bg-muted"
+                            }`}
+                          >
+                            {target}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : null}
 
@@ -1495,12 +1756,19 @@ export function PancakeGraphView() {
             <>
               <div
                 className={`absolute inset-0 touch-none ${
-                  zoom > 1 ? (isPanning ? "cursor-grabbing" : "cursor-grab") : ""
+                  settings.showFundamentalDomain
+                    ? "cursor-crosshair"
+                    : zoom > 1
+                      ? isPanning
+                        ? "cursor-grabbing"
+                        : "cursor-grab"
+                      : ""
                 }`}
                 onPointerDown={handlePanStart}
                 onPointerMove={handlePanMove}
                 onPointerUp={handlePanEnd}
                 onPointerCancel={handlePanEnd}
+                onClick={handleStageClick}
                 onWheel={handleWheelPan}
               >
                 {activeRenderer === "canvas" ||
@@ -1684,6 +1952,46 @@ function OrbitTable({ orbits, n }: { orbits: OrbitInfo[]; n: number }) {
         </p>
       </CardContent>
     </Card>
+  );
+}
+
+function IndexStepper({
+  label,
+  value,
+  count,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  count: number;
+  onChange: (value: number) => void;
+}) {
+  const wrap = (v: number) => ((v % count) + count) % count;
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <div className="flex items-center gap-1">
+        <Button
+          variant="outline"
+          size="icon-sm"
+          onClick={() => onChange(wrap(value - 1))}
+          aria-label={`Previous ${label}`}
+        >
+          <Minus className="h-3.5 w-3.5" />
+        </Button>
+        <span className="w-14 text-center font-mono text-xs">
+          {value + 1} / {count}
+        </span>
+        <Button
+          variant="outline"
+          size="icon-sm"
+          onClick={() => onChange(wrap(value + 1))}
+          aria-label={`Next ${label}`}
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+    </div>
   );
 }
 

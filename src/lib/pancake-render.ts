@@ -66,6 +66,22 @@ export interface RenderSettings {
    * the rotation Cₙ.
    */
   showDihedralAxes?: boolean;
+  /**
+   * Draw all n reflection axes of the dihedral group as a light overlay — the
+   * mirror lines of ρᵏ∘ω, at angles −π/n! + k·π/n. Complements showDihedralAxes
+   * (which emphasizes the single decisive ω axis plus the wedge).
+   */
+  showSymmetryAxes?: boolean;
+  /**
+   * Highlight a single dihedral fundamental domain and tile the disk with its
+   * images under the group. The user picks the piece granularity, which piece,
+   * and which reflection axis to emphasize.
+   */
+  showFundamentalDomain?: boolean;
+  /** Index of the highlighted 360/n sector (0…n−1). */
+  domainPiece?: number;
+  /** Index of the highlighted reflection axis (0…n−1). */
+  domainAxis?: number;
 }
 
 export interface Palette {
@@ -81,10 +97,18 @@ export interface Palette {
   labelVertexFill: string;
   /** ω mirror axis (the decisive reflection line). */
   dihedralAxis: string;
+  /** Alternating color for neighboring reflection axes (so adjacent axes are
+   *  distinguishable; also marks the two reflection classes for even n). */
+  dihedralAxisAlt: string;
+  /** Third axis color, used only for the one wrap-around axis when n is odd
+   *  (an odd cycle is not 2-colorable), so every neighbor still differs. */
+  dihedralAxisAlt2: string;
   /** ρ-block boundary / sector lines. */
   dihedralSector: string;
   /** Fundamental 360/n wedge shading. */
   dihedralWedge: string;
+  /** Cₙ rotation indicator (the arc arrow + label). */
+  dihedralRotation: string;
   /** Short within-block reversals (r₂…rₙ₋₁) in the "blocks" color scheme. */
   blockWithinStroke: string;
   /** Long between-block full reversals (rₙ) in the "blocks" color scheme. */
@@ -105,8 +129,11 @@ export const DEFAULT_PALETTE: Palette = {
   // near-black dots make label text illegible).
   labelVertexFill: "#cbd5e1", // slate-300
   dihedralAxis: "#7c3aed", // violet-600
+  dihedralAxisAlt: "#ea580c", // orange-600 (alternates with the violet)
+  dihedralAxisAlt2: "#db2777", // pink-600 (odd-n wrap axis)
   dihedralSector: "#94a3b8", // slate-400
   dihedralWedge: "#7c3aed", // violet-600 (low alpha when filled)
+  dihedralRotation: "#059669", // emerald-600
   blockWithinStroke: "#0ea5e9", // sky-500 — short, local chords
   blockBetweenStroke: "#111827", // gray-900 — long rₙ skeleton
 };
@@ -206,6 +233,15 @@ function orbitColor(q: number): string {
   return hsl(hue, 70, 48);
 }
 
+/** Color of the k-th reflection axis (of n), chosen so adjacent axes always
+ *  differ without a full rainbow. Two colors alternate (matching the two
+ *  reflection classes for even n); for odd n the single wrap-around axis takes
+ *  a third color, since an odd cycle is not 2-colorable. */
+function axisColor(k: number, n: number, palette: Palette): string {
+  if (n % 2 === 1 && k === n - 1) return palette.dihedralAxisAlt2;
+  return k % 2 === 0 ? palette.dihedralAxis : palette.dihedralAxisAlt;
+}
+
 /** Hue for a ρ-block (leading-symbol arc), 0 ≤ block < n. `light` brightens it
  * (used for banded vertex dots under index labels so dark digits stay legible). */
 function blockColor(block: number, n: number, light = false): string {
@@ -256,8 +292,8 @@ function drawDihedralOverlayToCanvas(
   ctx.fill();
 
   // Radial ρ-block boundary lines (the n sector spokes).
-  ctx.lineWidth = Math.max(0.8, 1.1 * scale);
-  ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.9);
+  ctx.lineWidth = Math.max(1.4, 1.8 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.95);
   for (let b = 0; b < n; b++) {
     const a = off + step * b;
     ctx.beginPath();
@@ -275,8 +311,37 @@ function drawDihedralOverlayToCanvas(
   ctx.moveTo(c + ext * Math.cos(off), cy + ext * Math.sin(off));
   ctx.lineTo(c + ext * Math.cos(off + Math.PI), cy + ext * Math.sin(off + Math.PI));
   ctx.stroke();
-
   ctx.setLineDash([]);
+
+  // Cₙ rotation indicator: an arc arrow spanning one wedge just outside the
+  // perimeter, showing the 360/n rotation ρ that tiles the wedge n times.
+  ctx.strokeStyle = withAlpha(palette.dihedralRotation, 0.95);
+  ctx.fillStyle = withAlpha(palette.dihedralRotation, 0.95);
+  ctx.lineWidth = Math.max(2, 2.2 * scale);
+  ctx.lineCap = "round";
+  const ra = r * 1.1;
+  ctx.beginPath();
+  ctx.arc(c, cy, ra, off, off + step);
+  ctx.stroke();
+  // Arrowhead at the leading end (increasing-angle travel direction).
+  const tipx = c + ra * Math.cos(off + step);
+  const tipy = cy + ra * Math.sin(off + step);
+  const dir = off + step + Math.PI / 2;
+  const ah = Math.max(7, 10 * scale);
+  ctx.beginPath();
+  ctx.moveTo(tipx, tipy);
+  ctx.lineTo(tipx + ah * Math.cos(dir + Math.PI - 0.45), tipy + ah * Math.sin(dir + Math.PI - 0.45));
+  ctx.moveTo(tipx, tipy);
+  ctx.lineTo(tipx + ah * Math.cos(dir + Math.PI + 0.45), tipy + ah * Math.sin(dir + Math.PI + 0.45));
+  ctx.stroke();
+  // Label the rotation amount at the arc midpoint.
+  const am = off + step / 2;
+  const lr = r * 1.19;
+  ctx.font = `${Math.max(11, 13 * scale)}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(`ρ ${Math.round(360 / n)}°`, c + lr * Math.cos(am), cy + lr * Math.sin(am));
+
   ctx.restore();
 }
 
@@ -595,6 +660,61 @@ function buildSectorMasks(
     : [...mk(palette.cayleyOddStroke, oddF, oddH), ...mk(palette.cayleyEvenStroke, evenF, evenH)];
 }
 
+/**
+ * Draw all n reflection axes of the dihedral group as light diameters. The
+ * reflections ρᵏ∘ω map angle θ ↦ (−2π/n! + 2πk/n) − θ, so their axes sit at
+ * −π/n! + k·π/n for k = 0…n−1 (n distinct mirror lines).
+ */
+function drawSymmetryAxesToCanvas(
+  ctx: CanvasRenderingContext2D,
+  geom: DihedralOverlayGeom,
+  palette: Palette
+): void {
+  const { n, total, c, cy, r, scale } = geom;
+  const off = dihedralOffset(total);
+  const ext = r * 1.02;
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.lineCap = "round";
+  // Bold and opaque so the axes read over the edge tangle; colors alternate so
+  // neighboring axes stay distinguishable.
+  ctx.lineWidth = Math.max(2, 2.4 * scale);
+  for (let k = 0; k < n; k++) {
+    const a = off + (k * Math.PI) / n;
+    ctx.strokeStyle = applyAlpha(axisColor(k, n, palette), 0.95);
+    ctx.beginPath();
+    ctx.moveTo(c + ext * Math.cos(a), cy + ext * Math.sin(a));
+    ctx.lineTo(c + ext * Math.cos(a + Math.PI), cy + ext * Math.sin(a + Math.PI));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** SVG fragment for the n light reflection axes (same geometry as the canvas). */
+function symmetryAxesSVG(
+  geom: { n: number; total: number; c: number; r: number; scale: number },
+  palette: Palette
+): string {
+  const { n, total, c, r, scale } = geom;
+  const off = dihedralOffset(total);
+  const ext = r * 1.02;
+  const sw = Math.max(2, 2.4 * scale);
+  const parts: string[] = [];
+  for (let k = 0; k < n; k++) {
+    const a = off + (k * Math.PI) / n;
+    const x0 = c + ext * Math.cos(a);
+    const y0 = c + ext * Math.sin(a);
+    const x1 = c + ext * Math.cos(a + Math.PI);
+    const y1 = c + ext * Math.sin(a + Math.PI);
+    parts.push(
+      `<line x1="${x0.toFixed(2)}" y1="${y0.toFixed(2)}" x2="${x1.toFixed(
+        2
+      )}" y2="${y1.toFixed(2)}" stroke="${axisColor(k, n, palette)}" stroke-width="${sw}" stroke-opacity="0.95" stroke-linecap="round"/>`
+    );
+  }
+  return parts.join("");
+}
+
 /** SVG fragment for the Dₙ overlay (same geometry as the canvas version). */
 function dihedralOverlaySVG(
   geom: { n: number; total: number; c: number; r: number; scale: number },
@@ -624,9 +744,9 @@ function dihedralOverlaySVG(
       `<line x1="${c}" y1="${c}" x2="${x.toFixed(2)}" y2="${y.toFixed(
         2
       )}" stroke="${palette.dihedralSector}" stroke-width="${Math.max(
-        0.8,
-        1.1 * scale
-      )}" stroke-opacity="0.9"/>`
+        1.4,
+        1.8 * scale
+      )}" stroke-opacity="0.95"/>`
     );
   }
 
@@ -645,6 +765,244 @@ function dihedralOverlaySVG(
       6 * scale
     ).toFixed(2)}"/>`
   );
+
+  // Cₙ rotation indicator: arc arrow over one wedge + a 360/n label.
+  const ra = r * 1.1;
+  const rx0 = c + ra * Math.cos(off);
+  const ry0 = c + ra * Math.sin(off);
+  const rx1 = c + ra * Math.cos(off + step);
+  const ry1 = c + ra * Math.sin(off + step);
+  const rsw = Math.max(2, 2.2 * scale);
+  parts.push(
+    `<path d="M${rx0.toFixed(2)},${ry0.toFixed(2)}A${ra.toFixed(2)},${ra.toFixed(
+      2
+    )} 0 0 1 ${rx1.toFixed(2)},${ry1.toFixed(2)}" fill="none" stroke="${palette.dihedralRotation}" stroke-width="${rsw}" stroke-opacity="0.95" stroke-linecap="round"/>`
+  );
+  const dir = off + step + Math.PI / 2;
+  const ah = Math.max(7, 10 * scale);
+  const b1x = rx1 + ah * Math.cos(dir + Math.PI - 0.45);
+  const b1y = ry1 + ah * Math.sin(dir + Math.PI - 0.45);
+  const b2x = rx1 + ah * Math.cos(dir + Math.PI + 0.45);
+  const b2y = ry1 + ah * Math.sin(dir + Math.PI + 0.45);
+  parts.push(
+    `<path d="M${b1x.toFixed(2)},${b1y.toFixed(2)}L${rx1.toFixed(2)},${ry1.toFixed(
+      2
+    )}L${b2x.toFixed(2)},${b2y.toFixed(2)}" fill="none" stroke="${palette.dihedralRotation}" stroke-width="${rsw}" stroke-opacity="0.95" stroke-linecap="round" stroke-linejoin="round"/>`
+  );
+  const am = off + step / 2;
+  const lr = r * 1.19;
+  const fs = Math.max(11, 13 * scale);
+  parts.push(
+    `<text x="${(c + lr * Math.cos(am)).toFixed(2)}" y="${(c + lr * Math.sin(am)).toFixed(
+      2
+    )}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs.toFixed(
+      1
+    )}" text-anchor="middle" dominant-baseline="middle" fill="${palette.dihedralRotation}">ρ ${Math.round(
+      360 / n
+    )}°</text>`
+  );
+
+  return parts.join("");
+}
+
+interface DomainSelection {
+  count: number;
+  wedge: number;
+  piece: number;
+  axis: number;
+}
+
+/** Resolve the (clamped) sector count, wedge angle, piece and axis indices. */
+function domainSelection(n: number, settings: RenderSettings): DomainSelection {
+  const count = n;
+  const wedge = (2 * Math.PI) / n;
+  const piece = (((settings.domainPiece ?? 0) % count) + count) % count;
+  const axis = (((settings.domainAxis ?? 0) % n) + n) % n;
+  return { count, wedge, piece, axis };
+}
+
+/**
+ * Highlight one Cₙ sector (a 360/n fundamental domain) and tile the disk with
+ * its n rotation images. The chosen sector is shaded strongly and outlined; the
+ * rest are lightly tinted, so it reads as "this seed generates everything". The
+ * chosen reflection axis is drawn as a bold emerald diameter.
+ */
+function drawFundamentalDomainToCanvas(
+  ctx: CanvasRenderingContext2D,
+  geom: DihedralOverlayGeom,
+  settings: RenderSettings,
+  palette: Palette
+): void {
+  const { n, total, c, cy, r, scale } = geom;
+  const off = dihedralOffset(total);
+  const { count, wedge, piece, axis } = domainSelection(n, settings);
+
+  ctx.save();
+  ctx.setLineDash([]);
+
+  const fillWedge = (t: number, style: string) => {
+    const a0 = off + t * wedge;
+    ctx.beginPath();
+    ctx.moveTo(c, cy);
+    ctx.arc(c, cy, r, a0, a0 + wedge);
+    ctx.closePath();
+    ctx.fillStyle = style;
+    ctx.fill();
+  };
+
+  // Tile: every sector is a rotation image of the chosen one.
+  for (let t = 0; t < count; t++) {
+    if (t === piece) continue;
+    fillWedge(t, withAlpha(palette.dihedralAxis, 0.07));
+  }
+
+  // Chosen piece: strong fill + outline.
+  fillWedge(piece, withAlpha(palette.dihedralAxis, 0.3));
+  const pa0 = off + piece * wedge;
+  ctx.beginPath();
+  ctx.moveTo(c, cy);
+  ctx.arc(c, cy, r, pa0, pa0 + wedge);
+  ctx.closePath();
+  ctx.lineWidth = Math.max(1.5, 2 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralAxis, 0.95);
+  ctx.stroke();
+
+  // Chosen reflection axis: a bold diameter.
+  const ext = r * 1.04;
+  const ang = off + (axis * Math.PI) / n;
+  ctx.lineCap = "round";
+  ctx.lineWidth = Math.max(2, 2.4 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralRotation, 0.95);
+  ctx.beginPath();
+  ctx.moveTo(c + ext * Math.cos(ang), cy + ext * Math.sin(ang));
+  ctx.lineTo(c + ext * Math.cos(ang + Math.PI), cy + ext * Math.sin(ang + Math.PI));
+  ctx.stroke();
+
+  // Grab handles at the axis endpoints (drag the rim to move the axis).
+  const hr = Math.max(4, 5.5 * scale);
+  for (const aa of [ang, ang + Math.PI]) {
+    ctx.beginPath();
+    ctx.arc(c + ext * Math.cos(aa), cy + ext * Math.sin(aa), hr, 0, 2 * Math.PI);
+    ctx.fillStyle = withAlpha(palette.dihedralRotation, 0.95);
+    ctx.fill();
+    ctx.lineWidth = Math.max(1, 1.4 * scale);
+    ctx.strokeStyle = withAlpha(palette.background, 0.9);
+    ctx.stroke();
+  }
+
+  // Small tangential chevrons flanking each handle, hinting "drag around here".
+  const chev = Math.max(4, 5 * scale);
+  const reach = hr + 2 * scale + chev;
+  ctx.lineWidth = Math.max(1.5, 2 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralRotation, 0.95);
+  ctx.lineJoin = "round";
+  const chevron = (px: number, py: number, dir: number) => {
+    ctx.beginPath();
+    ctx.moveTo(px + chev * Math.cos(dir + Math.PI - 0.55), py + chev * Math.sin(dir + Math.PI - 0.55));
+    ctx.lineTo(px, py);
+    ctx.lineTo(px + chev * Math.cos(dir + Math.PI + 0.55), py + chev * Math.sin(dir + Math.PI + 0.55));
+    ctx.stroke();
+  };
+  for (const aa of [ang, ang + Math.PI]) {
+    const hx = c + ext * Math.cos(aa);
+    const hy = cy + ext * Math.sin(aa);
+    const tx = -Math.sin(aa);
+    const ty = Math.cos(aa);
+    chevron(hx + tx * reach, hy + ty * reach, aa + Math.PI / 2);
+    chevron(hx - tx * reach, hy - ty * reach, aa - Math.PI / 2);
+  }
+
+  ctx.restore();
+}
+
+/** SVG fragment for the fundamental-domain overlay (mirrors the canvas one). */
+function fundamentalDomainSVG(
+  geom: { n: number; total: number; c: number; r: number; scale: number },
+  settings: RenderSettings,
+  palette: Palette
+): string {
+  const { n, total, c, r, scale } = geom;
+  const off = dihedralOffset(total);
+  const { count, wedge, piece, axis } = domainSelection(n, settings);
+  const parts: string[] = [];
+
+  const wedgePath = (t: number): string => {
+    const a0 = off + t * wedge;
+    const a1 = a0 + wedge;
+    const x0 = c + r * Math.cos(a0);
+    const y0 = c + r * Math.sin(a0);
+    const x1 = c + r * Math.cos(a1);
+    const y1 = c + r * Math.sin(a1);
+    const large = wedge > Math.PI ? 1 : 0;
+    return `M${c},${c}L${x0.toFixed(2)},${y0.toFixed(2)}A${r.toFixed(2)},${r.toFixed(
+      2
+    )} 0 ${large} 1 ${x1.toFixed(2)},${y1.toFixed(2)}Z`;
+  };
+
+  for (let t = 0; t < count; t++) {
+    if (t === piece) continue;
+    parts.push(
+      `<path d="${wedgePath(t)}" fill="${palette.dihedralAxis}" fill-opacity="0.07"/>`
+    );
+  }
+
+  parts.push(
+    `<path d="${wedgePath(piece)}" fill="${palette.dihedralAxis}" fill-opacity="0.3" stroke="${palette.dihedralAxis}" stroke-opacity="0.95" stroke-width="${Math.max(
+      1.5,
+      2 * scale
+    )}"/>`
+  );
+
+  const ext = r * 1.04;
+  const ang = off + (axis * Math.PI) / n;
+  const ax0 = c + ext * Math.cos(ang);
+  const ay0 = c + ext * Math.sin(ang);
+  const ax1 = c + ext * Math.cos(ang + Math.PI);
+  const ay1 = c + ext * Math.sin(ang + Math.PI);
+  parts.push(
+    `<line x1="${ax0.toFixed(2)}" y1="${ay0.toFixed(2)}" x2="${ax1.toFixed(
+      2
+    )}" y2="${ay1.toFixed(2)}" stroke="${palette.dihedralRotation}" stroke-width="${Math.max(
+      2,
+      2.4 * scale
+    )}" stroke-opacity="0.95" stroke-linecap="round"/>`
+  );
+
+  // Grab handles at the axis endpoints.
+  const hr = Math.max(4, 5.5 * scale);
+  for (const aa of [ang, ang + Math.PI]) {
+    parts.push(
+      `<circle cx="${(c + ext * Math.cos(aa)).toFixed(2)}" cy="${(
+        c +
+        ext * Math.sin(aa)
+      ).toFixed(2)}" r="${hr.toFixed(2)}" fill="${palette.dihedralRotation}" fill-opacity="0.95" stroke="${palette.background}" stroke-opacity="0.9" stroke-width="${Math.max(
+        1,
+        1.4 * scale
+      )}"/>`
+    );
+  }
+
+  // Small tangential chevrons flanking each handle, hinting "drag around here".
+  const chev = Math.max(4, 5 * scale);
+  const reach = hr + 2 * scale + chev;
+  const csw = Math.max(1.5, 2 * scale);
+  const chevron = (px: number, py: number, dir: number): string => {
+    const b1x = px + chev * Math.cos(dir + Math.PI - 0.55);
+    const b1y = py + chev * Math.sin(dir + Math.PI - 0.55);
+    const b2x = px + chev * Math.cos(dir + Math.PI + 0.55);
+    const b2y = py + chev * Math.sin(dir + Math.PI + 0.55);
+    return `<path d="M${b1x.toFixed(2)},${b1y.toFixed(2)}L${px.toFixed(2)},${py.toFixed(
+      2
+    )}L${b2x.toFixed(2)},${b2y.toFixed(2)}" fill="none" stroke="${palette.dihedralRotation}" stroke-width="${csw}" stroke-opacity="0.95" stroke-linecap="round" stroke-linejoin="round"/>`;
+  };
+  for (const aa of [ang, ang + Math.PI]) {
+    const hx = c + ext * Math.cos(aa);
+    const hy = c + ext * Math.sin(aa);
+    const tx = -Math.sin(aa);
+    const ty = Math.cos(aa);
+    parts.push(chevron(hx + tx * reach, hy + ty * reach, aa + Math.PI / 2));
+    parts.push(chevron(hx - tx * reach, hy - ty * reach, aa - Math.PI / 2));
+  }
 
   return parts.join("");
 }
@@ -857,12 +1215,12 @@ export function drawToCanvas(
     }
   }
 
-  if (
-    settings.showDihedralAxes &&
-    settings.edgeMode !== "density" &&
-    supportsSymmetry(graph)
-  ) {
-    drawDihedralOverlayToCanvas(ctx, { n: graph.n, total, c, cy, r, scale }, palette);
+  if (settings.edgeMode !== "density" && supportsSymmetry(graph)) {
+    const geom = { n: graph.n, total, c, cy, r, scale };
+    if (settings.showFundamentalDomain)
+      drawFundamentalDomainToCanvas(ctx, geom, settings, palette);
+    if (settings.showSymmetryAxes) drawSymmetryAxesToCanvas(ctx, geom, palette);
+    if (settings.showDihedralAxes) drawDihedralOverlayToCanvas(ctx, geom, palette);
   }
 
   ctx.restore();
@@ -1097,8 +1455,16 @@ export function drawZaksSymmetryToCanvas(
     }
   }
 
-  if (settings.showDihedralAxes) {
-    drawDihedralOverlayToCanvas(ctx, { n, total, c, cy, r, scale }, palette);
+  if (
+    settings.showFundamentalDomain ||
+    settings.showSymmetryAxes ||
+    settings.showDihedralAxes
+  ) {
+    const geom = { n, total, c, cy, r, scale };
+    if (settings.showFundamentalDomain)
+      drawFundamentalDomainToCanvas(ctx, geom, settings, palette);
+    if (settings.showSymmetryAxes) drawSymmetryAxesToCanvas(ctx, geom, palette);
+    if (settings.showDihedralAxes) drawDihedralOverlayToCanvas(ctx, geom, palette);
   }
 
   if (settings.showLabels && n <= 5) {
@@ -1531,8 +1897,12 @@ export function toSVG(opts: SvgOpts): string {
     }
   }
 
-  if (settings.showDihedralAxes && supportsSymmetry(graph)) {
-    parts.push(dihedralOverlaySVG({ n: graph.n, total, c, r, scale }, palette));
+  if (supportsSymmetry(graph)) {
+    const geom = { n: graph.n, total, c, r, scale };
+    if (settings.showFundamentalDomain)
+      parts.push(fundamentalDomainSVG(geom, settings, palette));
+    if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
+    if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
   }
 
   parts.push("</svg>");
@@ -1736,8 +2106,16 @@ export function toSymmetrySVG(opts: SvgOpts): string {
     parts.push(uses.join(""));
   }
 
-  if (settings.showDihedralAxes) {
-    parts.push(dihedralOverlaySVG({ n, total, c, r, scale }, palette));
+  if (
+    settings.showFundamentalDomain ||
+    settings.showSymmetryAxes ||
+    settings.showDihedralAxes
+  ) {
+    const geom = { n, total, c, r, scale };
+    if (settings.showFundamentalDomain)
+      parts.push(fundamentalDomainSVG(geom, settings, palette));
+    if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
+    if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
   }
 
   // Index labels (only legible for tiny n): the position i on the Zaks ring.
@@ -1927,8 +2305,16 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     parts.push(uses.join(""));
   }
 
-  if (settings.showDihedralAxes) {
-    parts.push(dihedralOverlaySVG({ n, total, c, r, scale }, palette));
+  if (
+    settings.showFundamentalDomain ||
+    settings.showSymmetryAxes ||
+    settings.showDihedralAxes
+  ) {
+    const geom = { n, total, c, r, scale };
+    if (settings.showFundamentalDomain)
+      parts.push(fundamentalDomainSVG(geom, settings, palette));
+    if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
+    if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
   }
 
   // Index labels (only emitted for tiny n): the position i on the Zaks ring,
