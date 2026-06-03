@@ -21,13 +21,16 @@ import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import {
   buildPancakeGraph,
+  buildZaksSymmetryGraph,
   buildQuotientGraph,
   EDGE_DISTANCE_BIN_DEGREES,
+  factorial,
   graphEdgeCount,
   graphPresetDescription,
   graphPresetLabel,
   graphMaxN,
   graphVertexCount,
+  permutahedronCompressionFactor,
   quotientDepthOptions,
   supportsQuotient,
   type EdgeDistanceBin,
@@ -38,12 +41,15 @@ import {
 import {
   drawQuotientToCanvas,
   drawToCanvas,
+  drawZaksSymmetryToCanvas,
+  type ZaksSymmetrySectors,
   edgeAlphaToSlider,
   edgeWidthToSlider,
   type EdgeRenderMode,
   supportsSymmetry,
   toSVG,
   toSymmetrySVG,
+  toZaksSymmetrySVG,
   type ParityMode,
   type RenderSettings,
 } from "@/lib/pancake-render";
@@ -124,8 +130,10 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "cayley-complete",
   "star",
   "permutohedron",
+  "permutahedron-compressed",
   "cyclic-adjacent",
   "transposition",
+  "asymmetric-tree",
   "kaleidoscope",
   "lexicographic",
   "hypercube",
@@ -238,6 +246,10 @@ export function PancakeGraphView() {
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [status, setStatus] = useState<string>("Ready.");
   const [running, setRunning] = useState(false);
+  // The build (running) and the actual draw are separate phases: for large
+  // graphs the SVG string + DOM injection can take a while *after* the graph is
+  // ready, so we surface it as its own "Rendering…" state.
+  const [isRendering, setIsRendering] = useState(false);
 
   const [settings, setSettings] = useState<RenderSettings>({
     alpha: initial.alpha,
@@ -260,6 +272,9 @@ export function PancakeGraphView() {
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const svgHostRef = useRef<HTMLDivElement>(null);
+  // Cached fundamental-sector geometry for the canvas symmetry renderer, reused
+  // across zoom/pan/alpha/width so only n/size/parity/hidden changes re-enumerate.
+  const symSectorCacheRef = useRef<ZaksSymmetrySectors | null>(null);
   const panStartRef = useRef<{
     pointerId: number;
     x: number;
@@ -278,6 +293,21 @@ export function PancakeGraphView() {
   // choice).
   const canUseInteractiveSvg = true;
   const activeRenderer: Renderer = renderer;
+  // pancake-zaks symmetry is rendered straight from the recursion, so it needs
+  // only the O((n-1)!) fundamental sector — never the full n! graph. When this
+  // is active we build the lightweight payload instead (and rebuild the full
+  // graph lazily if the user switches to a graph-dependent renderer).
+  const symmetryLite = preset === "pancake-zaks" && renderer === "symmetry";
+  // Vector renders above this many segments are slow enough to be worth a
+  // visible "Rendering…" phase; smaller ones draw synchronously to keep slider
+  // tweaks snappy and flicker-free. Symmetry only emits a 1/n sector.
+  const svgRenderLoad =
+    activeRenderer === "symmetry" && supportsSymmetry({ preset })
+      ? graphEdgeCount(n, preset) / n
+      : graphEdgeCount(n, preset);
+  const showRenderProgress =
+    (activeRenderer === "svg" || activeRenderer === "symmetry") &&
+    svgRenderLoad >= 120_000;
   const availableNOptions = useMemo(
     () => N_OPTIONS.filter((option) => option <= graphMaxN(preset)),
     [preset]
@@ -311,9 +341,42 @@ export function PancakeGraphView() {
 
     const run = async () => {
       setRunning(true);
-      setStatus(`Computing ${graphPresetLabel(preset)} for n = ${n}…`);
       const t0 = performance.now();
       try {
+        if (symmetryLite) {
+          // Built from the recursive fundamental sector only — O((n-1)!), no
+          // path/edge arrays. It is synchronous (no chunking needed even at the
+          // n = 11 ceiling), so yield one frame first: otherwise setRunning(true)
+          // and the blocking build run in the same task and the browser never
+          // paints the loading spinner until everything is already done.
+          setStatus(`Computing ${graphPresetLabel(preset)} symmetry for n = ${n}…`);
+          await new Promise<void>((resolve) =>
+            requestAnimationFrame(() => resolve())
+          );
+          if (signal.aborted) return;
+          const g = buildZaksSymmetryGraph(n);
+          if (signal.aborted) return;
+          setGraph(g);
+          setSettings((s) => {
+            const initialHidden = defaultHiddenGenerators(g);
+            const unchanged =
+              s.hiddenGenerators.length === initialHidden.length &&
+              s.hiddenGenerators.every((id, i) => id === initialHidden[i]);
+            return unchanged ? s : { ...s, hiddenGenerators: initialHidden };
+          });
+          setMetrics({
+            vertices: graphVertexCount(n, preset),
+            cayleyEdges: graphEdgeCount(n, preset),
+            cycleEdges: factorial(n),
+            rnEdges: n,
+            evenEdges: g.evenEdgeCount,
+            oddEdges: g.oddEdgeCount,
+            elapsedMs: Math.round(performance.now() - t0),
+          });
+          setStatus(`${graphPresetLabel(preset)} drawn.`);
+          return;
+        }
+        setStatus(`Computing ${graphPresetLabel(preset)} for n = ${n}…`);
         const g = await buildPancakeGraph(
           n,
           preset,
@@ -370,7 +433,7 @@ export function PancakeGraphView() {
       ac.abort();
       clearTimeout(id);
     };
-  }, [n, preset]);
+  }, [n, preset, symmetryLite]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -486,21 +549,124 @@ export function PancakeGraphView() {
   }, [activeRenderer, quotient, settings, stageSize, pan.x, pan.y, zoom]);
 
   useEffect(() => {
+    // pancake-zaks symmetry renders to canvas (see the effect below) to avoid a
+    // multi-GB SVG render tree at large n, so the SVG host only handles the flat
+    // renderer and the non-zaks symmetry fallback here.
+    if (symmetryLite) return;
     if (activeRenderer !== "svg" && activeRenderer !== "symmetry") return;
     const host = svgHostRef.current;
     if (!host || !graph) return;
     // Square SVG with a viewBox — CSS scales it to fill the stage. The symmetry
     // renderer falls back to the flat one if the graph lacks the n-fold layout.
     const useSymmetry = activeRenderer === "symmetry" && supportsSymmetry(graph);
-    const svg = (useSymmetry ? toSymmetrySVG : toSVG)({
-      graph,
-      settings,
-      size: SVG_VIEWBOX,
+    const render = !useSymmetry
+      ? toSVG
+      : graph.preset === "pancake-zaks"
+        ? toZaksSymmetrySVG
+        : toSymmetrySVG;
+    const draw = () => {
+      const svg = render({ graph, settings, size: SVG_VIEWBOX });
+      host.innerHTML = svg
+        .replace(`width="${SVG_VIEWBOX}"`, 'width="100%"')
+        .replace(`height="${SVG_VIEWBOX}"`, 'height="100%"');
+    };
+
+    // Light graphs draw inline (no flicker on slider tweaks). Heavy ones are
+    // deferred a frame so the "Rendering…" indicator can paint before the
+    // (blocking) string build + DOM injection runs.
+    if (!showRenderProgress) {
+      draw();
+      return;
+    }
+    // Defer past a paint so the "Rendering…" indicator is visible while the
+    // blocking string build + DOM injection runs. All state changes happen in
+    // these async callbacks (and cleanup), never synchronously in the body.
+    let cancelled = false;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      if (cancelled) return;
+      setIsRendering(true);
+      setStatus(`Rendering n = ${graph.n}…`);
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        draw();
+        setIsRendering(false);
+        setStatus(`${graphPresetLabel(graph.preset)} drawn.`);
+      });
     });
-    host.innerHTML = svg
-      .replace(`width="${SVG_VIEWBOX}"`, 'width="100%"')
-      .replace(`height="${SVG_VIEWBOX}"`, 'height="100%"');
-  }, [activeRenderer, graph, settings]);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      setIsRendering(false);
+    };
+  }, [symmetryLite, activeRenderer, graph, settings, showRenderProgress]);
+
+  // Canvas symmetry renderer for pancake-zaks: draws the fundamental sector and
+  // composites n rotated copies, with pixel-bound memory instead of the SVG
+  // render tree. Sector geometry is cached, so only n/size/parity/hidden changes
+  // re-enumerate; zoom/pan/alpha/width reuse it and draw inline.
+  useEffect(() => {
+    if (!symmetryLite) return;
+    const canvas = canvasRef.current;
+    if (!canvas || !graph) return;
+    const { width, height } = stageSize;
+    if (width === 0 || height === 0) return;
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const draw = () => {
+      drawZaksSymmetryToCanvas(ctx, {
+        n: graph.n,
+        settings,
+        cssWidth: width,
+        cssHeight: height,
+        dpr,
+        zoom,
+        panX: pan.x,
+        panY: pan.y,
+        cache: symSectorCacheRef,
+      });
+    };
+
+    // Only the first draw of a new sector enumerates; cache hits (zoom/pan/
+    // alpha/width) draw inline so they stay smooth and flicker-free.
+    const hiddenKey = [...new Set(settings.hiddenGenerators)]
+      .sort((a, b) => a - b)
+      .join(",");
+    const key = `${graph.n}|${Math.floor(width * dpr)}x${Math.floor(
+      height * dpr
+    )}|${settings.parityMode}|${hiddenKey}`;
+    const cacheMiss = symSectorCacheRef.current?.key !== key;
+
+    if (!cacheMiss || !showRenderProgress) {
+      draw();
+      return;
+    }
+    let cancelled = false;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      if (cancelled) return;
+      setIsRendering(true);
+      setStatus(`Rendering n = ${graph.n}…`);
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        draw();
+        setIsRendering(false);
+        setStatus(`${graphPresetLabel(graph.preset)} drawn.`);
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      setIsRendering(false);
+    };
+  }, [symmetryLite, graph, settings, stageSize, zoom, pan.x, pan.y, showRenderProgress]);
 
   // Zoom/pan for SVG are driven through the viewBox rather than a CSS
   // transform: changing the viewBox re-rasterizes the vectors crisply at
@@ -530,7 +696,12 @@ export function PancakeGraphView() {
       try {
         const useSymmetry =
           activeRenderer === "symmetry" && supportsSymmetry(graph);
-        const svg = (useSymmetry ? toSymmetrySVG : toSVG)({
+        const render = !useSymmetry
+          ? toSVG
+          : graph.preset === "pancake-zaks"
+            ? toZaksSymmetrySVG
+            : toSymmetrySVG;
+        const svg = render({
           graph,
           settings,
           size: svgExportSize,
@@ -563,7 +734,15 @@ export function PancakeGraphView() {
         const ctx = canvas.getContext("2d");
         if (!ctx) throw new Error("Could not create canvas context.");
 
-        if (activeRenderer === "quotient") {
+        if (symmetryLite) {
+          drawZaksSymmetryToCanvas(ctx, {
+            n: graph.n,
+            settings,
+            cssWidth: svgExportSize,
+            cssHeight: svgExportSize,
+            dpr: 1,
+          });
+        } else if (activeRenderer === "quotient") {
           if (!quotient) throw new Error("Quotient is still building.");
           drawQuotientToCanvas(ctx, {
             quotient,
@@ -604,7 +783,7 @@ export function PancakeGraphView() {
         setStatus(`PNG export error: ${msg}`);
       }
     }, 30);
-  }, [activeRenderer, graph, quotient, settings, svgExportSize]);
+  }, [activeRenderer, symmetryLite, graph, quotient, settings, svgExportSize]);
 
   const svgDownloadDisabled = useMemo(() => {
     if (!graph) return true;
@@ -799,6 +978,16 @@ export function PancakeGraphView() {
               </Select>
               <p className="text-xs leading-snug text-muted-foreground">
                 {selectedPresetLabel}: {selectedPresetDescription}.
+                {preset === "permutahedron-compressed" ? (
+                  <>
+                    {" "}
+                    The drawing has{" "}
+                    <span className="font-medium">
+                      {permutahedronCompressionFactor(n)}-fold
+                    </span>{" "}
+                    rotational symmetry (compression κ = {permutahedronCompressionFactor(n)}).
+                  </>
+                ) : null}
               </p>
             </div>
 
@@ -1197,7 +1386,8 @@ export function PancakeGraphView() {
               >
                 {activeRenderer === "canvas" ||
                 activeRenderer === "density" ||
-                activeRenderer === "quotient" ? (
+                activeRenderer === "quotient" ||
+                symmetryLite ? (
                   <canvas ref={canvasRef} className="block h-full w-full" />
                 ) : (
                   <div
@@ -1206,8 +1396,40 @@ export function PancakeGraphView() {
                   />
                 )}
               </div>
+              {isRendering ? (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-3 bg-white/55 backdrop-blur-[1px]">
+                  <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                  <span className="text-sm font-medium text-muted-foreground">
+                    Rendering…
+                  </span>
+                </div>
+              ) : null}
               <div className="absolute left-3 top-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border bg-background/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
                 <span className="font-mono">n = {n}</span>
+                {isRendering || graph ? (
+                  <>
+                    <span>·</span>
+                    <span
+                      className={`inline-flex items-center gap-1 ${
+                        isRendering ? "text-amber-600" : "text-emerald-600"
+                      }`}
+                      title={
+                        isRendering
+                          ? "Generating and drawing the figure"
+                          : "Figure is fully drawn"
+                      }
+                    >
+                      <span
+                        className={`inline-block h-2 w-2 rounded-full ${
+                          isRendering
+                            ? "animate-pulse bg-amber-500"
+                            : "bg-emerald-500"
+                        }`}
+                      />
+                      {isRendering ? "Rendering" : "Done"}
+                    </span>
+                  </>
+                ) : null}
                 <span>·</span>
                 <span className="rounded border bg-muted px-1 py-px font-mono text-[10px] uppercase">
                   {activeRenderer}

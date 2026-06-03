@@ -11,7 +11,13 @@
  * small graphs readable and large ones visible.
  */
 
-import { factorial, type PancakeGraph, type QuotientGraph } from "./pancake";
+import {
+  factorial,
+  forEachZaksFundamentalEdge,
+  zaksBlock0,
+  type PancakeGraph,
+  type QuotientGraph,
+} from "./pancake";
 
 /**
  * Edge coloring mode:
@@ -283,6 +289,283 @@ export function drawToCanvas(
 function pointXY(i: number, total: number, cx: number, cy: number, r: number): [number, number] {
   const a = (2 * Math.PI * i) / total;
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+}
+
+/**
+ * Cached fundamental-sector geometry for the canvas symmetry renderer. Edge
+ * segments are stored as flat [ax,ay,bx,by,…] in device pixels at zoom = 1;
+ * zoom/pan are applied via the canvas transform, so this survives those without
+ * recomputation. Only n, canvas size, parity mode and hidden generators affect
+ * it (captured in `key`).
+ */
+export interface ZaksSymmetrySectors {
+  key: string;
+  buckets: { color: string; full: Float32Array; half: Float32Array }[];
+  vertices: Float32Array;
+}
+
+interface ZaksSymmetryCanvasOpts {
+  n: number;
+  settings: RenderSettings;
+  cssWidth: number;
+  cssHeight: number;
+  dpr: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
+  palette?: Palette;
+  /** Mutable cache (e.g. a React ref); reused across zoom/pan/alpha/width. */
+  cache?: { current: ZaksSymmetrySectors | null };
+}
+
+// Reusable offscreen canvas for the symmetry compositor (one per page, resized
+// on demand) so we don't allocate a full-frame buffer on every zoom/pan redraw.
+let symmetryScratch: HTMLCanvasElement | null = null;
+function getScratchCanvas(w: number, h: number): HTMLCanvasElement {
+  if (!symmetryScratch) symmetryScratch = document.createElement("canvas");
+  if (symmetryScratch.width !== w) symmetryScratch.width = w;
+  if (symmetryScratch.height !== h) symmetryScratch.height = h;
+  return symmetryScratch;
+}
+
+// Above this vertex count the per-dot circles are sub-pixel and invisible, but
+// cost millions of fills per frame — so the canvas renderer omits them (the
+// perimeter cycle already conveys the ring). The flat SVG export is unaffected.
+const SYMMETRY_VERTEX_LIMIT = 50_000;
+
+/**
+ * On-screen symmetry renderer for the pancake-zaks layout. Draws only the
+ * fundamental sector (block 0) and composites n rotated copies with canvas
+ * transforms — visually identical to the SVG symmetry view but with constant,
+ * pixel-bound memory instead of the multi-million-node SVG render tree that the
+ * `<use>`-expanded DOM produces at large n.
+ */
+export function drawZaksSymmetryToCanvas(
+  ctx: CanvasRenderingContext2D,
+  opts: ZaksSymmetryCanvasOpts
+): void {
+  const {
+    n,
+    settings,
+    cssWidth,
+    cssHeight,
+    dpr,
+    zoom = 1,
+    panX = 0,
+    panY = 0,
+    palette = DEFAULT_PALETTE,
+    cache,
+  } = opts;
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  // Floor to match the integer canvas backing-store size set by the caller, so
+  // the geometry cache key (which includes w×h) is stable across redraws.
+  const w = Math.floor(cssWidth * dpr);
+  const h = Math.floor(cssHeight * dpr);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = palette.background;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.save();
+  ctx.translate(w / 2 + panX * dpr, h / 2 + panY * dpr);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-w / 2, -h / 2);
+
+  const size = Math.min(w, h);
+  const c = size / 2 + (w - size) / 2;
+  const cy = size / 2 + (h - size) / 2;
+  const r = size * 0.405;
+  const scale = size / 1000;
+  const k = constantsFor(n, scale);
+  const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
+  const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
+  const halfTurns = n % 2 === 0 ? n / 2 : 0;
+  const step = (2 * Math.PI) / n;
+  ctx.lineCap = "round";
+
+  if (settings.showCycle) {
+    ctx.beginPath();
+    ctx.arc(c, cy, r, 0, 2 * Math.PI);
+    ctx.strokeStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
+    ctx.lineWidth = k.cycleWidth;
+    ctx.stroke();
+  }
+
+  // Recompute the sector only when geometry, parity mode or hidden set changes;
+  // zoom/pan/alpha/width reuse the cache, keeping interaction enumeration-free.
+  const hiddenKey = [...new Set(settings.hiddenGenerators)]
+    .sort((a, b) => a - b)
+    .join(",");
+  const key = `${n}|${w}x${h}|${settings.parityMode}|${hiddenKey}`;
+  let sectors = cache?.current && cache.current.key === key ? cache.current : null;
+  if (!sectors) {
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    const mode = settings.parityMode;
+    const neutralF: number[] = [];
+    const neutralH: number[] = [];
+    const evenF: number[] = [];
+    const evenH: number[] = [];
+    const oddF: number[] = [];
+    const oddH: number[] = [];
+    let evenWeight = 0;
+    let oddWeight = 0;
+    forEachZaksFundamentalEdge(n, (e) => {
+      const orbit = e.half ? n / 2 : n;
+      if (e.parityXor === 0) evenWeight += orbit;
+      else oddWeight += orbit;
+      if (hidden && hidden.has(e.gen)) return;
+      let full: number[];
+      let half: number[];
+      if (mode === "off") {
+        full = neutralF;
+        half = neutralH;
+      } else if (mode === "even") {
+        if (e.parityXor !== 0) return;
+        full = evenF;
+        half = evenH;
+      } else if (mode === "odd") {
+        if (e.parityXor !== 1) return;
+        full = oddF;
+        half = oddH;
+      } else if (e.parityXor === 0) {
+        full = evenF;
+        half = evenH;
+      } else {
+        full = oddF;
+        half = oddH;
+      }
+      const [ax, ay] = pointXY(e.i, total, c, cy, r);
+      const [bx, by] = pointXY(e.j, total, c, cy, r);
+      if (e.half) half.push(ax, ay, bx, by);
+      else full.push(ax, ay, bx, by);
+    });
+    const mk = (color: string, f: number[], hh: number[]) => ({
+      color,
+      full: Float32Array.from(f),
+      half: Float32Array.from(hh),
+    });
+    const buckets =
+      mode === "off"
+        ? [mk(palette.cayleyStroke, neutralF, neutralH)]
+        : mode === "even"
+          ? [mk(palette.cayleyEvenStroke, evenF, evenH)]
+          : mode === "odd"
+            ? [mk(palette.cayleyOddStroke, oddF, oddH)]
+            : evenWeight >= oddWeight
+              ? [
+                  mk(palette.cayleyEvenStroke, evenF, evenH),
+                  mk(palette.cayleyOddStroke, oddF, oddH),
+                ]
+              : [
+                  mk(palette.cayleyOddStroke, oddF, oddH),
+                  mk(palette.cayleyEvenStroke, evenF, evenH),
+                ];
+    const vertices =
+      settings.showVertices && total <= SYMMETRY_VERTEX_LIMIT
+        ? (() => {
+            const v = new Float32Array(B * 2);
+            for (let i = 0; i < B; i++) {
+              const [x, y] = pointXY(i, total, c, cy, r);
+              v[2 * i] = x;
+              v[2 * i + 1] = y;
+            }
+            return v;
+          })()
+        : new Float32Array(0);
+    sectors = { key, buckets, vertices };
+    if (cache) cache.current = sectors;
+  }
+
+  if (settings.showCayley) {
+    // Reproduce the SVG `<use>` opacity semantics: paint each sector mask ONCE
+    // (opaque) onto an offscreen canvas, then composite n rotated copies at the
+    // edge alpha. Stroking the sector directly in many batches would composite
+    // each batch separately and accumulate opacity into a solid black disk.
+    const scratch = getScratchCanvas(w, h);
+    const sctx = scratch.getContext("2d");
+    if (sctx) {
+      // Stroke the offscreen in batches (opaque, so batching does not darken),
+      // keeping any single path well under the size some canvases will drop.
+      const batch = n >= 9 ? 15_000 : 60_000;
+      const compositeSector = (
+        coords: Float32Array,
+        color: string,
+        repeats: number
+      ) => {
+        if (coords.length === 0 || repeats <= 0) return;
+        sctx.setTransform(1, 0, 0, 1, 0, 0);
+        sctx.clearRect(0, 0, w, h);
+        sctx.lineCap = "round";
+        sctx.lineWidth = edgeWidth;
+        sctx.strokeStyle = color;
+        for (let start = 0; start < coords.length; start += batch * 4) {
+          const end = Math.min(coords.length, start + batch * 4);
+          sctx.beginPath();
+          for (let t = start; t < end; t += 4) {
+            sctx.moveTo(coords[t], coords[t + 1]);
+            sctx.lineTo(coords[t + 2], coords[t + 3]);
+          }
+          sctx.stroke();
+        }
+        for (let s = 0; s < repeats; s++) {
+          ctx.save();
+          ctx.globalAlpha = edgeAlpha;
+          ctx.translate(c, cy);
+          ctx.rotate(step * s);
+          ctx.translate(-c, -cy);
+          ctx.drawImage(scratch, 0, 0);
+          ctx.restore();
+        }
+      };
+      for (const bucket of sectors.buckets) {
+        compositeSector(bucket.full, bucket.color, n);
+        compositeSector(bucket.half, bucket.color, halfTurns);
+      }
+    }
+  }
+
+  if (settings.showVertices && sectors.vertices.length > 0) {
+    ctx.fillStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
+    const dotRadius = Math.max(0.5, k.vertexRadius);
+    const verts = sectors.vertices;
+    for (let s = 0; s < n; s++) {
+      ctx.save();
+      ctx.translate(c, cy);
+      ctx.rotate(step * s);
+      ctx.translate(-c, -cy);
+      ctx.beginPath();
+      for (let i = 0; i < verts.length; i += 2) {
+        ctx.moveTo(verts[i] + dotRadius, verts[i + 1]);
+        ctx.arc(verts[i], verts[i + 1], dotRadius, 0, 2 * Math.PI);
+      }
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  if (settings.showLabels && n <= 5) {
+    ctx.fillStyle = palette.labelFill;
+    ctx.font = `${(total <= 24 ? 12 : 6) * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const block0 = zaksBlock0(n);
+    for (let i = 0; i < total; i++) {
+      const b = Math.floor(i / B);
+      const o = i % B;
+      const p = new Uint8Array(block0[o]);
+      for (let t = 0; t < b; t++) {
+        for (let sym = 0; sym < p.length; sym++) p[sym] = (p[sym] % n) + 1;
+      }
+      let label = "";
+      for (let sym = 0; sym < p.length; sym++) label += p[sym];
+      const [x, y] = pointXY(i, total, c, cy, r);
+      ctx.fillText(label, x, y);
+    }
+  }
+
+  ctx.restore();
 }
 
 /* -------------------------------- quotient -------------------------------- */
@@ -815,6 +1098,159 @@ export function toSymmetrySVG(opts: SvgOpts): string {
       const [x, y] = point(i, total, c, r);
       parts.push(
         `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${permLabel(path[i])}</text>`
+      );
+    }
+  }
+
+  parts.push("</svg>");
+  return parts.join("");
+}
+
+/**
+ * Symmetry SVG for the pancake-zaks layout generated straight from the
+ * recursive / rotational structure — no full O(n!) graph required. It reads
+ * only `graph.n`: the fundamental sector (block 0, (n-1)! vertices) and its
+ * edges are enumerated via `forEachZaksFundamentalEdge`, then folded with n
+ * rotated `<use>` elements, exactly as `toSymmetrySVG` does, but in O((n-1)!)
+ * instead of scanning every edge.
+ *
+ * The emitted geometry is byte-for-byte identical to `toSymmetrySVG` for the
+ * pancake-zaks preset (same edge order, same fundamental-domain rule), so it is
+ * a drop-in replacement that simply avoids materializing the n! graph.
+ */
+export function toZaksSymmetrySVG(opts: SvgOpts): string {
+  const { graph, settings, size, palette = DEFAULT_PALETTE } = opts;
+  const n = graph.n;
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const c = size / 2;
+  const r = size * 0.405;
+  const scale = size / 1000;
+
+  const k = constantsFor(n, scale);
+  const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
+  const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
+  const halfTurns = n % 2 === 0 ? n / 2 : 0;
+
+  const rotate = (steps: number): string =>
+    steps === 0
+      ? ""
+      : ` transform="rotate(${((360 / n) * steps).toFixed(4)} ${c} ${c})"`;
+  const seg = (i: number, j: number): string => {
+    const [ax, ay] = point(i, total, c, r);
+    const [bx, by] = point(j, total, c, r);
+    return `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
+  };
+
+  const parts: string[] = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">`
+  );
+  parts.push(`<rect width="100%" height="100%" fill="${palette.background}"/>`);
+
+  if (settings.showCycle) {
+    parts.push(
+      `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`
+    );
+  }
+
+  const defs: string[] = [];
+  const uses: string[] = [];
+  let fragId = 0;
+  const emitFragment = (d: string, color: string, repeats: number): void => {
+    if (d.length === 0 || repeats <= 0) return;
+    const id = `s${fragId++}`;
+    defs.push(
+      `<path id="${id}" d="${d}" fill="none" stroke="${color}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
+    );
+    for (let s = 0; s < repeats; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
+  };
+
+  if (settings.showCayley) {
+    const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+    // Parity buckets mirror parityPasses: "off" → one neutral bucket; "even"/
+    // "odd" → that bucket only; "both" → both, ordered by total edge count so
+    // the majority parity is drawn first (matching the scan-based renderer).
+    type Bucket = { color: string; full: string; half: string };
+    const mode = settings.parityMode;
+    const neutral: Bucket = { color: palette.cayleyStroke, full: "", half: "" };
+    const evenB: Bucket = { color: palette.cayleyEvenStroke, full: "", half: "" };
+    const oddB: Bucket = { color: palette.cayleyOddStroke, full: "", half: "" };
+    let evenWeight = 0;
+    let oddWeight = 0;
+
+    forEachZaksFundamentalEdge(n, (e) => {
+      // Pass-order weights track every edge (hidden or not), matching how the
+      // full build's even/odd counts are computed before render-time hiding.
+      const orbit = e.half ? n / 2 : n;
+      if (e.parityXor === 0) evenWeight += orbit;
+      else oddWeight += orbit;
+      if (hidden && hidden.has(e.gen)) return;
+      let bucket: Bucket | null;
+      if (mode === "off") bucket = neutral;
+      else if (mode === "even") bucket = e.parityXor === 0 ? evenB : null;
+      else if (mode === "odd") bucket = e.parityXor === 1 ? oddB : null;
+      else bucket = e.parityXor === 0 ? evenB : oddB;
+      if (!bucket) return;
+      if (e.half) bucket.half += seg(e.i, e.j);
+      else bucket.full += seg(e.i, e.j);
+    });
+
+    const order: Bucket[] =
+      mode === "off"
+        ? [neutral]
+        : mode === "even"
+          ? [evenB]
+          : mode === "odd"
+            ? [oddB]
+            : evenWeight >= oddWeight
+              ? [evenB, oddB]
+              : [oddB, evenB];
+    for (const bucket of order) {
+      emitFragment(bucket.full, bucket.color, n);
+      emitFragment(bucket.half, bucket.color, halfTurns);
+    }
+  }
+
+  if (settings.showVertices) {
+    const dotRadius = Math.max(0.5, k.vertexRadius);
+    let dots = "";
+    for (let i = 0; i < B; i++) {
+      const [x, y] = point(i, total, c, r);
+      dots += `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotRadius.toFixed(
+        2
+      )}" fill="${palette.cayleyStroke}" fill-opacity="${edgeAlpha}"/>`;
+    }
+    if (dots.length > 0) {
+      const id = `s${fragId++}`;
+      defs.push(`<g id="${id}">${dots}</g>`);
+      for (let s = 0; s < n; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
+    }
+  }
+
+  if (defs.length > 0) {
+    parts.push(`<defs>${defs.join("")}</defs>`);
+    parts.push(uses.join(""));
+  }
+
+  // Labels are only legible (and only emitted) for tiny n; reconstruct the full
+  // ordering from block 0 via the cyclic relabeling φ: vertex b·B+o is φᵇ
+  // applied to block-0 vertex o.
+  if (settings.showLabels && n <= 5) {
+    const block0 = zaksBlock0(n);
+    const fs = total <= 24 ? 12 : 6;
+    for (let i = 0; i < total; i++) {
+      const b = Math.floor(i / B);
+      const o = i % B;
+      const p = new Uint8Array(block0[o]);
+      for (let t = 0; t < b; t++) {
+        for (let s = 0; s < p.length; s++) p[s] = (p[s] % n) + 1;
+      }
+      let label = "";
+      for (let s = 0; s < p.length; s++) label += p[s];
+      const [x, y] = point(i, total, c, r);
+      parts.push(
+        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${label}</text>`
       );
     }
   }

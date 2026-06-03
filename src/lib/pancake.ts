@@ -21,6 +21,10 @@
  * memory efficiency — at n = 10 we hold 10! = 3,628,800 of them.
  */
 
+import { permutahedronCompressionOrder } from "./permutahedron-compression";
+
+export { permutahedronCompressionFactor } from "./permutahedron-compression";
+
 export type Perm = Uint8Array<ArrayBuffer>;
 
 /** Rows of the sliding-puzzle grid; the n parameter is the number of columns. */
@@ -82,8 +86,10 @@ export type GraphPreset =
   | "pancake-williams"
   | "star"
   | "permutohedron"
+  | "permutahedron-compressed"
   | "cyclic-adjacent"
   | "transposition"
+  | "asymmetric-tree"
   | "kaleidoscope"
   | "lexicographic"
   | "hypercube"
@@ -95,8 +101,10 @@ export type GraphKind =
   | "pancake"
   | "star"
   | "permutohedron"
+  | "permutahedron-compressed"
   | "cyclic-adjacent"
   | "transposition"
+  | "asymmetric-tree"
   | "kaleidoscope"
   | "lexicographic"
   | "hypercube"
@@ -374,8 +382,10 @@ export function supportsQuotient(preset: GraphPreset): boolean {
     preset === "pancake-williams" ||
     preset === "star" ||
     preset === "permutohedron" ||
+    preset === "permutahedron-compressed" ||
     preset === "cyclic-adjacent" ||
     preset === "transposition" ||
+    preset === "asymmetric-tree" ||
     preset === "kaleidoscope" ||
     preset === "lexicographic" ||
     preset === "cayley-complete"
@@ -625,6 +635,12 @@ export async function buildPancakeGraph(
           (done, total) => onProgress?.("cycle", done, total),
           signal
         )
+      : preset === "permutahedron-compressed"
+      ? await permutahedronCompressionOrder(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
       : order === undefined
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
@@ -752,6 +768,220 @@ export async function buildPancakeGraph(
   };
 }
 
+/* ----------------------- zaks rotational symmetry ----------------------- */
+
+/**
+ * One representative edge of the Zaks pancake layout's fundamental angular
+ * sector (block 0), produced directly from the recursive / rotational
+ * structure instead of scanning the full O(n!) edge set.
+ */
+export interface ZaksFundamentalEdge {
+  /** Block-0 endpoint, 0 ≤ i < (n-1)! — the orbit's canonical representative. */
+  i: number;
+  /** Partner endpoint along the full circle, 0 ≤ j < n!. */
+  j: number;
+  /** Generator id = suffix-reversal length. */
+  gen: number;
+  /** Antipodal "diameter" chord (orbit size n/2) vs a generic orbit (size n). */
+  half: boolean;
+  /** Parity difference (0 = same parity, 1 = opposite) of the two endpoints. */
+  parityXor: 0 | 1;
+}
+
+function pancakeGeneratorIds(n: number): number[] {
+  // Mirrors graphGenerators("pancake-*"): only rₙ is materialized past n = 6.
+  const first = n > 6 ? n : 2;
+  const ids: number[] = [];
+  for (let k = first; k <= n; k++) ids.push(k);
+  return ids;
+}
+
+function permParity(p: Perm): 0 | 1 {
+  let par = 0;
+  const len = p.length;
+  for (let a = 0; a < len; a++) {
+    const va = p[a];
+    for (let b = a + 1; b < len; b++) if (va > p[b]) par ^= 1;
+  }
+  return par as 0 | 1;
+}
+
+/**
+ * The first block of the Zaks ordering: the (n-1)! permutations reachable from
+ * the identity without ever using the full reversal rₙ (so all share the
+ * leading symbol 1). This is the greedy smallest-flip walk restricted to
+ * reversals of length < n, which is exactly the first (n-1)! entries of the
+ * full pancake-zaks path — O((n-1)!) time and memory, never the full n!.
+ */
+export function zaksBlock0(n: number): Perm[] {
+  const B = factorial(n - 1);
+  const start = new Uint8Array(n);
+  for (let i = 0; i < n; i++) start[i] = i + 1;
+  const block: Perm[] = [start];
+  const seen = new Set<string>([key(start)]);
+  let p = start;
+  while (block.length < B) {
+    let next: Perm | null = null;
+    for (let k = 2; k <= n - 1; k++) {
+      const q = flip(p, k);
+      if (!seen.has(key(q))) {
+        next = q;
+        break;
+      }
+    }
+    if (!next) break; // block 0 exhausted
+    seen.add(key(next));
+    block.push(next);
+    p = next;
+  }
+  return block;
+}
+
+/**
+ * Enumerate the fundamental-domain edges of the pancake-zaks layout straight
+ * from the recursion, without building the full graph. The cyclic relabeling
+ * φ: s ↦ (s mod n)+1 realizes a 360/n rotation (index shift by B = (n-1)!), so
+ * every edge orbit has a single representative incident to block 0; we locate
+ * each rₙ partner via φ in O(1) using only a block-0 position map.
+ *
+ * Edges are yielded in the same order (block-0 index, then ascending generator
+ * id) as the full edge array, so consumers reproduce the scan-based output
+ * exactly. Total work is O((n-1)!) — an n-fold reduction over a full scan.
+ */
+export function forEachZaksFundamentalEdge(
+  n: number,
+  visit: (edge: ZaksFundamentalEdge) => void
+): void {
+  const B = factorial(n - 1);
+  const block0 = zaksBlock0(n);
+  const pos = new Map<string, number>();
+  for (let o = 0; o < block0.length; o++) pos.set(key(block0[o]), o);
+  const par0 = block0.map(permParity);
+  const ids = pancakeGeneratorIds(n);
+  const even = n % 2 === 0;
+
+  // φ⁻¹ on symbol values: s ↦ ((s-2) mod n)+1.
+  const phiInvOnce = (q: Perm): Perm => {
+    const r = new Uint8Array(q.length);
+    for (let t = 0; t < q.length; t++) r[t] = ((q[t] - 2 + n) % n) + 1;
+    return r;
+  };
+
+  for (let i = 0; i < B; i++) {
+    const p = block0[i];
+    for (const k of ids) {
+      let j: number;
+      let pj: 0 | 1;
+      if (k < n) {
+        // Short reversal: stays inside block 0, so its index is its offset.
+        const o = pos.get(key(flip(p, k)))!;
+        j = o;
+        pj = par0[o];
+      } else {
+        // Full reversal rₙ: crosses into block b, whose leading symbol is
+        // φᵇ(1) = 1+b, hence b = q[0]-1. Undo b rotations to land back in
+        // block 0 and read the offset there.
+        const q = flip(p, n);
+        const b = q[0] - 1;
+        let back = q;
+        for (let t = 0; t < b; t++) back = phiInvOnce(back);
+        const o = pos.get(key(back))!;
+        j = b * B + o;
+        pj = permParity(q);
+      }
+      if (!(i < j)) continue;
+      const parityXor = (par0[i] ^ pj) as 0 | 1;
+      if (j < B) {
+        visit({ i, j, gen: k, half: false, parityXor });
+      } else {
+        const v = j % B;
+        if (i < v) visit({ i, j, gen: k, half: false, parityXor });
+        else if (i === v && even) visit({ i, j, gen: k, half: true, parityXor });
+      }
+    }
+  }
+}
+
+/**
+ * A lightweight pancake-zaks payload for the rotational symmetry renderer. It
+ * carries only what the UI panels and the SVG need — analytic counts and
+ * per-generator metadata derived from the fundamental sector — and omits the
+ * O(n!) path/edge arrays entirely. Time and memory are O((n-1)!).
+ *
+ * `path`/`edges`/`vertexParity` are intentionally empty: the symmetry SVG is
+ * generated from the recursion (see toZaksSymmetrySVG), and consumers that need
+ * the full arrays (canvas/density/flat-SVG/PNG) trigger a full rebuild.
+ */
+export function buildZaksSymmetryGraph(n: number): PancakeGraph {
+  const preset: GraphPreset = "pancake-zaks";
+  const total = factorial(n);
+  const generators = graphGenerators(n, preset);
+  const generatorInfos = computeGeneratorInfos(n, preset, generators);
+  const degreesPerStep = 360 / total;
+  const binsById = new Map<number, Float64Array>();
+  const arcStepSum = new Map<number, number>();
+  const arcCount = new Map<number, number>();
+  let evenEdgeCount = 0;
+  let oddEdgeCount = 0;
+
+  forEachZaksFundamentalEdge(n, (e) => {
+    // Each representative stands for its whole rotation orbit (n, or n/2 for
+    // antipodal "diameter" chords), so we weight every tally by the orbit size.
+    const orbit = e.half ? n / 2 : n;
+    if (e.parityXor === 0) evenEdgeCount += orbit;
+    else oddEdgeCount += orbit;
+    const raw = e.j - e.i;
+    const arcSteps = Math.min(raw, total - raw);
+    const degrees = arcSteps * degreesPerStep;
+    const binIndex = Math.min(
+      EDGE_DISTANCE_BIN_COUNT - 1,
+      Math.floor(degrees / EDGE_DISTANCE_BIN_DEGREES)
+    );
+    let bins = binsById.get(e.gen);
+    if (!bins) {
+      bins = new Float64Array(EDGE_DISTANCE_BIN_COUNT);
+      binsById.set(e.gen, bins);
+    }
+    bins[binIndex] += orbit;
+    arcStepSum.set(e.gen, (arcStepSum.get(e.gen) ?? 0) + arcSteps * orbit);
+    arcCount.set(e.gen, (arcCount.get(e.gen) ?? 0) + orbit);
+  });
+
+  for (const info of generatorInfos) {
+    const count = arcCount.get(info.id) ?? 0;
+    if (count > 0) {
+      info.avgArcDegrees = (arcStepSum.get(info.id)! / count) * degreesPerStep;
+      const bins = binsById.get(info.id);
+      if (bins) {
+        info.distanceBins = Array.from(bins, (binCount, index) => ({
+          minDegrees: index * EDGE_DISTANCE_BIN_DEGREES,
+          maxDegrees:
+            index === EDGE_DISTANCE_BIN_COUNT - 1
+              ? 180
+              : (index + 1) * EDGE_DISTANCE_BIN_DEGREES,
+          count: binCount,
+        })).filter((bin) => bin.count > 0);
+      }
+    }
+  }
+
+  const empty = new Uint32Array(0);
+  return {
+    n,
+    preset,
+    kind: "pancake",
+    order: "zaks",
+    path: [],
+    flips: [],
+    edges: empty,
+    rn: empty,
+    vertexParity: new Uint8Array(0),
+    evenEdgeCount,
+    oddEdgeCount,
+    generators: generatorInfos,
+  };
+}
+
 function computeGeneratorInfos(
   n: number,
   preset: GraphPreset,
@@ -830,7 +1060,7 @@ function generatorLabel(
   if (preset === "cyclic-adjacent") {
     return id === n ? `s${n}` : `s${id}`;
   }
-  if (preset === "transposition") {
+  if (preset === "transposition" || preset === "asymmetric-tree") {
     const i = Math.floor(id / 100);
     const j = id % 100;
     return `${i},${j}`;
@@ -902,10 +1132,14 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Star graph";
     case "permutohedron":
       return "Permutohedron graph";
+    case "permutahedron-compressed":
+      return "Permutahedron — Gregor–Merino–Mütze compression";
     case "cyclic-adjacent":
       return "Cyclic adjacent graph";
     case "transposition":
       return "Transposition graph";
+    case "asymmetric-tree":
+      return "Asymmetric tree Cayley graph";
     case "kaleidoscope":
       return "Kaleidoscope graph";
     case "lexicographic":
@@ -935,10 +1169,14 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Swap the first position with any other";
     case "permutohedron":
       return "Adjacent transpositions s_i = (i, i+1)";
+    case "permutahedron-compressed":
+      return "Adjacent transpositions, laid out along a maximally rotationally symmetric Hamilton cycle (Gregor–Merino–Mütze 2024)";
     case "cyclic-adjacent":
       return "Adjacent transpositions on a ring, including (n, 1)";
     case "transposition":
       return "All transpositions (i, j)";
+    case "asymmetric-tree":
+      return "Transpositions of a rigid (identity) tree — Aut = Sₙ (Feng's minimum)";
     case "kaleidoscope":
       return "Reverse any contiguous block";
     case "lexicographic":
@@ -1026,8 +1264,10 @@ function graphKind(preset: GraphPreset): GraphKind {
   if (
     preset === "star" ||
     preset === "permutohedron" ||
+    preset === "permutahedron-compressed" ||
     preset === "cyclic-adjacent" ||
     preset === "transposition" ||
+    preset === "asymmetric-tree" ||
     preset === "kaleidoscope" ||
     preset === "lexicographic" ||
     preset === "hypercube" ||
@@ -1039,6 +1279,25 @@ function graphKind(preset: GraphPreset): GraphKind {
     return preset;
   }
   return "pancake";
+}
+
+/**
+ * Edges of the asymmetric transposition tree on positions 1..n, as ordered
+ * pairs [a, b] with a < b. A path 1–2–…–(n-1) plus a leaf n hung off vertex 3
+ * (a 3-leg spider). For n ≥ 7 the three legs have distinct lengths, so the
+ * tree is rigid (Aut = 1); for n ≤ 4 it degenerates to the plain path
+ * 1–2–…–n. The result always spans all n positions, so the transpositions
+ * generate Sₙ and the Cayley graph is connected.
+ */
+function asymmetricTreeEdges(n: number): Array<[number, number]> {
+  const edges: Array<[number, number]> = [];
+  if (n <= 4) {
+    for (let i = 1; i <= n - 1; i++) edges.push([i, i + 1]);
+    return edges;
+  }
+  for (let i = 1; i <= n - 2; i++) edges.push([i, i + 1]);
+  edges.push([3, n]);
+  return edges;
 }
 
 function graphGenerators(n: number, preset: GraphPreset): Generator[] {
@@ -1069,7 +1328,11 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
     }
     return generators;
   }
-  if (preset === "permutohedron" || preset === "cyclic-adjacent") {
+  if (
+    preset === "permutohedron" ||
+    preset === "permutahedron-compressed" ||
+    preset === "cyclic-adjacent"
+  ) {
     const generators: Generator[] = [];
     for (let i = 0; i < n - 1; i++) {
       generators.push({ id: i + 1, apply: (p) => swap(p, i, i + 1) });
@@ -1090,6 +1353,21 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
       }
     }
     return generators;
+  }
+  if (preset === "asymmetric-tree") {
+    // A *transposition tree*: a spanning tree on the n positions whose edges
+    // are the generating transpositions. By Feng's theorem the automorphism
+    // group of the Cayley graph is R(Sₙ) ⋊ Aut(tree); a rigid (identity) tree
+    // gives the minimum group Sₙ. We use a 3-leg "spider": the path
+    // 1–2–…–(n-1) with a leaf n attached to vertex 3, so the legs have lengths
+    // {2, 1, n-4}. Distinct leg lengths ⇒ trivial automorphism group, which
+    // holds for every n ≥ 7 (n = 7 reproduces legs {1,2,3}, the smallest
+    // asymmetric tree). For n ≤ 6 no asymmetric tree exists; the same
+    // construction still yields a valid spanning tree of transpositions.
+    return asymmetricTreeEdges(n).map(([a, b]) => ({
+      id: a * 100 + b,
+      apply: (p) => swap(p, a - 1, b - 1),
+    }));
   }
   if (preset === "kaleidoscope") {
     const generators: Generator[] = [];
