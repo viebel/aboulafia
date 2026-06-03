@@ -64,7 +64,7 @@ import {
   readNonNegIntParam,
   writeUrlParams,
 } from "@/lib/url-state";
-import { AlertTriangle, Download, Loader2, Minus, Plus, RotateCcw } from "lucide-react";
+import { AlertTriangle, Download, Loader2, Minus, Pause, Play, Plus, RotateCcw } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import {
   useCallback,
@@ -340,6 +340,10 @@ export function PancakeGraphView() {
   const [domainClickTarget, setDomainClickTarget] = useState<
     "piece" | "axis" | "both"
   >("piece");
+  // Vertex-orbit animation: when playing, the chosen vertex advances around the
+  // ring in an infinite loop at `orbitSpeed` vertices per second.
+  const [orbitPlaying, setOrbitPlaying] = useState(false);
+  const [orbitSpeed, setOrbitSpeed] = useState(3);
 
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -1122,6 +1126,46 @@ export function PancakeGraphView() {
   const domainPieceCount = n;
   const vertexCount = factorial(n);
 
+  // Stop the animation if the vertex-orbit overlay is turned off, so the
+  // play/pause state never lingers while the controls are hidden.
+  useEffect(() => {
+    if (!settings.showVertexOrbit && orbitPlaying) setOrbitPlaying(false);
+  }, [settings.showVertexOrbit, orbitPlaying]);
+
+  // Vertex-orbit animation loop: advance the chosen vertex one step at a time
+  // around the ring, wrapping forever. Driven by requestAnimationFrame with a
+  // time accumulator so the cadence tracks `orbitSpeed` (vertices/second)
+  // regardless of frame rate, and speed changes apply immediately.
+  const orbitSpeedRef = useRef(orbitSpeed);
+  orbitSpeedRef.current = orbitSpeed;
+  useEffect(() => {
+    if (!orbitPlaying || !settings.showVertexOrbit) return;
+    let raf = 0;
+    let last = performance.now();
+    let acc = 0;
+    const tick = (now: number) => {
+      acc += (now - last) / 1000;
+      last = now;
+      const step = 1 / Math.max(0.1, orbitSpeedRef.current);
+      if (acc >= step) {
+        const advance = Math.floor(acc / step);
+        acc -= advance * step;
+        setSettings((s) => ({
+          ...s,
+          vertexOrbitIndex:
+            ((((s.vertexOrbitIndex ?? 0) + advance) % vertexCount) +
+              vertexCount) %
+            vertexCount,
+          orbitEdgeA: -1,
+          orbitEdgeB: -1,
+        }));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [orbitPlaying, settings.showVertexOrbit, vertexCount]);
+
   // Geometry of a pointer event relative to the drawing: the drawing is
   // centered in the stage (offset by the pan), and zoom scales about that
   // center, so the angle/radius around it are computed directly. The drawing
@@ -1653,6 +1697,44 @@ export function PancakeGraphView() {
                         }))
                       }
                     />
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <Button
+                          variant={orbitPlaying ? "default" : "outline"}
+                          size="sm"
+                          className="h-7 gap-1.5 px-2 text-[11px]"
+                          onClick={() => setOrbitPlaying((p) => !p)}
+                          aria-label={
+                            orbitPlaying ? "Pause animation" : "Play animation"
+                          }
+                          aria-pressed={orbitPlaying}
+                        >
+                          {orbitPlaying ? (
+                            <Pause className="h-3.5 w-3.5" />
+                          ) : (
+                            <Play className="h-3.5 w-3.5" />
+                          )}
+                          {orbitPlaying ? "Pause" : "Animate"}
+                        </Button>
+                        <span className="font-mono text-[11px] text-muted-foreground">
+                          {orbitSpeed} v/s
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-muted-foreground">
+                          Speed
+                        </span>
+                        <Slider
+                          value={[orbitSpeed]}
+                          min={1}
+                          max={30}
+                          step={1}
+                          onValueChange={([v]) => setOrbitSpeed(v)}
+                          aria-label="Animation speed"
+                          className="flex-1"
+                        />
+                      </div>
+                    </div>
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[11px] text-muted-foreground">
                         Show
