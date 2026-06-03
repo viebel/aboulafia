@@ -14,6 +14,7 @@
 import {
   factorial,
   forEachZaksFundamentalEdge,
+  zaksBlock0,
   type PancakeGraph,
   type QuotientGraph,
 } from "./pancake";
@@ -38,12 +39,18 @@ export type EdgeRenderMode = "line" | "density";
  *                 draws one representative per orbit and rotates it n times, so
  *                 giving each representative its own hue makes every color class
  *                 a clean rotated n-set — the decisive Cₙ test.
+ *   - "dihedral" → one hue per full Dₙ orbit: like "orbit" but also merging each
+ *                 Cₙ orbit with its mirror under ω: i ↦ (n!−1)−i, so a chord and
+ *                 its reflection share a color (the reflection test).
  *   - "blocks"  → band the n! dots into n arcs of (n-1)! by leading symbol (one
  *                 ρ-block / Pₙ₋₁ copy each) and split the chords into the two
  *                 superimposed families: short within-block reversals (r₂…rₙ₋₁)
  *                 and long between-block full reversals (rₙ).
  */
-export type SymmetryColoring = "parity" | "orbit" | "blocks";
+export type SymmetryColoring = "parity" | "orbit" | "dihedral" | "blocks";
+
+/** Which images to show in the vertex-orbit overlay. */
+export type OrbitParts = "both" | "rotations" | "reflections";
 
 export interface RenderSettings {
   alpha: number;
@@ -82,6 +89,25 @@ export interface RenderSettings {
   domainPiece?: number;
   /** Index of the highlighted reflection axis (0…n−1). */
   domainAxis?: number;
+  /**
+   * Highlight the orbit of a single chosen vertex: the n rotation images
+   * {i+kB} in one color and the reflection images {ω(i)+kB} in another, so the
+   * group's action on one point (its full Dₙ orbit) is visible.
+   */
+  showVertexOrbit?: boolean;
+  /** Index of the chosen vertex (0…n!−1). */
+  vertexOrbitIndex?: number;
+  /** Which images of the seed edge(s) to draw (defaults to "both"). */
+  vertexOrbitParts?: OrbitParts;
+  /** Restrict the vertex-orbit overlay to the long full-reversal rₙ edges. */
+  vertexOrbitLongOnly?: boolean;
+  /**
+   * A single chosen edge {orbitEdgeA, orbitEdgeB} to seed the orbit from
+   * (clicking a chord). When set (both ≥ 0) it overrides the vertex's incident
+   * edges, so only this edge's orbit is shown.
+   */
+  orbitEdgeA?: number;
+  orbitEdgeB?: number;
 }
 
 export interface Palette {
@@ -109,6 +135,8 @@ export interface Palette {
   dihedralWedge: string;
   /** Cₙ rotation indicator (the arc arrow + label). */
   dihedralRotation: string;
+  /** ω mirror axis in the vertex-orbit overlay (a neutral guide line). */
+  dihedralMirror: string;
   /** Short within-block reversals (r₂…rₙ₋₁) in the "blocks" color scheme. */
   blockWithinStroke: string;
   /** Long between-block full reversals (rₙ) in the "blocks" color scheme. */
@@ -134,6 +162,7 @@ export const DEFAULT_PALETTE: Palette = {
   dihedralSector: "#94a3b8", // slate-400
   dihedralWedge: "#7c3aed", // violet-600 (low alpha when filled)
   dihedralRotation: "#059669", // emerald-600
+  dihedralMirror: "#475569", // slate-600 (reflection axis guide)
   blockWithinStroke: "#0ea5e9", // sky-500 — short, local chords
   blockBetweenStroke: "#111827", // gray-900 — long rₙ skeleton
 };
@@ -232,6 +261,7 @@ function orbitColor(q: number): string {
   const hue = (q * 137.508) % 360;
   return hsl(hue, 70, 48);
 }
+
 
 /** Color of the k-th reflection axis (of n), chosen so adjacent axes always
  *  differ without a full rainbow. Two colors alternate (matching the two
@@ -393,11 +423,32 @@ function canonicalOrbitCode(
   return best;
 }
 
-// Canonical-orbit-code → orbit index q, in the SAME order the Symmetry renderer
-// assigns hues (forEachZaksFundamentalEdge enumeration). Sharing this map makes
-// the flat Canvas/SVG orbit coloring, the Symmetry view, and the orbit table
-// all agree on a hue per orbit. Cached per n (independent of any graph build).
+/**
+ * Canonical id of a chord's full dihedral (Dₙ) orbit: the smaller of its own
+ * Cₙ canonical code and that of its reflection ω: i ↦ (n!−1)−i. Two chords
+ * share a Dₙ orbit iff one maps to the other under a rotation and/or ω, so this
+ * merges each Cₙ orbit with its mirror image.
+ */
+function canonicalDihedralCode(
+  i: number,
+  j: number,
+  n: number,
+  total: number,
+  B: number
+): number {
+  const direct = canonicalOrbitCode(i, j, n, total, B);
+  const mirror = canonicalOrbitCode(total - 1 - i, total - 1 - j, n, total, B);
+  return direct < mirror ? direct : mirror;
+}
+
+// Cₙ-canonical-code → orbit index, in the SAME order the Symmetry renderer
+// enumerates fundamental edges. Sharing these maps makes the flat Canvas/SVG
+// coloring, the Symmetry view, and the orbit table all agree on a hue per
+// orbit. Two variants: "orbit" gives one index per Cₙ orbit; "dihedral" merges
+// ω-related Cₙ orbits so a reflection pair shares a color. Cached per n.
 const orbitQMapCache = new Map<number, Map<number, number>>();
+const dihedralQMapCache = new Map<number, Map<number, number>>();
+
 function orbitQMapFor(n: number): Map<number, number> {
   const cached = orbitQMapCache.get(n);
   if (cached) return cached;
@@ -413,38 +464,79 @@ function orbitQMapFor(n: number): Map<number, number> {
   return map;
 }
 
-// One color per edge (Cₙ-orbit hue), cached on the graph's edge array — a fresh
-// build allocates a new Uint32Array, so identity is a safe, GC-friendly key.
-// Recomputing on every zoom/pan would be wasteful (it is O(n · edges)).
-const orbitColorCache = new WeakMap<Uint32Array, string[]>();
+function dihedralQMapFor(n: number): Map<number, number> {
+  const cached = dihedralQMapCache.get(n);
+  if (cached) return cached;
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const map = new Map<number, number>(); // Cₙ code → Dₙ orbit index
+  const dCodeToIndex = new Map<number, number>();
+  let next = 0;
+  forEachZaksFundamentalEdge(n, (e) => {
+    const cn = canonicalOrbitCode(e.i, e.j, n, total, B);
+    const dCode = canonicalDihedralCode(e.i, e.j, n, total, B);
+    let idx = dCodeToIndex.get(dCode);
+    if (idx === undefined) {
+      idx = next++;
+      dCodeToIndex.set(dCode, idx);
+    }
+    map.set(cn, idx);
+  });
+  dihedralQMapCache.set(n, map);
+  return map;
+}
+
+/** The Cₙ-code → hue-index map for the chosen orbit coloring. */
+function orbitIndexMap(n: number, coloring: SymmetryColoring): Map<number, number> {
+  return coloring === "dihedral" ? dihedralQMapFor(n) : orbitQMapFor(n);
+}
+
+// One color per edge (orbit hue), cached on the graph's edge array (a fresh
+// build allocates a new Uint32Array, so identity is a safe, GC-friendly key)
+// keyed also by the orbit coloring. Recomputing on every zoom/pan would be
+// wasteful (it is O(n · edges)).
+const orbitColorCache = new WeakMap<
+  Uint32Array,
+  Partial<Record<SymmetryColoring, string[]>>
+>();
 
 /**
- * Assign every (flat) edge the hue of its Cₙ rotation orbit, so all n members
- * get one color — the same "clean rotated n-set" the Symmetry renderer shows,
- * but for the full disk. For pancake-zaks the hue index comes from the shared
- * fundamental-edge map (so flat/symmetry/table colors match); other symmetric
- * layouts (e.g. the recursive Zaks order, whose index ring differs) fall back
- * to a first-seen ordering.
+ * Assign every (flat) edge the hue of its rotation orbit ("orbit") or full
+ * dihedral orbit ("dihedral", which merges each Cₙ orbit with its ω mirror), so
+ * the members of an orbit share one color across the whole disk. For
+ * pancake-zaks the hue index comes from the shared fundamental-edge map (so
+ * flat/symmetry/table colors match); other symmetric layouts (e.g. the
+ * recursive Zaks order, whose index ring differs) fall back to first-seen.
  */
-function orbitColorsForGraph(graph: PancakeGraph): string[] {
-  const cached = orbitColorCache.get(graph.edges);
+function orbitColorsForGraph(
+  graph: PancakeGraph,
+  coloring: SymmetryColoring
+): string[] {
+  const bucket = orbitColorCache.get(graph.edges);
+  const cached = bucket?.[coloring];
   if (cached) return cached;
   const { n, edges, preset } = graph;
   const total = graph.path.length;
   const B = total / n;
   const numEdges = edges.length / 3;
   const colors = new Array<string>(numEdges);
+  const canon = (i: number, j: number) =>
+    coloring === "dihedral"
+      ? canonicalDihedralCode(i, j, n, total, B)
+      : canonicalOrbitCode(i, j, n, total, B);
   if (preset === "pancake-zaks") {
-    const qmap = orbitQMapFor(n);
+    const qmap = orbitIndexMap(n, coloring);
     for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
-      const code = canonicalOrbitCode(edges[t], edges[t + 1], n, total, B);
-      colors[e] = orbitColor(qmap.get(code) ?? 0);
+      // Map keys are Cₙ codes; for dihedral the code resolves through the
+      // mirror-merged index map below, so look up via the Cₙ code.
+      const cn = canonicalOrbitCode(edges[t], edges[t + 1], n, total, B);
+      colors[e] = orbitColor(qmap.get(cn) ?? 0);
     }
   } else {
     const keyToOrbit = new Map<number, number>();
     let nextOrbit = 0;
     for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
-      const code = canonicalOrbitCode(edges[t], edges[t + 1], n, total, B);
+      const code = canon(edges[t], edges[t + 1]);
       let orbit = keyToOrbit.get(code);
       if (orbit === undefined) {
         orbit = nextOrbit++;
@@ -453,7 +545,7 @@ function orbitColorsForGraph(graph: PancakeGraph): string[] {
       colors[e] = orbitColor(orbit);
     }
   }
-  orbitColorCache.set(graph.edges, colors);
+  orbitColorCache.set(graph.edges, { ...(bucket ?? {}), [coloring]: colors });
   return colors;
 }
 
@@ -522,18 +614,18 @@ function buildSectorMasks(
     return [ax, ay, bx, by];
   };
 
-  if (coloring === "orbit") {
-    // One hue per orbit: each fundamental representative is its own color, and
-    // the n (or n/2) rotated copies inherit it — so every color class is a
-    // clean rotated n-set.
+  if (coloring === "orbit" || coloring === "dihedral") {
+    // One hue per orbit. For "orbit" each fundamental representative is its own
+    // Cₙ class; for "dihedral" ω-related classes share a hue. The n (or n/2)
+    // rotated copies inherit the color, so every class is a clean rotated set.
+    const B = total / n;
+    const qmap = orbitIndexMap(n, coloring);
     const fullCoords: number[] = [];
     const fullColors: string[] = [];
     const halfCoords: number[] = [];
     const halfColors: string[] = [];
-    let q = 0;
     forEachZaksFundamentalEdge(n, (e) => {
-      const color = orbitColor(q);
-      q++;
+      const color = orbitColor(qmap.get(canonicalOrbitCode(e.i, e.j, n, total, B)) ?? 0);
       if (hidden && hidden.has(e.gen)) return;
       const [ax, ay, bx, by] = seg(e);
       if (e.half) {
@@ -1007,6 +1099,563 @@ function fundamentalDomainSVG(
   return parts.join("");
 }
 
+/** A chord incident to the chosen vertex: [v, neighbor, generatorId]. */
+type IncidentEdge = [number, number, number];
+
+/** The chords incident to vertex v, found by scanning the materialized edge
+ *  list; the third entry is the generator id (suffix-reversal length). */
+function incidentEdges(edges: Uint32Array, v: number): IncidentEdge[] {
+  const res: IncidentEdge[] = [];
+  for (let t = 0; t < edges.length; t += 3) {
+    const a = edges[t];
+    const b = edges[t + 1];
+    if (a === v) res.push([v, b, edges[t + 2]]);
+    else if (b === v) res.push([v, a, edges[t + 2]]);
+  }
+  return res;
+}
+
+/** The chords incident to vertex v for the pancake-zaks layout, derived from
+ *  the recursive fundamental sector (no materialized edge list needed). Each
+ *  edge orbit's rotations are {i+mB}; v is incident when its offset (v mod B)
+ *  matches an endpoint's, at the rotation that lands the endpoint in v's block. */
+function incidentEdgesZaks(n: number, v: number): IncidentEdge[] {
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const off = v % B;
+  const kv = Math.floor(v / B);
+  const res: IncidentEdge[] = [];
+  forEachZaksFundamentalEdge(n, (e) => {
+    if (e.i === off) res.push([v, (e.j + kv * B) % total, e.gen]);
+    const oj = e.j % B;
+    if (oj === off) {
+      const bj0 = Math.floor(e.j / B);
+      const m = (((kv - bj0) % n) + n) % n;
+      res.push([v, (e.i + m * B) % total, e.gen]);
+    }
+  });
+  return res;
+}
+
+/** Permutation as letters (symbol v → 'a'+v−1), so every symbol is one
+ *  character even for n ≥ 10. */
+function permLetters(p: ArrayLike<number>): string {
+  let s = "";
+  for (let i = 0; i < p.length; i++) s += String.fromCharCode(96 + p[i]);
+  return s;
+}
+
+/** Word (as letters) at a Zaks index, reconstructed from block 0 via the cyclic
+ *  relabeling φ — for renderers without a materialized path. */
+function makeZaksWordOf(n: number): (idx: number) => string {
+  const B = factorial(n - 1);
+  const block0 = zaksBlock0(n);
+  return (idx) => {
+    const b = Math.floor(idx / B);
+    const o = idx % B;
+    const p = new Uint8Array(block0[o]);
+    for (let t = 0; t < b; t++) {
+      for (let s = 0; s < p.length; s++) p[s] = (p[s] % n) + 1;
+    }
+    return permLetters(p);
+  };
+}
+
+// Above this many at-play vertices the index+word labels would overlap into
+// noise, so they are suppressed (use "long edges only" to thin them out).
+const VERTEX_ORBIT_LABEL_LIMIT = 80;
+// Flip (rₖ) tags are only drawn when there are at most this many orbit edges,
+// so they stay legible (mainly the "long edges only" view).
+const VERTEX_ORBIT_TAG_LIMIT = 16;
+
+// Highlight color for the "dramatic" cases (near-zero chord / self-mirror).
+const ORBIT_NOTE_COLOR = "#d97706"; // amber-600
+
+/** True when a chord's two endpoints are (near) circular neighbours, so it
+ *  draws as an almost-invisible sliver — e.g. a full reversal that lands next
+ *  to its source in Zaks order (a ρ-block boundary). */
+function orbitChordTiny(a: number, b: number, total: number): boolean {
+  const d = Math.abs(a - b);
+  return Math.min(d, total - d) <= 2;
+}
+
+/** True when the reflection images of the seed edges all coincide with their
+ *  rotation images — the orbit is its own mirror, so "Both" looks like
+ *  "Rotations". Only meaningful when both layers are shown. */
+function orbitSelfMirror(
+  seed: IncidentEdge[],
+  n: number,
+  total: number,
+  showRot: boolean,
+  showRef: boolean
+): boolean {
+  if (!showRot || !showRef) return false;
+  const B = total / n;
+  const ek = (a: number, b: number) => (a < b ? a * total + b : b * total + a);
+  const rot = new Set<number>();
+  for (const [a, b] of seed) {
+    for (let m = 0; m < n; m++) rot.add(ek((a + m * B) % total, (b + m * B) % total));
+  }
+  return seed.every(([a, b]) => {
+    for (let m = 0; m < n; m++) {
+      if (!rot.has(ek((total - 1 - a + m * B) % total, (total - 1 - b + m * B) % total))) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+/**
+ * The suffix-reversal length k (2…n) that turns word `wa` into `wb`, or 0 if
+ * none. A pancake-graph edge is exactly such a suffix reversal, so a nonzero k
+ * proves the two endpoints are genuinely adjacent in the graph.
+ */
+function suffixFlipBetween(wa: string, wb: string, n: number): number {
+  if (wa.length !== wb.length) return 0;
+  for (let k = 2; k <= n; k++) {
+    const cut = wa.length - k;
+    const rev = wa.slice(cut).split("").reverse().join("");
+    if (wa.slice(0, cut) + rev === wb) return k;
+  }
+  return 0;
+}
+
+/** Incident chords of the chosen vertex (from the edge list if present, else
+ *  analytically for the Zaks layout), optionally restricted to the long full
+ *  reversal rₙ. */
+function vertexSeedEdges(
+  n: number,
+  total: number,
+  v: number,
+  edges: Uint32Array | undefined,
+  longOnly: boolean
+): IncidentEdge[] {
+  const all = edges && edges.length > 0 ? incidentEdges(edges, v) : incidentEdgesZaks(n, v);
+  return longOnly ? all.filter((e) => e[2] === n) : all;
+}
+
+/**
+ * Highlight the orbit of the chosen vertex's edges on the canvas: the chords
+ * incident to it (emerald), all their rotation images {i+mB} (violet), and all
+ * their reflection images {ω(i)+mB} (orange) — the full Dₙ orbit of that
+ * vertex's star. The chosen vertex is ringed.
+ */
+function drawVertexOrbitToCanvas(
+  ctx: CanvasRenderingContext2D,
+  geom: DihedralOverlayGeom,
+  settings: RenderSettings,
+  palette: Palette,
+  edges?: Uint32Array,
+  wordOf?: (idx: number) => string
+): void {
+  const { n, total, c, cy, r, scale } = geom;
+  const B = total / n;
+  const ea = settings.orbitEdgeA ?? -1;
+  const eb = settings.orbitEdgeB ?? -1;
+  const edgeMode = ea >= 0 && eb >= 0 && ea < total && eb < total;
+  const v = (((settings.vertexOrbitIndex ?? 0) % total) + total) % total;
+  const seed: IncidentEdge[] = edgeMode
+    ? [[ea, eb, 0]]
+    : vertexSeedEdges(n, total, v, edges, settings.vertexOrbitLongOnly ?? false);
+  const markers = edgeMode ? [ea, eb] : [v];
+  const lw = Math.max(2, 2.6 * scale);
+  const parts = settings.vertexOrbitParts ?? "both";
+  const showRot = parts !== "reflections";
+  const showRef = parts !== "rotations";
+  const tinyEdge = seed.some(([a, b]) => orbitChordTiny(a, b, total));
+  const selfMirror = orbitSelfMirror(seed, n, total, showRot, showRef);
+
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.lineCap = "round";
+  const drawSeg = (a: number, b: number, color: string, width: number) => {
+    const [ax, ay] = pointXY(a, total, c, cy, r);
+    const [bx, by] = pointXY(b, total, c, cy, r);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+  };
+  // [a, b, step] — step is the rotation count m (ρᵐ) within the edge's family.
+  // One hue for the whole orbit: rotation solid, its mirror a lighter dash.
+  const drawn: Array<[number, number, number]> = [];
+  const rotColor = palette.dihedralAxis;
+  const mirrorColor = lightenHex(palette.dihedralAxis, 0.5);
+  if (showRef) {
+    // Reflection family s·rᵐx = ω(rᵐx): step m is the mirror of rotation step m.
+    for (const [a, b] of seed) {
+      for (let m = 0; m < n; m++) {
+        const ra = ((total - 1 - a - m * B) % total + total) % total;
+        const rb = ((total - 1 - b - m * B) % total + total) % total;
+        drawSeg(ra, rb, withAlpha(mirrorColor, 0.95), lw);
+        drawn.push([ra, rb, m]);
+      }
+    }
+  }
+  if (showRot) {
+    for (const [a, b] of seed) {
+      for (let m = 0; m < n; m++) {
+        const ra = (a + m * B) % total;
+        const rb = (b + m * B) % total;
+        drawSeg(ra, rb, withAlpha(rotColor, 0.92), lw);
+        drawn.push([ra, rb, m]);
+      }
+    }
+  }
+
+  // Mark the seed endpoint(s) — the chosen vertex, or both ends of a chosen
+  // edge. A near-invisible (tiny) seed chord is flagged amber.
+  const dotR = Math.max(4, 6 * scale) * (tinyEdge ? 1.4 : 1);
+  const markerColor = tinyEdge ? ORBIT_NOTE_COLOR : palette.dihedralAxis;
+  for (const mk of markers) {
+    const [mx, my] = pointXY(mk, total, c, cy, r);
+    ctx.beginPath();
+    ctx.arc(mx, my, dotR, 0, 2 * Math.PI);
+    ctx.fillStyle = withAlpha(markerColor, 0.98);
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, 2 * scale);
+    ctx.strokeStyle = withAlpha(palette.background, 0.95);
+    ctx.stroke();
+  }
+
+  // ω reflection axis (i ↦ N-1-i): the mirror that maps the violet family onto
+  // the orange one. Only meaningful when reflections are shown.
+  if (showRef) {
+    const off = dihedralOffset(total);
+    const ext = r * 1.04;
+    ctx.lineCap = "round";
+    ctx.lineWidth = Math.max(1.5, 2 * scale);
+    ctx.strokeStyle = withAlpha(palette.dihedralMirror, 0.9);
+    ctx.setLineDash([8 * scale, 6 * scale]);
+    ctx.beginPath();
+    ctx.moveTo(c + ext * Math.cos(off), cy + ext * Math.sin(off));
+    ctx.lineTo(c + ext * Math.cos(off + Math.PI), cy + ext * Math.sin(off + Math.PI));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const lfs = Math.max(12, 14 * scale);
+    ctx.font = `600 ${lfs}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const lx = c + r * 1.13 * Math.cos(off);
+    const ly = cy + r * 1.13 * Math.sin(off);
+    ctx.lineWidth = Math.max(2, 3 * scale);
+    ctx.strokeStyle = withAlpha(palette.background, 0.95);
+    ctx.strokeText("ω", lx, ly);
+    ctx.fillStyle = withAlpha(palette.dihedralMirror, 0.95);
+    ctx.fillText("ω", lx, ly);
+  }
+
+  // Flip tag rₖ on each orbit edge (few-edges views only): proves the two
+  // endpoints are one suffix reversal apart, i.e. a genuine graph edge.
+  if (wordOf && drawn.length > 0 && drawn.length <= VERTEX_ORBIT_TAG_LIMIT) {
+    const tfs = Math.max(9, 11 * scale);
+    ctx.font = `${tfs}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    for (const [a, b, m] of drawn) {
+      const k = suffixFlipBetween(wordOf(a), wordOf(b), n);
+      const [ax, ay] = pointXY(a, total, c, cy, r);
+      const [bx, by] = pointXY(b, total, c, cy, r);
+      const tx = ax + 0.28 * (bx - ax);
+      const ty = ay + 0.28 * (by - ay);
+      const tag = k ? `${m + 1}` : "✗";
+      ctx.lineWidth = Math.max(2, 3 * scale);
+      ctx.strokeStyle = withAlpha(palette.background, 0.95);
+      ctx.strokeText(tag, tx, ty);
+      ctx.fillStyle = k ? palette.labelFill : palette.cayleyOddStroke;
+      ctx.fillText(tag, tx, ty);
+    }
+  }
+
+  // Label every vertex at play: index (plain) with the word in a badge below.
+  if (wordOf) {
+    const labelSet = new Set<number>(markers);
+    for (const [a, b] of drawn) {
+      labelSet.add(a);
+      labelSet.add(b);
+    }
+    const labels = [...labelSet];
+    if (labels.length <= VERTEX_ORBIT_LABEL_LIMIT) {
+      const fs = Math.max(9, 11 * scale);
+      const wfs = Math.max(8.5, 10 * scale);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineJoin = "round";
+      const off = Math.max(26, 32 * scale);
+      for (const idx of labels) {
+        const a = (2 * Math.PI * idx) / total;
+        const ix = c + (r + off) * Math.cos(a);
+        const iy = cy + (r + off) * Math.sin(a);
+        ctx.font = `600 ${fs}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.lineWidth = Math.max(2, 3 * scale);
+        ctx.strokeStyle = withAlpha(palette.background, 0.9);
+        ctx.strokeText(String(idx), ix, iy);
+        ctx.fillStyle = palette.labelFill;
+        ctx.fillText(String(idx), ix, iy);
+
+        // index mod (n-1)! (0 or (n-1)!-1 marks a ρ-block boundary / big flip).
+        const res = idx % B;
+        const boundary = res === 0 || res === B - 1;
+        const my = iy + fs * 0.95;
+        ctx.font = `${wfs}px ui-monospace, Menlo, monospace`;
+        const modTxt = `≡${res}`;
+        ctx.lineWidth = Math.max(2, 3 * scale);
+        ctx.strokeStyle = withAlpha(palette.background, 0.9);
+        ctx.strokeText(modTxt, ix, my);
+        ctx.fillStyle = boundary ? ORBIT_NOTE_COLOR : withAlpha(palette.labelFill, 0.55);
+        ctx.fillText(modTxt, ix, my);
+
+        const word = wordOf(idx);
+        ctx.font = `${wfs}px ui-monospace, Menlo, monospace`;
+        const tw = ctx.measureText(word).width;
+        const padX = Math.max(2, 3 * scale);
+        const bw = tw + 2 * padX;
+        const bh = wfs + Math.max(3, 4 * scale);
+        const wyc = iy + fs * 2.05;
+        const bx = ix - bw / 2;
+        const byTop = wyc - bh / 2;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === "function") {
+          ctx.roundRect(bx, byTop, bw, bh, Math.max(2, 2.5 * scale));
+        } else {
+          ctx.rect(bx, byTop, bw, bh);
+        }
+        ctx.fillStyle = withAlpha(palette.dihedralAxis, 0.14);
+        ctx.fill();
+        ctx.lineWidth = Math.max(0.75, scale);
+        ctx.strokeStyle = withAlpha(palette.dihedralAxis, 0.55);
+        ctx.stroke();
+        ctx.fillStyle = palette.labelFill;
+        ctx.fillText(word, ix, wyc);
+      }
+    }
+  }
+
+  // Notes for the "dramatic" cases, near the top of the disk.
+  const notes: string[] = [];
+  if (tinyEdge) notes.push("full reversal lands on a neighbour — chord ≈ 0");
+  if (selfMirror) notes.push("reflection coincides with rotation (self-mirror orbit)");
+  if (notes.length > 0) {
+    const nfs = Math.max(11, 13 * scale);
+    ctx.font = `600 ${nfs}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    for (let i = 0; i < notes.length; i++) {
+      const ny = cy - r + Math.max(16, 20 * scale) + i * nfs * 1.4;
+      ctx.lineWidth = Math.max(3, 4 * scale);
+      ctx.strokeStyle = withAlpha(palette.background, 0.95);
+      ctx.strokeText(notes[i], c, ny);
+      ctx.fillStyle = ORBIT_NOTE_COLOR;
+      ctx.fillText(notes[i], c, ny);
+    }
+  }
+  ctx.restore();
+}
+
+/** SVG fragment for the vertex-orbit-edges overlay (mirrors the canvas one). */
+function vertexOrbitSVG(
+  geom: { n: number; total: number; c: number; r: number; scale: number },
+  settings: RenderSettings,
+  palette: Palette,
+  edges?: Uint32Array,
+  wordOf?: (idx: number) => string
+): string {
+  const { n, total, c, r, scale } = geom;
+  const B = total / n;
+  const ea = settings.orbitEdgeA ?? -1;
+  const eb = settings.orbitEdgeB ?? -1;
+  const edgeMode = ea >= 0 && eb >= 0 && ea < total && eb < total;
+  const v = (((settings.vertexOrbitIndex ?? 0) % total) + total) % total;
+  const seed: IncidentEdge[] = edgeMode
+    ? [[ea, eb, 0]]
+    : vertexSeedEdges(n, total, v, edges, settings.vertexOrbitLongOnly ?? false);
+  const markers = edgeMode ? [ea, eb] : [v];
+  const lw = Math.max(2, 2.6 * scale);
+  const which = settings.vertexOrbitParts ?? "both";
+  const showRot = which !== "reflections";
+  const showRef = which !== "rotations";
+  const tinyEdge = seed.some(([a, b]) => orbitChordTiny(a, b, total));
+  const selfMirror = orbitSelfMirror(seed, n, total, showRot, showRef);
+  const parts: string[] = [];
+  const segSvg = (a: number, b: number, color: string, width: number): string => {
+    const [ax, ay] = point(a, total, c, r);
+    const [bx, by] = point(b, total, c, r);
+    return `<line x1="${ax.toFixed(2)}" y1="${ay.toFixed(2)}" x2="${bx.toFixed(
+      2
+    )}" y2="${by.toFixed(2)}" stroke="${color}" stroke-width="${width}" stroke-opacity="0.92" stroke-linecap="round"/>`;
+  };
+  // One hue for the whole orbit: rotation solid, its mirror a lighter dash.
+  const rotColor = palette.dihedralAxis;
+  const mirrorColor = lightenHex(palette.dihedralAxis, 0.5);
+  const drawn: Array<[number, number, number]> = [];
+  if (showRef) {
+    // Reflection family s·rᵐx = ω(rᵐx): step m is the mirror of rotation step m.
+    for (const [a, b] of seed) {
+      for (let m = 0; m < n; m++) {
+        const ra = ((total - 1 - a - m * B) % total + total) % total;
+        const rb = ((total - 1 - b - m * B) % total + total) % total;
+        parts.push(segSvg(ra, rb, mirrorColor, lw));
+        drawn.push([ra, rb, m]);
+      }
+    }
+  }
+  if (showRot) {
+    for (const [a, b] of seed) {
+      for (let m = 0; m < n; m++) {
+        const ra = (a + m * B) % total;
+        const rb = (b + m * B) % total;
+        parts.push(segSvg(ra, rb, rotColor, lw));
+        drawn.push([ra, rb, m]);
+      }
+    }
+  }
+
+  const dot = Math.max(4, 6 * scale) * (tinyEdge ? 1.4 : 1);
+  const markerColor = tinyEdge ? ORBIT_NOTE_COLOR : palette.dihedralAxis;
+  for (const mk of markers) {
+    const [mx, my] = point(mk, total, c, r);
+    parts.push(
+      `<circle cx="${mx.toFixed(2)}" cy="${my.toFixed(2)}" r="${dot.toFixed(
+        2
+      )}" fill="${markerColor}" fill-opacity="0.98" stroke="${palette.background}" stroke-opacity="0.95" stroke-width="${Math.max(
+        1.5,
+        2 * scale
+      )}"/>`
+    );
+  }
+
+  // ω reflection axis (mirrors violet → orange), shown when reflections are on.
+  if (showRef) {
+    const off = dihedralOffset(total);
+    const ext = r * 1.04;
+    const dash = `${(8 * scale).toFixed(2)},${(6 * scale).toFixed(2)}`;
+    parts.push(
+      `<line x1="${(c + ext * Math.cos(off)).toFixed(2)}" y1="${(c + ext * Math.sin(off)).toFixed(
+        2
+      )}" x2="${(c + ext * Math.cos(off + Math.PI)).toFixed(2)}" y2="${(
+        c +
+        ext * Math.sin(off + Math.PI)
+      ).toFixed(2)}" stroke="${palette.dihedralMirror}" stroke-width="${Math.max(
+        1.5,
+        2 * scale
+      )}" stroke-opacity="0.9" stroke-linecap="round" stroke-dasharray="${dash}"/>`
+    );
+    const lfs = Math.max(12, 14 * scale);
+    parts.push(
+      `<text x="${(c + r * 1.13 * Math.cos(off)).toFixed(2)}" y="${(
+        c +
+        r * 1.13 * Math.sin(off)
+      ).toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${lfs.toFixed(
+        1
+      )}" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="${palette.dihedralMirror}" stroke="${palette.background}" stroke-width="${Math.max(
+        2,
+        3 * scale
+      ).toFixed(2)}" stroke-opacity="0.95" paint-order="stroke">ω</text>`
+    );
+  }
+
+  // Flip tag rₖ on each orbit edge (few-edges views only).
+  if (wordOf && drawn.length > 0 && drawn.length <= VERTEX_ORBIT_TAG_LIMIT) {
+    const tfs = Math.max(9, 11 * scale);
+    for (const [a, b, m] of drawn) {
+      const k = suffixFlipBetween(wordOf(a), wordOf(b), n);
+      const [ax, ay] = point(a, total, c, r);
+      const [bx, by] = point(b, total, c, r);
+      const tx = ax + 0.28 * (bx - ax);
+      const ty = ay + 0.28 * (by - ay);
+      parts.push(
+        `<text x="${tx.toFixed(2)}" y="${ty.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${tfs.toFixed(
+          1
+        )}" text-anchor="middle" dominant-baseline="middle" fill="${
+          k ? palette.labelFill : palette.cayleyOddStroke
+        }" stroke="${palette.background}" stroke-width="${Math.max(2, 3 * scale).toFixed(
+          2
+        )}" stroke-opacity="0.95" paint-order="stroke">${k ? `${m + 1}` : "✗"}</text>`
+      );
+    }
+  }
+
+  // Vertex labels: index (plain) + word in a badge below.
+  if (wordOf) {
+    const labelSet = new Set<number>(markers);
+    for (const [a, b] of drawn) {
+      labelSet.add(a);
+      labelSet.add(b);
+    }
+    const labels = [...labelSet];
+    if (labels.length <= VERTEX_ORBIT_LABEL_LIMIT) {
+      const fs = Math.max(9, 11 * scale);
+      const wfs = Math.max(8.5, 10 * scale);
+      const off = Math.max(26, 32 * scale);
+      const halo = Math.max(2, 3 * scale).toFixed(2);
+      for (const idx of labels) {
+        const a = (2 * Math.PI * idx) / total;
+        const ix = c + (r + off) * Math.cos(a);
+        const iy = c + (r + off) * Math.sin(a);
+        parts.push(
+          `<text x="${ix.toFixed(2)}" y="${iy.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs.toFixed(
+            1
+          )}" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}" stroke="${palette.background}" stroke-width="${halo}" stroke-opacity="0.9" paint-order="stroke">${idx}</text>`
+        );
+        const res = idx % B;
+        const boundary = res === 0 || res === B - 1;
+        parts.push(
+          `<text x="${ix.toFixed(2)}" y="${(iy + fs * 0.95).toFixed(
+            2
+          )}" font-family="ui-monospace,Menlo,monospace" font-size="${wfs.toFixed(
+            1
+          )}" text-anchor="middle" dominant-baseline="middle" fill="${
+            boundary ? ORBIT_NOTE_COLOR : palette.labelFill
+          }" fill-opacity="${boundary ? 1 : 0.55}" stroke="${palette.background}" stroke-width="${halo}" stroke-opacity="0.9" paint-order="stroke">≡${res}</text>`
+        );
+        const word = wordOf(idx);
+        const padX = Math.max(2, 3 * scale);
+        const bw = word.length * wfs * 0.62 + 2 * padX;
+        const bh = wfs + Math.max(3, 4 * scale);
+        const wyc = iy + fs * 2.05;
+        parts.push(
+          `<rect x="${(ix - bw / 2).toFixed(2)}" y="${(wyc - bh / 2).toFixed(
+            2
+          )}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" rx="${Math.max(
+            2,
+            2.5 * scale
+          ).toFixed(2)}" fill="${palette.dihedralAxis}" fill-opacity="0.14" stroke="${palette.dihedralAxis}" stroke-opacity="0.55" stroke-width="${Math.max(
+            0.75,
+            scale
+          ).toFixed(2)}"/>`
+        );
+        parts.push(
+          `<text x="${ix.toFixed(2)}" y="${wyc.toFixed(2)}" font-family="ui-monospace,Menlo,monospace" font-size="${wfs.toFixed(
+            1
+          )}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${word}</text>`
+        );
+      }
+    }
+  }
+
+  const notes: string[] = [];
+  if (tinyEdge) notes.push("full reversal lands on a neighbour — chord ≈ 0");
+  if (selfMirror) notes.push("reflection coincides with rotation (self-mirror orbit)");
+  const nfs = Math.max(11, 13 * scale);
+  for (let i = 0; i < notes.length; i++) {
+    const ny = c - r + Math.max(16, 20 * scale) + i * nfs * 1.4;
+    parts.push(
+      `<text x="${c}" y="${ny.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${nfs.toFixed(
+        1
+      )}" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="${ORBIT_NOTE_COLOR}" stroke="${palette.background}" stroke-width="${Math.max(
+        3,
+        4 * scale
+      ).toFixed(2)}" stroke-opacity="0.95" paint-order="stroke">${notes[i]}</text>`
+    );
+  }
+  return parts.join("");
+}
+
 /* --------------------------------- canvas --------------------------------- */
 
 interface CanvasDrawOpts {
@@ -1103,12 +1752,15 @@ export function drawToCanvas(
       // a color composite once (no darkening) and the orbit count never makes
       // this a per-edge stroke storm.
       const groups = new Map<string, number[]>();
-      const orbitColors = coloring === "orbit" ? orbitColorsForGraph(graph) : null;
+      const orbitColors =
+        coloring === "orbit" || coloring === "dihedral"
+          ? orbitColorsForGraph(graph, coloring)
+          : null;
       for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
         if (hidden && hidden.has(edges[t + 2])) continue;
         const color =
-          coloring === "orbit"
-            ? orbitColors![e]
+          orbitColors
+            ? orbitColors[e]
             : edges[t + 2] < graph.n
               ? palette.blockWithinStroke
               : palette.blockBetweenStroke;
@@ -1221,6 +1873,15 @@ export function drawToCanvas(
       drawFundamentalDomainToCanvas(ctx, geom, settings, palette);
     if (settings.showSymmetryAxes) drawSymmetryAxesToCanvas(ctx, geom, palette);
     if (settings.showDihedralAxes) drawDihedralOverlayToCanvas(ctx, geom, palette);
+    if (settings.showVertexOrbit)
+      drawVertexOrbitToCanvas(
+        ctx,
+        geom,
+        settings,
+        palette,
+        edges,
+        (i) => permLetters(path[i])
+      );
   }
 
   ctx.restore();
@@ -1458,13 +2119,23 @@ export function drawZaksSymmetryToCanvas(
   if (
     settings.showFundamentalDomain ||
     settings.showSymmetryAxes ||
-    settings.showDihedralAxes
+    settings.showDihedralAxes ||
+    settings.showVertexOrbit
   ) {
     const geom = { n, total, c, cy, r, scale };
     if (settings.showFundamentalDomain)
       drawFundamentalDomainToCanvas(ctx, geom, settings, palette);
     if (settings.showSymmetryAxes) drawSymmetryAxesToCanvas(ctx, geom, palette);
     if (settings.showDihedralAxes) drawDihedralOverlayToCanvas(ctx, geom, palette);
+    if (settings.showVertexOrbit)
+      drawVertexOrbitToCanvas(
+        ctx,
+        geom,
+        settings,
+        palette,
+        undefined,
+        makeZaksWordOf(n)
+      );
   }
 
   if (settings.showLabels && n <= 5) {
@@ -1743,6 +2414,18 @@ function parityPasses(
     : [oddPass, evenPass];
 }
 
+/** Mix a #rrggbb color toward white by fraction t (0 = same, 1 = white). */
+function lightenHex(hex: string, t: number): string {
+  const m = hex.match(/^#([0-9a-f]{6})$/i);
+  if (!m) return hex;
+  const v = parseInt(m[1], 16);
+  const mix = (ch: number) => Math.round(ch + (255 - ch) * t);
+  const r = mix((v >> 16) & 0xff);
+  const g = mix((v >> 8) & 0xff);
+  const b = mix(v & 0xff);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+}
+
 function withAlpha(hex: string, alpha: number): string {
   const a = Math.max(0, Math.min(1, alpha));
   const m = hex.match(/^#([0-9a-f]{6})$/i);
@@ -1803,13 +2486,16 @@ export function toSVG(opts: SvgOpts): string {
     // Group chords by color (one <path> per color) so overlaps within a color
     // composite once, mirroring the canvas renderer.
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
-    const orbitColors = coloring === "orbit" ? orbitColorsForGraph(graph) : null;
+    const orbitColors =
+      coloring === "orbit" || coloring === "dihedral"
+        ? orbitColorsForGraph(graph, coloring)
+        : null;
     const groups = new Map<string, string>();
     for (let t = 0, e = 0; t < edges.length; t += 3, e++) {
       if (hidden && hidden.has(edges[t + 2])) continue;
       const color =
-        coloring === "orbit"
-          ? orbitColors![e]
+        orbitColors
+          ? orbitColors[e]
           : edges[t + 2] < graph.n
             ? palette.blockWithinStroke
             : palette.blockBetweenStroke;
@@ -1903,6 +2589,16 @@ export function toSVG(opts: SvgOpts): string {
       parts.push(fundamentalDomainSVG(geom, settings, palette));
     if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
     if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
+    if (settings.showVertexOrbit)
+      parts.push(
+        vertexOrbitSVG(
+          geom,
+          settings,
+          palette,
+          graph.edges,
+          graph.path.length > 0 ? (i) => permLetters(graph.path[i]) : makeZaksWordOf(n)
+        )
+      );
   }
 
   parts.push("</svg>");
@@ -2013,18 +2709,30 @@ export function toSymmetrySVG(opts: SvgOpts): string {
     return null;
   };
 
-  if (settings.showCayley && edges.length > 0 && coloring === "orbit") {
+  if (
+    settings.showCayley &&
+    edges.length > 0 &&
+    (coloring === "orbit" || coloring === "dihedral")
+  ) {
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
-    let q = 0;
+    const keyToIdx = new Map<number, number>();
+    let next = 0;
     for (let t = 0; t < edges.length; t += 3) {
       const i = edges[t];
       const j = edges[t + 1];
       const cls = domainClass(i, j);
       if (!cls) continue;
-      const color = orbitColor(q);
-      q++;
+      const code =
+        coloring === "dihedral"
+          ? canonicalDihedralCode(i, j, n, total, B)
+          : canonicalOrbitCode(i, j, n, total, B);
+      let idx = keyToIdx.get(code);
+      if (idx === undefined) {
+        idx = next++;
+        keyToIdx.set(code, idx);
+      }
       if (hidden && hidden.has(edges[t + 2])) continue;
-      emitFragment(seg(i, j), color, cls === "half" ? halfTurns : n);
+      emitFragment(seg(i, j), orbitColor(idx), cls === "half" ? halfTurns : n);
     }
   } else if (settings.showCayley && edges.length > 0 && coloring === "blocks") {
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
@@ -2109,13 +2817,24 @@ export function toSymmetrySVG(opts: SvgOpts): string {
   if (
     settings.showFundamentalDomain ||
     settings.showSymmetryAxes ||
-    settings.showDihedralAxes
+    settings.showDihedralAxes ||
+    settings.showVertexOrbit
   ) {
     const geom = { n, total, c, r, scale };
     if (settings.showFundamentalDomain)
       parts.push(fundamentalDomainSVG(geom, settings, palette));
     if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
     if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
+    if (settings.showVertexOrbit)
+      parts.push(
+        vertexOrbitSVG(
+          geom,
+          settings,
+          palette,
+          graph.edges,
+          graph.path.length > 0 ? (i) => permLetters(graph.path[i]) : makeZaksWordOf(n)
+        )
+      );
   }
 
   // Index labels (only legible for tiny n): the position i on the Zaks ring.
@@ -2195,14 +2914,14 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
 
   const coloring: SymmetryColoring = settings.symmetryColoring ?? "parity";
 
-  if (settings.showCayley && coloring === "orbit") {
-    // One hue per Cₙ orbit: each fundamental representative is its own fragment,
-    // and its n (or n/2) rotated copies inherit the hue.
+  if (settings.showCayley && (coloring === "orbit" || coloring === "dihedral")) {
+    // One hue per orbit. "orbit": each Cₙ class its own fragment; "dihedral":
+    // ω-related classes share a hue. Each fragment's n (or n/2) rotated copies
+    // inherit the color.
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
-    let q = 0;
+    const qmap = orbitIndexMap(n, coloring);
     forEachZaksFundamentalEdge(n, (e) => {
-      const color = orbitColor(q);
-      q++;
+      const color = orbitColor(qmap.get(canonicalOrbitCode(e.i, e.j, n, total, B)) ?? 0);
       if (hidden && hidden.has(e.gen)) return;
       emitFragment(seg(e.i, e.j), color, e.half ? halfTurns : n);
     });
@@ -2308,13 +3027,24 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
   if (
     settings.showFundamentalDomain ||
     settings.showSymmetryAxes ||
-    settings.showDihedralAxes
+    settings.showDihedralAxes ||
+    settings.showVertexOrbit
   ) {
     const geom = { n, total, c, r, scale };
     if (settings.showFundamentalDomain)
       parts.push(fundamentalDomainSVG(geom, settings, palette));
     if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
     if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
+    if (settings.showVertexOrbit)
+      parts.push(
+        vertexOrbitSVG(
+          geom,
+          settings,
+          palette,
+          graph.edges,
+          graph.path.length > 0 ? (i) => permLetters(graph.path[i]) : makeZaksWordOf(n)
+        )
+      );
   }
 
   // Index labels (only emitted for tiny n): the position i on the Zaks ring,

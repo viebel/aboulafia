@@ -53,11 +53,17 @@ import {
   toZaksSymmetrySVG,
   computeZaksOrbits,
   type OrbitInfo,
+  type OrbitParts,
   type ParityMode,
   type RenderSettings,
   type SymmetryColoring,
 } from "@/lib/pancake-render";
-import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
+import {
+  readEnumParam,
+  readIntParam,
+  readNonNegIntParam,
+  writeUrlParams,
+} from "@/lib/url-state";
 import { AlertTriangle, Download, Loader2, Minus, Plus, RotateCcw } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import {
@@ -195,12 +201,15 @@ const PARITY_MODES = Object.keys(PARITY_MODE_LABELS) as ParityMode[];
 
 const SYMMETRY_COLORING_LABELS: Record<SymmetryColoring, string> = {
   parity: "Parity (default)",
-  orbit: "Cₙ orbit (rainbow)",
+  orbit: "Cₙ orbit (rotation)",
+  dihedral: "Dₙ orbit (reflection)",
   blocks: "Blocks (first symbol)",
 };
 const SYMMETRY_COLORINGS = Object.keys(
   SYMMETRY_COLORING_LABELS
 ) as SymmetryColoring[];
+
+const ORBIT_PARTS: readonly OrbitParts[] = ["both", "rotations", "reflections"];
 
 // Generous allowed list for the piece/axis indices; the renderer clamps to the
 // valid count for the current n, so the exact upper bound is not critical.
@@ -229,6 +238,12 @@ interface GraphState {
   showFundamentalDomain: boolean;
   domainPiece: number;
   domainAxis: number;
+  showVertexOrbit: boolean;
+  vertexOrbitIndex: number;
+  vertexOrbitParts: OrbitParts;
+  vertexOrbitLongOnly: boolean;
+  orbitEdgeA: number;
+  orbitEdgeB: number;
   showLabels: boolean;
   alpha: number;
   width: number;
@@ -258,6 +273,12 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     showFundamentalDomain: readEnumParam(params, "fd", ["0", "1"], "0") === "1",
     domainPiece: readIntParam(params, "dp", DOMAIN_INDEX_RANGE, 0),
     domainAxis: readIntParam(params, "da", DOMAIN_INDEX_RANGE, 0),
+    showVertexOrbit: readEnumParam(params, "vo", ["0", "1"], "0") === "1",
+    vertexOrbitIndex: readNonNegIntParam(params, "vi"),
+    vertexOrbitParts: readEnumParam(params, "vp", ORBIT_PARTS, "both"),
+    vertexOrbitLongOnly: readEnumParam(params, "vl", ["0", "1"], "0") === "1",
+    orbitEdgeA: readNonNegIntParam(params, "ea", -1),
+    orbitEdgeB: readNonNegIntParam(params, "eb", -1),
     showLabels: readEnumParam(params, "lbl", ["0", "1"], "0") === "1",
     alpha: readIntParam(params, "alpha", SLIDER_RANGE, rec.alpha),
     width: readIntParam(params, "width", SLIDER_RANGE, rec.width),
@@ -299,6 +320,12 @@ export function PancakeGraphView() {
     showFundamentalDomain: initial.showFundamentalDomain,
     domainPiece: initial.domainPiece,
     domainAxis: initial.domainAxis,
+    showVertexOrbit: initial.showVertexOrbit,
+    vertexOrbitIndex: initial.vertexOrbitIndex,
+    vertexOrbitParts: initial.vertexOrbitParts,
+    vertexOrbitLongOnly: initial.vertexOrbitLongOnly,
+    orbitEdgeA: initial.orbitEdgeA,
+    orbitEdgeB: initial.orbitEdgeB,
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
@@ -379,6 +406,18 @@ export function PancakeGraphView() {
       fd: settings.showFundamentalDomain ? "1" : null,
       dp: settings.showFundamentalDomain ? String(settings.domainPiece) : null,
       da: settings.showFundamentalDomain ? String(settings.domainAxis) : null,
+      vo: settings.showVertexOrbit ? "1" : null,
+      vi: settings.showVertexOrbit ? String(settings.vertexOrbitIndex) : null,
+      vp: settings.showVertexOrbit ? settings.vertexOrbitParts : null,
+      vl: settings.showVertexOrbit && settings.vertexOrbitLongOnly ? "1" : null,
+      ea:
+        settings.showVertexOrbit && (settings.orbitEdgeA ?? -1) >= 0
+          ? String(settings.orbitEdgeA)
+          : null,
+      eb:
+        settings.showVertexOrbit && (settings.orbitEdgeB ?? -1) >= 0
+          ? String(settings.orbitEdgeB)
+          : null,
       lbl: settings.showLabels ? "1" : null,
       alpha: String(settings.alpha),
       width: String(settings.width),
@@ -395,6 +434,12 @@ export function PancakeGraphView() {
     settings.showFundamentalDomain,
     settings.domainPiece,
     settings.domainAxis,
+    settings.showVertexOrbit,
+    settings.vertexOrbitIndex,
+    settings.vertexOrbitParts,
+    settings.vertexOrbitLongOnly,
+    settings.orbitEdgeA,
+    settings.orbitEdgeB,
     settings.showLabels,
     settings.alpha,
     settings.width,
@@ -1075,6 +1120,7 @@ export function PancakeGraphView() {
     (renderer === "symmetry" || renderer === "canvas" || renderer === "svg");
 
   const domainPieceCount = n;
+  const vertexCount = factorial(n);
 
   // Geometry of a pointer event relative to the drawing: the drawing is
   // centered in the stage (offset by the pan), and zoom scales about that
@@ -1087,10 +1133,48 @@ export function PancakeGraphView() {
     const dx = event.clientX - rect.left - (rect.width / 2 + pan.x);
     const dy = event.clientY - rect.top - (rect.height / 2 + pan.y);
     return {
+      dx,
+      dy,
       angle: Math.atan2(dy, dx),
       dist: Math.hypot(dx, dy),
       radius: 0.405 * Math.min(rect.width, rect.height) * zoom,
     };
+  };
+
+  // Nearest graph edge to a click (in the drawing's centered, zoom-scaled
+  // frame), or null if none is within the pick threshold. Vertex i sits at
+  // angle 2πi/total on a circle of the given screen radius.
+  const nearestEdge = (
+    dx: number,
+    dy: number,
+    radius: number
+  ): [number, number] | null => {
+    if (!graph || graph.edges.length === 0) return null;
+    const total = graph.path.length || factorial(n);
+    const { edges } = graph;
+    const pt = (i: number): [number, number] => {
+      const a = (2 * Math.PI * i) / total;
+      return [radius * Math.cos(a), radius * Math.sin(a)];
+    };
+    let best: [number, number] | null = null;
+    let bestD = Math.max(7, radius * 0.02);
+    for (let t = 0; t < edges.length; t += 3) {
+      const [ax, ay] = pt(edges[t]);
+      const [bx, by] = pt(edges[t + 1]);
+      const vx = bx - ax;
+      const vy = by - ay;
+      const len2 = vx * vx + vy * vy || 1;
+      let s = ((dx - ax) * vx + (dy - ay) * vy) / len2;
+      s = s < 0 ? 0 : s > 1 ? 1 : s;
+      const cxp = ax + s * vx;
+      const cyp = ay + s * vy;
+      const d = Math.hypot(dx - cxp, dy - cyp);
+      if (d < bestD) {
+        bestD = d;
+        best = [edges[t], edges[t + 1]];
+      }
+    }
+    return best;
   };
 
   const axisFromAngle = (angle: number) => {
@@ -1109,10 +1193,30 @@ export function PancakeGraphView() {
   // Clicking near the rim grabs the axis (see the pan handlers); interior
   // clicks set the piece (and/or axis) per the "Click sets" mode.
   const handleStageClick = (event: PointerEvent<HTMLDivElement>) => {
-    if (!settings.showFundamentalDomain) return;
     if (pointerDraggedRef.current) return;
     const g = pointerGeom(event);
     if (!g || g.dist < 6) return;
+    // Vertex-orbit selection takes priority. Prefer the nearest edge under the
+    // click (show that chord's orbit); otherwise pick the nearest vertex (its
+    // incident edges' orbit) and clear any selected edge.
+    if (settings.showVertexOrbit) {
+      const e = nearestEdge(g.dx, g.dy, g.radius);
+      if (e) {
+        setSettings((s) => ({ ...s, orbitEdgeA: e[0], orbitEdgeB: e[1] }));
+        return;
+      }
+      const total = factorial(n);
+      const idx =
+        ((Math.round((g.angle / (2 * Math.PI)) * total) % total) + total) % total;
+      setSettings((s) => ({
+        ...s,
+        vertexOrbitIndex: idx,
+        orbitEdgeA: -1,
+        orbitEdgeB: -1,
+      }));
+      return;
+    }
+    if (!settings.showFundamentalDomain) return;
     const piece = pieceFromAngle(g.angle);
     const axis = axisFromAngle(g.angle);
     setSettings((s) => ({
@@ -1124,7 +1228,7 @@ export function PancakeGraphView() {
 
   return (
     <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
-      <Card className="self-start lg:sticky lg:top-4">
+      <Card className="self-start lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
         <CardHeader className="space-y-1">
           <CardTitle className="text-lg">Graph explorer</CardTitle>
           <CardDescription>
@@ -1360,6 +1464,13 @@ export function PancakeGraphView() {
                       (ρ: i ↦ i+(n-1)!): each color class is a clean rotated
                       n-set at 360/n steps — the decisive rotation test.
                     </>
+                  ) : settings.symmetryColoring === "dihedral" ? (
+                    <>
+                      One hue per <span className="font-medium">Dₙ orbit</span>:
+                      like Cₙ orbit, but a chord and its mirror under ω: i ↦
+                      (n!−1)−i share a color — the reflection test (≈ half as
+                      many colors).
+                    </>
                   ) : settings.symmetryColoring === "blocks" ? (
                     <>
                       Dots banded into n arcs by leading symbol (one ρ-block
@@ -1485,6 +1596,103 @@ export function PancakeGraphView() {
                         ))}
                       </div>
                     </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {(activeRenderer === "symmetry" ||
+              activeRenderer === "canvas" ||
+              activeRenderer === "svg") &&
+            supportsSymmetry({ preset }) ? (
+              <div className="space-y-2 rounded-md border border-violet-200 bg-violet-50/40 p-2.5">
+                <label className="flex cursor-pointer items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-violet-600"
+                    checked={settings.showVertexOrbit ?? false}
+                    onChange={(e) => setS("showVertexOrbit", e.target.checked)}
+                  />
+                  <span className="font-medium">Vertex orbit</span>
+                </label>
+                {settings.showVertexOrbit ? (
+                  <div className="space-y-2.5 pl-5">
+                    <p className="text-[11px] leading-snug text-muted-foreground">
+                      Click an <span className="font-medium">edge</span> to show
+                      that chord&apos;s orbit; click empty space (or step) to use
+                      a vertex&apos;s incident edges.{" "}
+                      The <span style={{ color: "#7c3aed" }}>darker</span> half
+                      is the rotation orbit; the{" "}
+                      <span style={{ color: "#c4b5fd" }}>lighter</span> half is
+                      its mirror across ω. Show picks which halves to draw.
+                      {(settings.orbitEdgeA ?? -1) >= 0 &&
+                      (settings.orbitEdgeB ?? -1) >= 0 ? (
+                        <>
+                          {" "}
+                          Selected edge: {"{"}
+                          {settings.orbitEdgeA}, {settings.orbitEdgeB}
+                          {"}"}.
+                        </>
+                      ) : null}
+                    </p>
+                    <IndexStepper
+                      label="Vertex"
+                      value={
+                        (((settings.vertexOrbitIndex ?? 0) % vertexCount) +
+                          vertexCount) %
+                        vertexCount
+                      }
+                      count={vertexCount}
+                      oneBased={false}
+                      onChange={(v) =>
+                        setSettings((s) => ({
+                          ...s,
+                          vertexOrbitIndex: v,
+                          orbitEdgeA: -1,
+                          orbitEdgeB: -1,
+                        }))
+                      }
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] text-muted-foreground">
+                        Show
+                      </span>
+                      <div className="inline-flex overflow-hidden rounded-md border">
+                        {ORBIT_PARTS.map((part) => (
+                          <button
+                            key={part}
+                            type="button"
+                            onClick={() => setS("vertexOrbitParts", part)}
+                            className={`px-2 py-0.5 text-[11px] capitalize transition-colors ${
+                              (settings.vertexOrbitParts ?? "both") === part
+                                ? "bg-violet-600 text-white"
+                                : "bg-background hover:bg-muted"
+                            }`}
+                          >
+                            {part}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <label className="flex cursor-pointer items-center gap-2 text-[11px]">
+                      <input
+                        type="checkbox"
+                        className="h-3.5 w-3.5 accent-violet-600"
+                        checked={settings.vertexOrbitLongOnly ?? false}
+                        onChange={(e) =>
+                          setS("vertexOrbitLongOnly", e.target.checked)
+                        }
+                      />
+                      <span>Full reversal rₙ only</span>
+                    </label>
+                    {settings.vertexOrbitLongOnly ? (
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        rₙ reverses the whole word — it&apos;s &ldquo;long&rdquo;
+                        combinatorially, not geometrically. When the reversal
+                        lands a near-neighbour in Zaks order the chord is short;
+                        the rₙ tag confirms it&apos;s still the full reversal.
+                      </p>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -1756,7 +1964,7 @@ export function PancakeGraphView() {
             <>
               <div
                 className={`absolute inset-0 touch-none ${
-                  settings.showFundamentalDomain
+                  settings.showFundamentalDomain || settings.showVertexOrbit
                     ? "cursor-crosshair"
                     : zoom > 1
                       ? isPanning
@@ -1960,11 +2168,13 @@ function IndexStepper({
   value,
   count,
   onChange,
+  oneBased = true,
 }: {
   label: string;
   value: number;
   count: number;
   onChange: (value: number) => void;
+  oneBased?: boolean;
 }) {
   const wrap = (v: number) => ((v % count) + count) % count;
   return (
@@ -1980,7 +2190,7 @@ function IndexStepper({
           <Minus className="h-3.5 w-3.5" />
         </Button>
         <span className="w-14 text-center font-mono text-xs">
-          {value + 1} / {count}
+          {value + (oneBased ? 1 : 0)} / {count}
         </span>
         <Button
           variant="outline"
