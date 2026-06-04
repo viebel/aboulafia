@@ -165,12 +165,14 @@ function buildSynth(ctx: BaseAudioContext): Synth {
   const master = ctx.createGain();
   master.gain.value = 0.8;
 
-  // Shared guitar body resonance sits on the master bus.
+  // A gentle shared low-mid warmth on the master bus. (The guitar now carries
+  // its own wooden-body resonances baked into each string buffer, so this stays
+  // light to avoid doubling up into a boomy low end.)
   const body = ctx.createBiquadFilter();
   body.type = "peaking";
   body.frequency.value = 120;
   body.Q.value = 0.8;
-  body.gain.value = 4;
+  body.gain.value = 2.5;
 
   // Glue the overlapping strings and keep peaks in check.
   const comp = ctx.createDynamicsCompressor();
@@ -226,14 +228,23 @@ function normalize(data: Float32Array, target = 0.9): void {
 
 // Karplus-Strong plucked string (guitar, harpsichord). A noise burst feeds a
 // damped feedback delay line = a vibrating string. `smooth` controls how dark
-// the pluck is; `decay*` how long it sustains.
+// the pluck is; `decay*` how long it sustains. `damp` adds a one-pole low-pass
+// inside the feedback loop: a real nylon string sheds its high partials far
+// faster than its fundamental, so more damping turns the bright, metallic KS
+// "sproing" into a warm, woody, human-sounding decay (0 = the crisp original).
+// `pickPos` (0 = off) combs the excitation to model WHERE the string is plucked:
+// a real player picks a fraction of the way along the string, which silences the
+// harmonics that have a node there — this comb is a big part of why a guitar
+// sounds like a guitar and not a buzzy synth string.
 function karplusBuffer(
   ctx: BaseAudioContext,
   freq: number,
   decayLow: number,
   decayHigh: number,
   smooth: number,
-  seconds: number
+  seconds: number,
+  damp = 0,
+  pickPos = 0
 ): AudioBuffer {
   const sr = ctx.sampleRate;
   const total = Math.floor(sr * seconds);
@@ -246,14 +257,85 @@ function karplusBuffer(
     lp = smooth * w + (1 - smooth) * lp;
     d[i] = lp;
   }
+  // Pick-position comb: subtract a delayed copy of the excitation (a notch comb),
+  // so the harmonics with a node at the pluck point vanish — the characteristic
+  // hollow colour of a plucked acoustic string.
+  if (pickPos > 0) {
+    const p = Math.max(1, Math.round(delay * pickPos));
+    for (let i = delay - 1; i >= p; i--) d[i] -= d[i - p];
+  }
   const decay = freq < 200 ? decayLow : decayHigh;
+  // Feedback-loop low-pass state: each round trip darkens the tone a little
+  // more, so the aggressive top partials die away first and leave a warm body.
+  let loopLp = 0;
   for (let i = delay; i < total; i++) {
     const prev = d[i - delay];
     const prev2 = i - delay - 1 >= 0 ? d[i - delay - 1] : prev;
-    d[i] = decay * 0.5 * (prev + prev2);
+    const avg = 0.5 * (prev + prev2);
+    loopLp = avg + damp * (loopLp - avg);
+    d[i] = decay * loopLp;
   }
   normalize(d);
   return buffer;
+}
+
+// One RBJ peaking-EQ biquad, run in place over a sample buffer. Used to BAKE the
+// resonant peaks of a guitar body (the air/Helmholtz "boom" + the wood-top
+// resonances) into the bare string tone — the hollow wooden "box" that the ear
+// hears as an acoustic guitar rather than a synthetic string.
+function peakingEq(
+  d: Float32Array,
+  sr: number,
+  f0: number,
+  q: number,
+  dbGain: number
+): void {
+  const A = Math.pow(10, dbGain / 40);
+  const w0 = (2 * Math.PI * f0) / sr;
+  const cw = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * q);
+  const a0 = 1 + alpha / A;
+  const b0 = (1 + alpha * A) / a0;
+  const b1 = (-2 * cw) / a0;
+  const b2 = (1 - alpha * A) / a0;
+  const a1 = (-2 * cw) / a0;
+  const a2 = (1 - alpha / A) / a0;
+  let x1 = 0,
+    x2 = 0,
+    y1 = 0,
+    y2 = 0;
+  for (let i = 0; i < d.length; i++) {
+    const x0 = d[i];
+    const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+    d[i] = y0;
+  }
+}
+
+// Turns a bare Karplus-Strong string into an acoustic guitar: it bakes in the
+// resonances of a wooden body and a soft finger attack. The body peaks are the
+// measured resonances of a real classical guitar — the Helmholtz air mode near
+// 100 Hz, the main top (wood) mode near 200 Hz, and an upper wood formant around
+// 430 Hz — which together give the warm, hollow, woody "box" of the instrument.
+function shapeGuitarBody(buffer: AudioBuffer, sr: number): void {
+  const d = buffer.getChannelData(0);
+  // A short, soft finger/nail transient at the very onset: the gentle "chiff" of
+  // flesh and nail releasing the string, low-passed so it stays warm, not clicky.
+  const aN = Math.floor(sr * 0.008);
+  let nlp = 0;
+  for (let i = 0; i < aN && i < d.length; i++) {
+    const w = Math.random() * 2 - 1;
+    nlp = 0.5 * w + 0.5 * nlp; // low-pass the noise → soft, fleshy, not clicky
+    d[i] += 0.18 * nlp * (1 - i / aN);
+  }
+  // The wooden body resonances.
+  peakingEq(d, sr, 100, 1.1, 4); // air / Helmholtz "boom"
+  peakingEq(d, sr, 200, 1.4, 3); // main top (wood) resonance
+  peakingEq(d, sr, 430, 1.2, 2); // upper wood formant — the "woody" colour
+  normalize(d);
 }
 
 interface Harmonic {
@@ -501,8 +583,15 @@ function makeInstrumentBuffer(
   freq: number
 ): AudioBuffer {
   switch (id) {
-    case "guitar":
-      return karplusBuffer(ctx, freq, 0.9975, 0.9965, 0.55, 3.2);
+    case "guitar": {
+      // A real nylon/acoustic guitar: a darker, fleshier pluck (low `smooth`)
+      // with a damped feedback loop (highs decay fast), combed for the pluck
+      // position, then shaped by the resonances of a wooden body + a soft finger
+      // attack — a warm acoustic voice instead of a bright, metallic ring.
+      const buf = karplusBuffer(ctx, freq, 0.9975, 0.9965, 0.38, 3.6, 0.5, 0.18);
+      shapeGuitarBody(buf, ctx.sampleRate);
+      return buf;
+    }
     case "harpsichord":
       return karplusBuffer(ctx, freq, 0.994, 0.991, 0.12, 2.4);
     case "piano":
