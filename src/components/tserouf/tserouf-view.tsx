@@ -112,8 +112,10 @@ const SPEED_OPTIONS: readonly number[] = Array.from(
   (_, i) => SPEED_MIN + i * SPEED_STEP
 );
 const DEFAULT_SPEED = 100;
-const BASE_STEP_SECONDS = 0.18; // invention: seconds per note at 100%
-const BASE_NOTE_SECONDS = 0.66; // meditation/chant: seconds per note at 100%
+// The reference tempo (100%) is what used to be 80%: 0.18 / 0.8 = 0.225 and
+// 0.66 / 0.8 = 0.825, i.e. a touch slower than the old default.
+const BASE_STEP_SECONDS = 0.225; // invention: seconds per note at 100%
+const BASE_NOTE_SECONDS = 0.825; // meditation/chant: seconds per note at 100%
 const stepSecondsForSpeed = (speed: number) => BASE_STEP_SECONDS / (speed / 100);
 const noteSecondsForSpeed = (speed: number) => BASE_NOTE_SECONDS / (speed / 100);
 
@@ -180,6 +182,9 @@ const TileRegisterContext = createContext<TileRegister | null>(null);
 
 // The permutation currently sounding during playback, so tiles can highlight.
 const PlayingWordContext = createContext<string | null>(null);
+
+// Clicking a word starts playback from it; tiles call this with their word.
+const PlayWordContext = createContext<((word: string) => void) | null>(null);
 
 interface EdgeSpec {
   path: string;
@@ -372,7 +377,7 @@ export function TseroufView() {
     setPlayingWord(null);
   }, []);
 
-  const startPlayback = () => {
+  const startPlayback = (startIndex = 0) => {
     if (words.length === 0) return;
     const kind = soundKindFor(instrument);
     // The drone and the invention are different engines; swap the player if the
@@ -391,6 +396,7 @@ export function TseroufView() {
     );
     playerRef.current.play(words, {
       loop: true,
+      startIndex,
       instrument: kind === "invention" ? (instrument as InstrumentId) : undefined,
       stepSeconds: stepSecondsForSpeed(speed),
       noteSeconds: noteSecondsForSpeed(speed),
@@ -402,6 +408,28 @@ export function TseroufView() {
       },
     });
   };
+
+  // Clicking a word (re)starts playback from that word — a quick way to jump
+  // straight into any point of the piece. The current player is torn down and
+  // rebuilt so it begins cleanly at the chosen index.
+  const wordIndexMap = useMemo(() => {
+    const map = new Map<string, number>();
+    words.forEach((item, index) => map.set(item.word, index));
+    return map;
+  }, [words]);
+
+  const playFromWord = useCallback(
+    (word: string) => {
+      const index = wordIndexMap.get(word);
+      if (index === undefined) return;
+      playerRef.current?.stop();
+      startPlayback(index);
+    },
+    // startPlayback closes over current controls but is stable enough here;
+    // wordIndexMap changes whenever the sequence does.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [wordIndexMap, instrument, speed, words]
+  );
 
   const togglePlay = () => {
     if (playState === "playing") {
@@ -770,13 +798,15 @@ export function TseroufView() {
           ) : recursiveCell ? (
             <HebrewLettersContext.Provider value={hebrewLetters}>
               <PlayingWordContext.Provider value={playingWord}>
-                <div ref={renderRef} className="p-2 font-mono text-sm">
-                  {layout === "tree" ? (
-                    <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
-                  ) : (
-                    <FlatWordsView words={words} alphabet={alphabet} n={n} />
-                  )}
-                </div>
+                <PlayWordContext.Provider value={playFromWord}>
+                  <div ref={renderRef} className="p-2 font-mono text-sm">
+                    {layout === "tree" ? (
+                      <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
+                    ) : (
+                      <FlatWordsView words={words} alphabet={alphabet} n={n} />
+                    )}
+                  </div>
+                </PlayWordContext.Provider>
               </PlayingWordContext.Provider>
             </HebrewLettersContext.Provider>
           ) : null}
@@ -1291,6 +1321,7 @@ function WordTile({
   const hebrewLetters = useHebrewLetters();
   const register = useContext(TileRegisterContext);
   const playingWord = useContext(PlayingWordContext);
+  const playWord = useContext(PlayWordContext);
   const word = item.word;
   const isActive = playingWord === word;
   const elRef = useRef<HTMLSpanElement | null>(null);
@@ -1310,10 +1341,29 @@ function WordTile({
     <span
       ref={setRef}
       dir={isHebrew ? "rtl" : "ltr"}
-      title={`${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`}
-      className={`inline-flex rounded-md border px-1.5 py-0.5 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] ${parityClassName(
-        item.word
-      )} ${
+      role={playWord ? "button" : undefined}
+      tabIndex={playWord ? 0 : undefined}
+      onClick={playWord ? () => playWord(word) : undefined}
+      onKeyDown={
+        playWord
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                playWord(word);
+              }
+            }
+          : undefined
+      }
+      title={
+        playWord
+          ? `Play from here · ${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`
+          : `${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`
+      }
+      className={`inline-flex rounded-md border px-1.5 py-0.5 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] ${
+        playWord
+          ? "cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+          : ""
+      } ${parityClassName(item.word)} ${
         isActive
           ? `ring-2 ring-offset-1 ring-offset-background ${
               isEvenPermutationWord(item.word)

@@ -22,6 +22,7 @@
 // deeper reversal = a longer pause), never a resolution.
 
 import {
+  clampStartIndex,
   encodeWav,
   type TseroufNote,
   type TseroufPlayOptions,
@@ -587,7 +588,7 @@ export class TseroufDronePlayer {
     const startTime = ctx.currentTime + 0.15;
     this.synth = buildChantSynth(ctx, this.noteSeconds, startTime);
 
-    this.wordIdx = 0;
+    this.wordIdx = clampStartIndex(options.startIndex, notes.length);
     this.nextWordTime = startTime;
     this.lastVoiceEnd = startTime;
     this.finishedScheduling = false;
