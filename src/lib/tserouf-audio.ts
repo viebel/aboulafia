@@ -267,12 +267,18 @@ function karplusBuffer(
   const decay = freq < 200 ? decayLow : decayHigh;
   // Feedback-loop low-pass state: each round trip darkens the tone a little
   // more, so the aggressive top partials die away first and leave a warm body.
+  // The damping RAMPS IN over the first ~120 ms: the pluck keeps its bright,
+  // lively attack (the string's initial sparkle) and only then mellows into the
+  // warm body — a real string sheds its highs fast, but not instantly.
   let loopLp = 0;
+  const rampSamples = Math.max(1, Math.floor(sr * 0.12));
   for (let i = delay; i < total; i++) {
+    const prog = Math.min(1, (i - delay) / rampSamples);
+    const dampNow = damp * (0.35 + 0.65 * prog);
     const prev = d[i - delay];
     const prev2 = i - delay - 1 >= 0 ? d[i - delay - 1] : prev;
     const avg = 0.5 * (prev + prev2);
-    loopLp = avg + damp * (loopLp - avg);
+    loopLp = avg + dampNow * (loopLp - avg);
     d[i] = decay * loopLp;
   }
   normalize(d);
@@ -331,10 +337,14 @@ function shapeGuitarBody(buffer: AudioBuffer, sr: number): void {
     nlp = 0.5 * w + 0.5 * nlp; // low-pass the noise → soft, fleshy, not clicky
     d[i] += 0.18 * nlp * (1 - i / aN);
   }
-  // The wooden body resonances.
-  peakingEq(d, sr, 100, 1.1, 4); // air / Helmholtz "boom"
-  peakingEq(d, sr, 200, 1.4, 3); // main top (wood) resonance
-  peakingEq(d, sr, 430, 1.2, 2); // upper wood formant — the "woody" colour
+  // The wooden body resonances — peaks at the measured modes, with an
+  // anti-resonance (a real body has dips between its modes) and an upper
+  // "presence/brilliance" peak that gives the box its woody air and definition.
+  peakingEq(d, sr, 100, 1.1, 4); //  air / Helmholtz "boom"
+  peakingEq(d, sr, 200, 1.4, 3); //  main top (wood) resonance
+  peakingEq(d, sr, 280, 2.0, -3); // anti-resonance dip between the modes
+  peakingEq(d, sr, 430, 1.2, 2); //  upper wood formant — the "woody" colour
+  peakingEq(d, sr, 2600, 1.4, 2.5); // brilliance — the air/definition of the box
   normalize(d);
 }
 
@@ -580,7 +590,8 @@ const MUSICBOX: Harmonic[] = [
 function makeInstrumentBuffer(
   ctx: BaseAudioContext,
   id: InstrumentId,
-  freq: number
+  freq: number,
+  variant = 0
 ): AudioBuffer {
   switch (id) {
     case "guitar": {
@@ -588,7 +599,12 @@ function makeInstrumentBuffer(
       // with a damped feedback loop (highs decay fast), combed for the pluck
       // position, then shaped by the resonances of a wooden body + a soft finger
       // attack — a warm acoustic voice instead of a bright, metallic ring.
-      const buf = karplusBuffer(ctx, freq, 0.9975, 0.9965, 0.38, 3.6, 0.5, 0.18);
+      //
+      // Round-robin: each variant is a fresh excitation burst (the noise is
+      // random every call) with the pluck point nudged a little, so repeated
+      // notes never sound identical — no "machine-gun" giveaway of a sampler.
+      const pickPos = 0.18 + ((variant * 0.37) % 1 - 0.5) * 0.07;
+      const buf = karplusBuffer(ctx, freq, 0.9975, 0.9965, 0.46, 3.6, 0.5, pickPos);
       shapeGuitarBody(buf, ctx.sampleRate);
       return buf;
     }
@@ -609,14 +625,20 @@ function makeInstrumentBuffer(
   }
 }
 
-function instrumentBuffer(synth: Synth, freq: number): AudioBuffer {
-  const key = `${synth.instrument}:${Math.round(freq * 50)}`;
+function instrumentBuffer(synth: Synth, freq: number, variant = 0): AudioBuffer {
+  const key = `${synth.instrument}:${Math.round(freq * 50)}:${variant}`;
   const cached = synth.bufferCache.get(key);
   if (cached) return cached;
-  const buffer = makeInstrumentBuffer(synth.ctx, synth.instrument, freq);
+  const buffer = makeInstrumentBuffer(synth.ctx, synth.instrument, freq, variant);
   synth.bufferCache.set(key, buffer);
   return buffer;
 }
+
+// How many round-robin string variants the guitar cycles through. Each is a
+// distinct cached buffer (different excitation + pluck point); a note picks one
+// at random so consecutive strikes of the same pitch differ subtly, the way a
+// real player never plucks a string exactly the same way twice.
+const GUITAR_ROUND_ROBIN = 4;
 
 const SUSTAINED: Partial<Record<InstrumentId, boolean>> = {
   saxophone: true,
@@ -644,8 +666,11 @@ function pluckNote(
   attack?: number
 ): number {
   const ctx = synth.ctx;
+  const isGuitar = synth.instrument === "guitar";
   const src = ctx.createBufferSource();
-  src.buffer = instrumentBuffer(synth, freq * voice.transpose);
+  // Round-robin: pick one of the guitar's string variants at random per note.
+  const variant = isGuitar ? Math.floor(Math.random() * GUITAR_ROUND_ROBIN) : 0;
+  src.buffer = instrumentBuffer(synth, freq * voice.transpose, variant);
   src.detune.value = (Math.random() - 0.5) * 8;
 
   const atk = attack ?? DEFAULT_ATTACK[synth.instrument];
@@ -669,7 +694,21 @@ function pluckNote(
   }
 
   src.connect(gain);
-  gain.connect(voice.in);
+  if (isGuitar) {
+    // Velocity → brightness (the EKS "dynamic-level" filter): a soft pluck is
+    // round and dark, a hard pluck is bright and present. We open a per-note
+    // low-pass as the velocity rises, so dynamics change the TONE, not just the
+    // volume — the difference between "typed in" and "played".
+    const v = Math.max(0, Math.min(1, (velocity - 0.25) / 0.55));
+    const tone = ctx.createBiquadFilter();
+    tone.type = "lowpass";
+    tone.frequency.value = 1200 + v * v * 4300; // ~1.2 kHz (soft) .. ~5.5 kHz (hard)
+    tone.Q.value = 0.4;
+    gain.connect(tone);
+    tone.connect(voice.in);
+  } else {
+    gain.connect(voice.in);
+  }
   src.start(time);
   src.stop(end);
   return end;
