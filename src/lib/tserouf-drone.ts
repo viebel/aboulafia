@@ -45,10 +45,20 @@ const VOICE_ROOT = DRONE_FREQ / 2; // ≈32.7 Hz; letters = its 2nd..8th harmoni
 // ≈108 BPM (one pulse ≈0.556 s) — the steady, hypnotic breathing pulse.
 const DEFAULT_NOTE_SECONDS = 60 / 108;
 
-// The hum is closed-mouth ("mmm/oum"): almost all the energy is in the
-// fundamental, low-passed hard so there is nothing bright. This is the matte,
-// dark, bodily timbre the loop is after.
-const HUM_LOWPASS_HZ = 760;
+// The hum voice is shaped by a bank of vocal-tract FORMANTS (resonant peaks,
+// like a real voice singing a dark, closed "ou/om" vowel). These peaks are what
+// the ear reads as a human voice instead of an organ/bell — they are the cure
+// for the "too metallic" timbre. Frequencies of a warm, rounded back vowel; F3
+// stays low and quiet so the voice gains humanity without gaining brightness.
+const VOICE_FORMANTS = [
+  { freq: 340, q: 6, gain: 0.9 }, //  F1 — the warm body of the vowel
+  { freq: 760, q: 9, gain: 0.6 }, //  F2 — the "ou/o" colour
+  { freq: 1280, q: 11, gain: 0.22 }, // F3 — a hint of vocal presence, still dark
+];
+
+// A soft low-pass over the whole voice: high enough to let the formants sing
+// (so the vowel reads as human), but still dark and matte — warmth, not highs.
+const HUM_LOWPASS_HZ = 1900;
 
 function letterToOvertone(letter: string): number {
   const index = letter.charCodeAt(0) - 97;
@@ -56,10 +66,13 @@ function letterToOvertone(letter: string): number {
   return VOICE_ROOT * harmonic;
 }
 
-// A closed "mmm/oum" hum: mostly the fundamental, a touch of the low harmonics,
-// nothing high — soft and dark, never reedy or bright.
+// A glottal-source hum: the fundamental dominates, with a smooth -12 dB/oct
+// (1/k²) overtone tail — the natural spectral slope of the human voice. The
+// tail is kept long (up to the ~24th harmonic) so that even the LOW hums carry
+// enough energy up into the formant region for the vocal-tract resonances to
+// "sing" the vowel; the steep rolloff keeps it warm and never buzzy.
 function makeHumWave(ctx: BaseAudioContext): PeriodicWave {
-  const n = 8;
+  const n = 24;
   const real = new Float32Array(n);
   const imag = new Float32Array(n);
   for (let k = 1; k < n; k++) {
@@ -188,16 +201,43 @@ function buildChantSynth(
 
   const running: { stop: (when: number) => void }[] = [];
 
-  // The hum bus: a hard low-pass so the "houm/mmm" stays closed, dark and
-  // matte, with nothing bright. Centred and forward but soft.
+  // The hum bus. To make the "houm/mmm" sound like a HUMAN voice rather than a
+  // metallic synth, the raw hum is passed through a bank of vocal-tract formants
+  // (parallel band-pass resonators tuned to a dark "ou/om" vowel) and blended
+  // with a little of the direct hum for body. A soft low-pass then keeps the
+  // whole thing dark and matte — warmth, not brightness.
+  const voiceBus = ctx.createGain();
+  voiceBus.gain.value = 1.5;
+
+  // A gentle low-pass over the summed voice, high enough to let the formants
+  // through so the vowel reads as a voice, but still dark.
   const voiceTone = ctx.createBiquadFilter();
   voiceTone.type = "lowpass";
   voiceTone.frequency.value = HUM_LOWPASS_HZ;
   voiceTone.Q.value = 0.7;
-  const voiceBus = ctx.createGain();
-  voiceBus.gain.value = 1.5;
-  voiceBus.connect(voiceTone);
   voiceTone.connect(master);
+
+  // The formant resonators: each band-pass picks out one vocal-tract resonance,
+  // and together they sculpt the bare harmonic hum into a sung vowel — the thing
+  // the ear recognises as a human voice.
+  for (const { freq, q, gain } of VOICE_FORMANTS) {
+    const bp = ctx.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.value = freq;
+    bp.Q.value = q;
+    const fg = ctx.createGain();
+    fg.gain.value = gain;
+    voiceBus.connect(bp);
+    bp.connect(fg);
+    fg.connect(voiceTone);
+  }
+
+  // A little of the direct hum under the formants: formants alone sound thin and
+  // nasal, so this restores the low body and keeps the voice warm and grounded.
+  const voiceBody = ctx.createGain();
+  voiceBody.gain.value = 0.45;
+  voiceBus.connect(voiceBody);
+  voiceBody.connect(voiceTone);
 
   // The frame drum: low-passed and dampened, but with enough of the skin attack
   // (up to ~1.1 kHz) to be clearly heard as a "tap/doum" — not buried sub-bass.
