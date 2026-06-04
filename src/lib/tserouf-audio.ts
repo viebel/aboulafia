@@ -695,7 +695,8 @@ function pluckNote(
   time: number,
   velocity: number,
   ringSeconds: number,
-  attack?: number
+  attack?: number,
+  detuneCents = 0
 ): number {
   const ctx = synth.ctx;
   time = humanizeTime(time);
@@ -704,7 +705,7 @@ function pluckNote(
   // Round-robin: pick one of the guitar's string variants at random per note.
   const variant = isGuitar ? Math.floor(Math.random() * GUITAR_ROUND_ROBIN) : 0;
   src.buffer = instrumentBuffer(synth, freq * voice.transpose, variant);
-  src.detune.value = (Math.random() - 0.5) * 8;
+  src.detune.value = detuneCents + (Math.random() - 0.5) * 8;
 
   const atk = attack ?? DEFAULT_ATTACK[synth.instrument];
   const gain = ctx.createGain();
@@ -749,47 +750,6 @@ function pluckNote(
   return end;
 }
 
-function resonanceTrace(
-  synth: Synth,
-  voice: Voice,
-  freq: number,
-  time: number,
-  duration: number,
-  level: number
-): number {
-  const ctx = synth.ctx;
-  const start = Math.max(0, time);
-  const end = start + duration;
-  const env = ctx.createGain();
-  // Pedal-like tail: it is already present when the word releases, then slowly
-  // breathes away. No pluck attack, no late "new note" inside the pause.
-  env.gain.setValueAtTime(level, start);
-  env.gain.linearRampToValueAtTime(level * 0.9, start + duration * 0.35);
-  env.gain.linearRampToValueAtTime(level * 0.45, start + duration * 0.78);
-  env.gain.exponentialRampToValueAtTime(0.0001, end);
-  env.connect(voice.in);
-
-  // A very quiet harmonic "after-image": slow envelope, no pluck transient. It
-  // keeps the pause alive without sounding like a new note was played.
-  for (const [ratio, gain] of [
-    [1, 0.72],
-    [2, 0.22],
-    [3, 0.06],
-  ] as const) {
-    const osc = ctx.createOscillator();
-    osc.type = "triangle";
-    osc.frequency.value = freq * ratio;
-    const og = ctx.createGain();
-    og.gain.value = gain;
-    osc.connect(og);
-    og.connect(env);
-    osc.start(start);
-    osc.stop(end + 0.05);
-  }
-
-  return end + 0.05;
-}
-
 interface WordTiming {
   len: number;
   beat: number;
@@ -799,18 +759,12 @@ interface WordTiming {
   isPhraseEnd: boolean;
 }
 
-// The line boundary itself is legato: the common note is tied over. The breath
-// belongs AFTER the first word of the new line (the resolution word), before the
-// second word launches the line proper.
-const AFTER_RESOLUTION_BREATH_BEATS = 0.38;
-
 // Pure timing for one word — shared by audio scheduling and the duration
 // estimate used to size the offline render buffer.
 function wordTiming(
   notes: TseroufNote[],
   idx: number,
-  stepSeconds: number,
-  isOpeningReturn = false
+  stepSeconds: number
 ): WordTiming {
   const note = notes[idx];
   const len = note.word.length;
@@ -825,13 +779,9 @@ function wordTiming(
   // Steady tempo across the line break so the cadence flows (no ritardando).
   const beat = stepSeconds;
   const span = len * beat;
-  // Inside a line and across the line boundary, cells run legato. The short
-  // breath comes after the first word of a line, except at the very beginning of
-  // the whole piece where that first word should simply begin.
-  const pause =
-    isPhraseStart && (idx > 0 || isOpeningReturn)
-      ? beat * AFTER_RESOLUTION_BREATH_BEATS
-      : 0;
+  // No rests between words. Line shape is carried by ties and accents, not by
+  // stopping the flow.
+  const pause = 0;
 
   return { len, beat, span, advance: span + pause, isPhraseStart, isPhraseEnd };
 }
@@ -910,9 +860,9 @@ function lineGroove(wordIndex: number, wordLength: number): LineGroove {
 
   return {
     velocity:
-      0.96 + 0.16 * arc + 0.08 * arrival + 0.14 * launch + 0.08 * crest - 0.06 * ending,
-    ring: 0.96 + 0.12 * arc + 0.32 * arrival + 0.08 * launch + 0.08 * crest - 0.08 * ending,
-    bass: 0.92 + 0.14 * arc + 0.24 * arrival + 0.12 * launch + 0.1 * crest - 0.12 * ending,
+      0.96 + 0.16 * arc + 0.08 * arrival + 0.95 * launch + 0.08 * crest - 0.06 * ending,
+    ring: 0.96 + 0.12 * arc + 0.2 * arrival + 0.36 * launch + 0.08 * crest - 0.08 * ending,
+    bass: 0.92 + 0.14 * arc + 0.2 * arrival + 0.82 * launch + 0.1 * crest - 0.12 * ending,
     resolution: 1 + 0.35 * arrival,
     tension: 1 + 0.28 * ending,
     wordInLine,
@@ -937,8 +887,7 @@ function scheduleWord(
   const { len, beat, advance, isPhraseStart, isPhraseEnd } = wordTiming(
     notes,
     idx,
-    stepSeconds,
-    isOpeningReturn
+    stepSeconds
   );
 
   const isBlueWord = isEvenPermutation(note.word);
@@ -1037,7 +986,10 @@ function scheduleWord(
           center,
           midiToFreq(bassRoot),
           t,
-          (0.3 + 0.12 * bol.stress) * groove.bass * line.bass,
+          (0.3 + 0.12 * bol.stress) *
+            groove.bass *
+            line.bass *
+            (line.wordInLine === 1 && i === 0 ? 1.7 : 1),
           beat * (isAccent ? 1.3 : 0.9) * line.ring,
           SOFT
         )
@@ -1061,18 +1013,22 @@ function scheduleWord(
     // velocity also drives the guitar's brightness, an accent rings a touch
     // brighter as well as louder — exactly like a stronger pluck.
     const accent = Math.random() < 0.14 ? 1.22 + Math.random() * 0.16 : 1;
+    const isLineLaunch = isWordStart && line.wordInLine === 1;
+    const launchAttack = isLineLaunch ? 2.2 : 1;
     const velocity = Math.min(
       0.98,
       (0.52 + 0.2 * bol.stress) *
         groove.velocity *
         line.velocity *
         cycleArrival *
+        launchAttack *
         (0.94 + Math.random() * 0.1) *
         accent
     );
     // Round the attack at the seam so the new word swells in under the still-
     // ringing previous note (legato), rather than re-articulating.
-    const attack = isWordStart ? 0.022 : undefined;
+    const attack =
+      isLineLaunch ? 0.001 : isWordStart ? 0.022 : undefined;
     // Long, overlapping rings; the cell's last note bridges into the next word.
     const boundaryTail = (isPhraseEnd || wrapsToStart) && i === len - 1 ? 1.75 : 1;
     const resolutionTrace = isPhraseStart && i === len - 1 ? 1.65 : 1;
@@ -1082,39 +1038,19 @@ function scheduleWord(
       line.ring *
       boundaryTail *
       resolutionTrace;
-    mark(pluckNote(synth, voice, letterToFreq(letter), t, velocity, ring, attack));
-  });
-
-  if (isPhraseStart && (idx > 0 || isOpeningReturn)) {
-    // Fill the post-resolution breath with a living trace instead of freezing on
-    // the last melody note: a slow, quiet resonance of the word's final pitch
-    // that starts where the word ends and carries into the launch of word 2.
-    const traceStart = startTime + len * beat - beat * 0.28;
-    const traceDuration = beat * (AFTER_RESOLUTION_BREATH_BEATS + 1.05);
-    const finalLetter = letters[letters.length - 1];
     mark(
-      resonanceTrace(
+      pluckNote(
         synth,
         voice,
-        letterToFreq(finalLetter),
-        traceStart,
-        traceDuration,
-        0.11 * line.resolution
+        letterToFreq(letter),
+        t,
+        velocity,
+        ring,
+        attack,
+        isLineLaunch ? 28 : 0
       )
     );
-    // Add a barely audible tonic sympathetic resonance under the melodic trace:
-    // this is the "pedal" feeling, not another articulated event.
-    mark(
-      resonanceTrace(
-        synth,
-        center,
-        midiToFreq(bassRoot + 12),
-        traceStart + beat * 0.08,
-        traceDuration * 0.92,
-        0.055 * line.resolution
-      )
-    );
-  }
+  });
 
   if (isPhraseEnd || wrapsToStart) {
     // TENSION closing the line: a soft dominant bass (E) only — a falling-fifth
