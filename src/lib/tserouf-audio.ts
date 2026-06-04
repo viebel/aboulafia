@@ -23,6 +23,13 @@ function midiToFreq(midi: number): number {
   return 440 * Math.pow(2, (midi - 69) / 12);
 }
 
+// Keeps a requested start index inside the sequence (and defaults to 0), so the
+// UI can ask playback to begin at an arbitrary clicked word safely.
+export function clampStartIndex(index: number | undefined, length: number): number {
+  if (index === undefined || !Number.isFinite(index)) return 0;
+  return Math.max(0, Math.min(Math.floor(index), length - 1));
+}
+
 function letterToFreq(letter: string): number {
   const index = letter.charCodeAt(0) - 97;
   const offset = SCALE_OFFSETS[index] ?? index * 2;
@@ -77,6 +84,9 @@ export interface TseroufPlayOptions {
   noteSeconds?: number;
   loop?: boolean;
   instrument?: InstrumentId;
+  // Index of the word to start playback from (defaults to 0). Lets the UI
+  // jump into the piece at a clicked word.
+  startIndex?: number;
   onStep?: (wordIndex: number) => void;
   onEnd?: () => void;
 }
@@ -605,15 +615,10 @@ function wordTiming(
   // Steady tempo across the line break so the cadence flows (no ritardando).
   const beat = stepSeconds;
   const span = len * beat;
-  // The dominant lands on the last beat of a line and the tonic on the very
-  // next beat that opens the following line — one steady beat apart, no pause —
-  // so V -> I flows. The only real silence is the breath AFTER the resolution.
-  let pauseBeats: number;
-  if (isPhraseStart) pauseBeats = 2.6; // breathe after the resolution
-  else if (isPhraseEnd) pauseBeats = 0; // flow straight into the next line
-  else if (note.flip !== undefined && note.flip >= 3) pauseBeats = 0.6;
-  else pauseBeats = 0.35;
-  const pause = stepSeconds * pauseBeats;
+  // No pause between words: cells run back-to-back as one continuous stream of
+  // beats, so the rotating accent cycle never loses its pulse. (Cadences are
+  // still shaped by the V -> I bass motion, just without a silent breath.)
+  const pause = 0;
 
   return { len, beat, span, advance: span + pause, isPhraseStart, isPhraseEnd };
 }
@@ -647,14 +652,44 @@ function scheduleWord(
   // Soft attack so the cadence stays inside the texture.
   const SOFT = 0.025;
 
+  // Follow the tabla — and respect its two drums. Lay the steady note stream
+  // onto TEENTAL (16 matras, four vibhags of four), so a four-note word is
+  // exactly one vibhag and four cells complete one cycle. Each matra carries a
+  // bol that is routed to the two hands:
+  //   * baya  (bass / left hand)  -> a low tonic pulse on synth.center,
+  //   * dayan (treble / right hand) -> the pitched melody note (parity voice).
+  // Resonant bols (Dha, Dhin) strike BOTH drums; the khali bols (Na, Tin, Ta)
+  // are dayan-only — the left hand lifts, opening the cycle. Straight matras,
+  // strongest on sam, then the vibhag heads. The grid is global so the tala
+  // carries across cells.
+  //   Dha Dhin Dhin Dha | Dha Dhin Dhin Dha | Na Tin Tin Ta | Ta Dhin Dhin Dha
+  const THEKA: { baya: boolean; stress: number }[] = [
+    { baya: true, stress: 1.0 }, // 1  Dha  (SAM — both hands)
+    { baya: true, stress: 0.5 }, // 2  Dhin
+    { baya: true, stress: 0.5 }, // 3  Dhin
+    { baya: true, stress: 0.58 }, // 4  Dha
+    { baya: true, stress: 0.8 }, // 5  Dha  (vibhag head)
+    { baya: true, stress: 0.5 }, // 6  Dhin
+    { baya: true, stress: 0.5 }, // 7  Dhin
+    { baya: true, stress: 0.58 }, // 8  Dha
+    { baya: false, stress: 0.72 }, // 9  Na   (KHALI — baya lifts)
+    { baya: false, stress: 0.46 }, // 10 Tin
+    { baya: false, stress: 0.46 }, // 11 Tin
+    { baya: false, stress: 0.52 }, // 12 Ta
+    { baya: false, stress: 0.74 }, // 13 Ta   (vibhag head, still baya-less)
+    { baya: true, stress: 0.5 }, // 14 Dhin (baya returns)
+    { baya: true, stress: 0.5 }, // 15 Dhin
+    { baya: true, stress: 0.58 }, // 16 Dha
+  ];
+  const CYCLE = THEKA.length; // 16 matras
+  const matra = (g: number) => ((g % CYCLE) + CYCLE) % CYCLE;
+
   if (isPhraseStart) {
     // RESOLUTION: a single soft tonic bass (A). The falling-fifth E -> A lands
     // here as pure bass motion — no struck chord at all — so the arrival stays
     // completely inside the melodic texture. A slightly longer ring seats it.
+    // (This also serves as the baya stroke on this downbeat.)
     mark(pluckNote(synth, center, midiToFreq(bassRoot), startTime, 0.42, 2.6, SOFT));
-  } else {
-    // Ordinary cell: thumb bass an octave below the first melody note.
-    mark(pluckNote(synth, voice, letterToFreq(letters[0]) / 2, startTime, 0.45, 1.3));
   }
 
   // A line break reverses the whole word, so the last letter of a line becomes
@@ -665,16 +700,51 @@ function scheduleWord(
   const tieFirst =
     isPhraseStart && prevWord.length > 0 && prevWord[prevWord.length - 1] === letters[0];
 
-  // Melody. Rings stay close to one step so notes overlap only lightly (legato);
-  // the last note of a cell sings a little longer.
+  // Strike the theka: straight (un-swung) matras, with each bol routed to its
+  // hand. The global matra index is idx*len + i (words share one length, so
+  // each cell sits squarely on the tala grid).
   letters.forEach((letter, i) => {
-    if (tieFirst && i === 0) return; // note carried over (tied) from prev line
-    const t = startTime + i * beat + (Math.random() - 0.5) * 0.012;
-    const arch = Math.sin((Math.PI * (i + 0.5)) / len);
-    const velocity =
-      (i === 0 ? 0.85 : 0.5 + 0.28 * arch) * (0.94 + Math.random() * 0.12);
-    const ring = i === len - 1 ? 0.9 : beat * 1.5;
-    mark(pluckNote(synth, voice, letterToFreq(letter), t, velocity, ring));
+    const m = matra(idx * len + i);
+    const bol = THEKA[m];
+    const isAccent = bol.stress >= 0.7; // sam + vibhag heads
+    // Straight subdivisions; only a hair of human jitter, kept tight.
+    const t = startTime + i * beat + (Math.random() - 0.5) * 0.008;
+
+    // BAYA (left hand / bass): a low tonic pulse on every resonant bol, silent
+    // on the khali bols so the open half breathes. Skipped on a resolution
+    // downbeat where the cadence bass already covers it.
+    if (bol.baya && !(isPhraseStart && i === 0)) {
+      mark(
+        pluckNote(
+          synth,
+          center,
+          midiToFreq(bassRoot),
+          t,
+          0.3 + 0.12 * bol.stress,
+          beat * (isAccent ? 1.3 : 0.9),
+          SOFT
+        )
+      );
+    }
+
+    // DAYAN (right hand / treble): a CONTINUOUS singing voice. The tala's punch
+    // lives in the baya, so the melody itself keeps its dynamics gentle and is
+    // bound legato — notes overlap their neighbours, and the last note of a cell
+    // rings well into the next word so the previous sound is still alive when the
+    // next word eases in. The first note of each word also gets a softer,
+    // rounded attack so the seam between cells is inaudible (the pentatonic keeps
+    // every overlap consonant).
+    if (tieFirst && i === 0) return;
+    const isWordStart = i === 0;
+    // Gentle dynamics: only a small lift on the tala accents, so the line sings
+    // evenly across word boundaries instead of punching each vibhag head.
+    const velocity = (0.52 + 0.2 * bol.stress) * (0.94 + Math.random() * 0.1);
+    // Round the attack at the seam so the new word swells in under the still-
+    // ringing previous note (legato), rather than re-articulating.
+    const attack = isWordStart ? 0.022 : undefined;
+    // Long, overlapping rings; the cell's last note bridges into the next word.
+    const ring = i === len - 1 ? beat * 2.4 : beat * 1.7;
+    mark(pluckNote(synth, voice, letterToFreq(letter), t, velocity, ring, attack));
   });
 
   if (isPhraseEnd) {
@@ -736,7 +806,7 @@ export class TseroufPlayer {
     this.onStep = options.onStep;
     this.onEnd = options.onEnd;
 
-    this.wordIdx = 0;
+    this.wordIdx = clampStartIndex(options.startIndex, notes.length);
     this.nextWordTime = ctx.currentTime + 0.12;
     this.lastVoiceEnd = this.nextWordTime;
     this.finishedScheduling = false;

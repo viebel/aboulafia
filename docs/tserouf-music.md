@@ -126,6 +126,68 @@ structure:
 - Pauses: tiny lifts inside a line; **the one real silence is the breath after
   a resolution.**
 
+### Following the tabla (Teental)
+
+The pitches change every cell (one permutation each), but the *rhythm* would
+stay flat if every note were stressed the same way. So the engine lays the
+steady note stream onto **Teental** — the classic 16-matra tala of **four
+vibhags of four** — and strikes it like a tabla **theka**. A four-note word is
+exactly **one vibhag**, so four cells complete one full cycle and the tala
+returns to **sam**.
+
+The theka, with each bol routed to one of the **two drums** — the **baya**
+(bass, left hand) and the **dayan** (treble, right hand):
+
+```
+matra:  1    2    3    4  | 5    6    7    8  | 9   10   11  12 | 13  14   15   16
+bol:    Dha  Dhin Dhin Dha| Dha  Dhin Dhin Dha| Na  Tin  Tin Ta | Ta  Dhin Dhin Dha
+baya:   ●    ●    ●    ●  | ●    ●    ●    ●  | ·   ·    ·   ·  | ·   ●    ●    ●
+dayan:  ●    ●    ●    ●  | ●    ●    ●    ●  | ●   ●    ●   ●  | ●   ●    ●    ●
+stress: SAM  .    .    .  | >    .    .    .  | ○   .    .   .  | >   .    .    .
+                                               khali (baya lifts → open)
+```
+
+- **Two-drum roles.** Resonant bols (`Dha`, `Dhin`) strike **both** hands; the
+  khali bols (`Na`, `Tin`, `Ta`) are **dayan-only** — the left hand lifts. In
+  the engine the **dayan** is the pitched melody note (in the parity voice) and
+  the **baya** is a low tonic pulse on the centre voice, struck on every
+  resonant matra and silent through the khali half.
+- **Straight, not swung.** Subdivisions are even and crisp (tabla, not jazz);
+  only a hair of human jitter remains.
+- **Sam** (matra 1) is the strongest stress; the vibhag heads (matras 5, 13)
+  are also accented and ring a touch longer.
+- **Khali** (matras 9–13) is the "empty" wave: the **baya drops out**, so that
+  stretch of the cycle feels open, exactly as the open hand marks khali on the
+  tabla. (The dayan keeps singing — see the continuous voice below — so the
+  openness is carried by the *bass* lifting, not by clipping the melody.)
+- **Global tala.** Because cells run back-to-back with no pause, the matra grid
+  is **global** (`idx*len + i`), so the tala carries across cell boundaries and
+  cycles continuously rather than resetting every word.
+
+### A continuous melodic voice over the tabla
+
+With `len = 4`, every word begins exactly on a vibhag head (matra 1, 5, 9, 13),
+so without care each word boundary would *pop* on an accent and the line would
+sound chopped into cells. To make the melody sing as **one continuous voice**
+over the tabla accompaniment:
+
+- **The punch lives in the baya, not the melody.** The dayan keeps gentle, even
+  dynamics (only a small lift on the tala accents), so the line flows across
+  word boundaries instead of restriking each vibhag head. The *rhythmic* accent
+  is still felt — it's carried by the baya pulse and the stress grid.
+- **Legato overlap.** Notes ring well past their beat and the **last note of a
+  cell bridges into the next word**, so the previous sound is still alive as the
+  next word enters — there is never a gap or a clean hand-off at the seam.
+- **Rounded seam attack.** The first note of each word swells in with a softer
+  attack, easing in under the still-ringing previous note rather than
+  re-articulating.
+- The **pentatonic** is what makes this safe: every overlapping pair of notes is
+  consonant, so generous legato never muddies into dissonance.
+
+The two-part-invention dialog still stands (even = low/left, odd = high/right),
+but the voices now *hand off legato* — the line crosses the octave/pan between
+speakers as a bound phrase, not a series of separate plucks.
+
 ## 6. The cadence — how a line resolves
 
 The hard-won rules (each fixes a specific artifact heard during development):
@@ -171,6 +233,11 @@ The hard-won rules (each fixes a specific artifact heard during development):
   preserved at the loop seam).
 - The currently sounding permutation is **highlighted** in sync (ring colour
   matches the speaking voice: sky for even, rose for odd).
+- **Click any word to start from there.** Each word tile is a play button:
+  clicking (or pressing it with the keyboard) restarts playback at that
+  permutation — a quick way to jump straight into any point of the piece. Both
+  engines accept a `startIndex`, so this works for the melodic invention and
+  the zikr drone alike.
 - **Download audio (WAV):** renders the whole piece offline (one pass, no loop)
   through the same synthesis graph, capped to keep files reasonable for large
   permutation counts.
@@ -180,6 +247,15 @@ The hard-won rules (each fixes a specific artifact heard during development):
 - **Stay in the A-minor pentatonic** — guarantees consonance for *every*
   permutation; never use out-of-scale notes (no raised leading tone).
 - **One permutation = one melodic cell**, played in Zaks order.
+- **Tabla / Teental**: the note stream is struck as a 16-matra theka (four
+  cells = one cycle), strong on sam, with each bol routed to the two drums —
+  **dayan** (treble melody) + **baya** (bass pulse) — and the baya lifting
+  through the khali half; global across cells so the tala cycles rather than
+  resetting every word.
+- **Continuous voice over the tabla**: the dayan sings legato with gentle,
+  even dynamics and overlapping rings (last note bridges into the next word,
+  soft seam attack), so word boundaries are inaudible while the baya carries
+  the rhythmic punch.
 - **Parity = voice**; register (an octave) separates the dialog, pan only
   assists.
 - **Cadence only on the deepest flip** (line boundaries), as a falling-fifth
