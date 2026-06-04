@@ -35,7 +35,7 @@ const DRONE_FREQ = 65.41; // C2
 
 // Letters map to harmonics of the drone (just intonation). Letter a -> 2nd
 // harmonic, b -> 3rd, ... All are perfectly consonant with the ground tone.
-const HARMONICS = [2, 3, 4, 5, 6, 7, 8];
+export const TSEROUF_DRONE_HARMONICS = [2, 3, 4, 5, 6, 7, 8] as const;
 
 // The hum sings these harmonics an octave below the drone's, so it sits very
 // low and dark (≈65–262 Hz) — a wordless "houm/mmm" pulse, not a melody in a
@@ -60,10 +60,26 @@ const VOICE_FORMANTS = [
 // (so the vowel reads as human), but still dark and matte — warmth, not highs.
 const HUM_LOWPASS_HZ = 1900;
 
-function letterToOvertone(letter: string): number {
+export interface TseroufDroneTone {
+  letterIndex: number;
+  harmonic: number;
+  frequency: number;
+  label: string;
+}
+
+export function tseroufDroneTone(letter: string): TseroufDroneTone {
   const index = letter.charCodeAt(0) - 97;
-  const harmonic = HARMONICS[index] ?? index + 2;
-  return VOICE_ROOT * harmonic;
+  const harmonic = TSEROUF_DRONE_HARMONICS[index] ?? index + 2;
+  return {
+    letterIndex: index,
+    harmonic,
+    frequency: VOICE_ROOT * harmonic,
+    label: `${harmonic}x`,
+  };
+}
+
+function letterToOvertone(letter: string): number {
+  return tseroufDroneTone(letter).frequency;
 }
 
 // A glottal-source hum: the fundamental dominates, with a smooth -12 dB/oct
@@ -664,6 +680,11 @@ export class TseroufDronePlayer {
   setNoteSeconds(noteSeconds: number): void {
     this.noteSeconds = noteSeconds;
     if (this.synth) this.synth.noteSeconds = noteSeconds;
+  }
+
+  // Toggles looping for the current playback and future starts.
+  setLoop(loop: boolean): void {
+    this.loop = loop;
   }
 
   stop(): void {

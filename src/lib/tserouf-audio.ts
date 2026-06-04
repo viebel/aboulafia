@@ -16,11 +16,34 @@
 
 // Minor-pentatonic degrees from the root (A C D E G A' C' ...), warm and
 // consonant in any permutation order. Letter a -> degree 0, b -> 1, ...
-const SCALE_OFFSETS = [0, 3, 5, 7, 10, 12, 15];
-const ROOT_MIDI = 57; // A3 — a comfortable classical-guitar register.
+export const TSEROUF_SCALE_OFFSETS = [0, 3, 5, 7, 10, 12, 15] as const;
+export const TSEROUF_ROOT_MIDI = 57; // A3 — a comfortable classical-guitar register.
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 function midiToFreq(midi: number): number {
   return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+export interface TseroufMelodicTone {
+  letterIndex: number;
+  semitone: number;
+  midi: number;
+  frequency: number;
+  label: string;
+}
+
+export function tseroufMelodicTone(letter: string): TseroufMelodicTone {
+  const letterIndex = letter.charCodeAt(0) - 97;
+  const semitone = TSEROUF_SCALE_OFFSETS[letterIndex] ?? letterIndex * 2;
+  const midi = TSEROUF_ROOT_MIDI + semitone;
+  const octave = Math.floor(midi / 12) - 1;
+  return {
+    letterIndex,
+    semitone,
+    midi,
+    frequency: midiToFreq(midi),
+    label: `${NOTE_NAMES[((midi % 12) + 12) % 12]}${octave}`,
+  };
 }
 
 // Keeps a requested start index inside the sequence (and defaults to 0), so the
@@ -31,9 +54,7 @@ export function clampStartIndex(index: number | undefined, length: number): numb
 }
 
 function letterToFreq(letter: string): number {
-  const index = letter.charCodeAt(0) - 97;
-  const offset = SCALE_OFFSETS[index] ?? index * 2;
-  return midiToFreq(ROOT_MIDI + offset);
+  return tseroufMelodicTone(letter).frequency;
 }
 
 function isEvenPermutation(word: string): boolean {
@@ -655,6 +676,17 @@ const DEFAULT_ATTACK: Record<InstrumentId, number> = {
   musicbox: 0.003,
 };
 
+// A tiny, human timing offset. Even a steady player never lands a note exactly
+// on the grid: there is always a few-millisecond push or drag. Summing three
+// random values gives a near-Gaussian jitter clustered around zero (mostly
+// ~±4 ms, rarely up to ~±12 ms) — enough to feel played by a person rather than
+// a sequencer, without ever sounding sloppy. It is applied per note, around the
+// grid position (never accumulated), so the tempo never drifts.
+function humanizeTime(time: number): number {
+  const jitter = ((Math.random() + Math.random() + Math.random()) / 3 - 0.5) * 0.024;
+  return Math.max(0, time + jitter);
+}
+
 // Schedules one note and returns the time it stops sounding.
 function pluckNote(
   synth: Synth,
@@ -666,6 +698,7 @@ function pluckNote(
   attack?: number
 ): number {
   const ctx = synth.ctx;
+  time = humanizeTime(time);
   const isGuitar = synth.instrument === "guitar";
   const src = ctx.createBufferSource();
   // Round-robin: pick one of the guitar's string variants at random per note.
@@ -690,7 +723,9 @@ function pluckNote(
     gain.gain.setValueAtTime(0.0001, time);
     gain.gain.linearRampToValueAtTime(velocity, time + atk);
     gain.gain.setTargetAtTime(0.0001, time + ringSeconds * 0.6, ringSeconds * 0.5);
-    end = time + ringSeconds + 0.2;
+    // Let the exponential release get very quiet before stopping the buffer.
+    // Stopping too soon chops the tail, especially on the final arrival.
+    end = time + ringSeconds * 1.8 + 0.45;
   }
 
   src.connect(gain);
@@ -714,6 +749,47 @@ function pluckNote(
   return end;
 }
 
+function resonanceTrace(
+  synth: Synth,
+  voice: Voice,
+  freq: number,
+  time: number,
+  duration: number,
+  level: number
+): number {
+  const ctx = synth.ctx;
+  const start = Math.max(0, time);
+  const end = start + duration;
+  const env = ctx.createGain();
+  // Pedal-like tail: it is already present when the word releases, then slowly
+  // breathes away. No pluck attack, no late "new note" inside the pause.
+  env.gain.setValueAtTime(level, start);
+  env.gain.linearRampToValueAtTime(level * 0.9, start + duration * 0.35);
+  env.gain.linearRampToValueAtTime(level * 0.45, start + duration * 0.78);
+  env.gain.exponentialRampToValueAtTime(0.0001, end);
+  env.connect(voice.in);
+
+  // A very quiet harmonic "after-image": slow envelope, no pluck transient. It
+  // keeps the pause alive without sounding like a new note was played.
+  for (const [ratio, gain] of [
+    [1, 0.72],
+    [2, 0.22],
+    [3, 0.06],
+  ] as const) {
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = freq * ratio;
+    const og = ctx.createGain();
+    og.gain.value = gain;
+    osc.connect(og);
+    og.connect(env);
+    osc.start(start);
+    osc.stop(end + 0.05);
+  }
+
+  return end + 0.05;
+}
+
 interface WordTiming {
   len: number;
   beat: number;
@@ -723,12 +799,18 @@ interface WordTiming {
   isPhraseEnd: boolean;
 }
 
+// The line boundary itself is legato: the common note is tied over. The breath
+// belongs AFTER the first word of the new line (the resolution word), before the
+// second word launches the line proper.
+const AFTER_RESOLUTION_BREATH_BEATS = 0.38;
+
 // Pure timing for one word — shared by audio scheduling and the duration
 // estimate used to size the offline render buffer.
 function wordTiming(
   notes: TseroufNote[],
   idx: number,
-  stepSeconds: number
+  stepSeconds: number,
+  isOpeningReturn = false
 ): WordTiming {
   const note = notes[idx];
   const len = note.word.length;
@@ -743,12 +825,99 @@ function wordTiming(
   // Steady tempo across the line break so the cadence flows (no ritardando).
   const beat = stepSeconds;
   const span = len * beat;
-  // No pause between words: cells run back-to-back as one continuous stream of
-  // beats, so the rotating accent cycle never loses its pulse. (Cadences are
-  // still shaped by the V -> I bass motion, just without a silent breath.)
-  const pause = 0;
+  // Inside a line and across the line boundary, cells run legato. The short
+  // breath comes after the first word of a line, except at the very beginning of
+  // the whole piece where that first word should simply begin.
+  const pause =
+    isPhraseStart && (idx > 0 || isOpeningReturn)
+      ? beat * AFTER_RESOLUTION_BREATH_BEATS
+      : 0;
 
   return { len, beat, span, advance: span + pause, isPhraseStart, isPhraseEnd };
+}
+
+interface WordGrooveStep {
+  velocity: number;
+  ring: number;
+  bass: number;
+  time: number;
+}
+
+// Gives every permutation a real word-level rhythmic shape, not just a stream
+// of equal notes. The visual parity colours become MUSICAL colours:
+//   * blue/even words are grounded: stronger downbeat, longer tail, steadier.
+//   * rose/odd words are lifted: syncopated inner accents and a slight forward
+//     lean on offbeats, like an answer pushing back.
+function wordGrooveStep(
+  i: number,
+  len: number,
+  isBlue: boolean,
+  wordIndex: number
+): WordGrooveStep {
+  const pos = len <= 1 ? 0 : i / (len - 1);
+  const phrase = wordIndex % 4;
+  if (isBlue) {
+    const downbeat = i === 0 ? 1.18 : 1;
+    const tail = i === len - 1 ? 1.1 : 1;
+    const wave = 1 + 0.06 * Math.cos(2 * Math.PI * (pos + phrase * 0.08));
+    return {
+      velocity: downbeat * tail * wave,
+      ring: i === 0 ? 1.12 : i === len - 1 ? 1.18 : 0.95,
+      bass: i === 0 ? 1.18 : i === len - 1 ? 1.08 : 0.96,
+      time: i === 0 ? -0.01 : 0,
+    };
+  }
+
+  const upbeat = i === 1 || i === len - 1 ? 1.16 : 1;
+  const firstLight = i === 0 ? 0.9 : 1;
+  const wave = 1 + 0.07 * Math.sin(2 * Math.PI * (pos + 0.22 + phrase * 0.07));
+  return {
+    velocity: firstLight * upbeat * wave,
+    ring: i === 0 ? 0.9 : i === len - 1 ? 1.22 : 1.02,
+    bass: i === 0 ? 0.88 : i === len - 1 ? 1.12 : 1,
+    time: i % 2 === 1 ? 0.018 : -0.004,
+  };
+}
+
+function smallFactorial(n: number): number {
+  let r = 1;
+  for (let i = 2; i <= n; i++) r *= i;
+  return r;
+}
+
+interface LineGroove {
+  velocity: number;
+  ring: number;
+  bass: number;
+  resolution: number;
+  tension: number;
+  wordInLine: number;
+  lineWords: number;
+}
+
+// The next musical level above the word: one visible Tserouf line is (n-1)!
+// words — for abcd, 6 words. Give that whole line an audible arc:
+// arrival -> relaxation -> build -> crest -> tension into the next line.
+function lineGroove(wordIndex: number, wordLength: number): LineGroove {
+  const lineWords = Math.max(1, smallFactorial(Math.max(1, wordLength - 1)));
+  const wordInLine = wordIndex % lineWords;
+  const pos = lineWords <= 1 ? 0 : wordInLine / (lineWords - 1);
+  const arc = Math.sin(Math.PI * pos); // broad phrase swell, peak mid/late line
+  const arrival = wordInLine === 0 ? 1 : 0;
+  const launch = wordInLine === 1 ? 1 : 0;
+  const ending = wordInLine === lineWords - 1 ? 1 : 0;
+  const crest = wordInLine === Math.max(0, lineWords - 2) ? 1 : 0;
+
+  return {
+    velocity:
+      0.96 + 0.16 * arc + 0.08 * arrival + 0.14 * launch + 0.08 * crest - 0.06 * ending,
+    ring: 0.96 + 0.12 * arc + 0.32 * arrival + 0.08 * launch + 0.08 * crest - 0.08 * ending,
+    bass: 0.92 + 0.14 * arc + 0.24 * arrival + 0.12 * launch + 0.1 * crest - 0.12 * ending,
+    resolution: 1 + 0.35 * arrival,
+    tension: 1 + 0.28 * ending,
+    wordInLine,
+    lineWords,
+  };
 }
 
 // Schedules a single melodic cell and returns how far to advance and the time
@@ -758,20 +927,26 @@ function scheduleWord(
   notes: TseroufNote[],
   idx: number,
   startTime: number,
-  stepSeconds: number
+  stepSeconds: number,
+  options: { isOpeningReturn?: boolean; wrapsToStart?: boolean } = {}
 ): { advance: number; end: number } {
   const note = notes[idx];
   const letters = Array.from(note.word);
+  const isOpeningReturn = options.isOpeningReturn ?? false;
+  const wrapsToStart = options.wrapsToStart ?? false;
   const { len, beat, advance, isPhraseStart, isPhraseEnd } = wordTiming(
     notes,
     idx,
-    stepSeconds
+    stepSeconds,
+    isOpeningReturn
   );
 
-  const voice = isEvenPermutation(note.word) ? synth.even : synth.odd;
+  const isBlueWord = isEvenPermutation(note.word);
+  const voice = isBlueWord ? synth.even : synth.odd;
   const center = synth.center;
-  const root = ROOT_MIDI;
-  const bassRoot = root - 12;
+  const bassRoot = TSEROUF_ROOT_MIDI - 12;
+  const line = lineGroove(idx, len);
+  const cycleArrival = isOpeningReturn ? 1.26 : 1;
   let end = startTime;
   const mark = (t: number) => {
     if (t > end) end = t;
@@ -817,14 +992,26 @@ function scheduleWord(
     // here as pure bass motion — no struck chord at all — so the arrival stays
     // completely inside the melodic texture. A slightly longer ring seats it.
     // (This also serves as the baya stroke on this downbeat.)
-    mark(pluckNote(synth, center, midiToFreq(bassRoot), startTime, 0.42, 2.6, SOFT));
+    // On loop return, the first word of the whole piece is the real culmination.
+    mark(
+      pluckNote(
+        synth,
+        center,
+        midiToFreq(bassRoot),
+        startTime,
+        0.55 * line.resolution * cycleArrival,
+        3.4 * line.ring * (isOpeningReturn ? 1.35 : 1),
+        SOFT
+      )
+    );
   }
 
   // A line break reverses the whole word, so the last letter of a line becomes
   // the first of the next (…adcb -> bcda…). Rather than restrike that repeated
   // note, tie it over: skip the new line's first note and let the previous
   // one ring through the downbeat where the resolution lands.
-  const prevWord = idx > 0 ? notes[idx - 1].word : "";
+  const prevWord =
+    idx > 0 ? notes[idx - 1].word : isOpeningReturn ? notes[notes.length - 1].word : "";
   const tieFirst =
     isPhraseStart && prevWord.length > 0 && prevWord[prevWord.length - 1] === letters[0];
 
@@ -835,8 +1022,10 @@ function scheduleWord(
     const m = matra(idx * len + i);
     const bol = THEKA[m];
     const isAccent = bol.stress >= 0.7; // sam + vibhag heads
-    // Straight subdivisions; only a hair of human jitter, kept tight.
-    const t = startTime + i * beat + (Math.random() - 0.5) * 0.008;
+    const groove = wordGrooveStep(i, len, isBlueWord, idx);
+    // Straight subdivisions on the grid; the human micro-timing is added
+    // per-strike inside pluckNote, so both the bass and the melody breathe.
+    const t = startTime + i * beat + groove.time * beat;
 
     // BAYA (left hand / bass): a low tonic pulse on every resonant bol, silent
     // on the khali bols so the open half breathes. Skipped on a resolution
@@ -848,8 +1037,8 @@ function scheduleWord(
           center,
           midiToFreq(bassRoot),
           t,
-          0.3 + 0.12 * bol.stress,
-          beat * (isAccent ? 1.3 : 0.9),
+          (0.3 + 0.12 * bol.stress) * groove.bass * line.bass,
+          beat * (isAccent ? 1.3 : 0.9) * line.ring,
           SOFT
         )
       );
@@ -866,22 +1055,84 @@ function scheduleWord(
     const isWordStart = i === 0;
     // Gentle dynamics: only a small lift on the tala accents, so the line sings
     // evenly across word boundaries instead of punching each vibhag head.
-    const velocity = (0.52 + 0.2 * bol.stress) * (0.94 + Math.random() * 0.1);
+    // On top of that, a player leans into the odd note for expression: a random
+    // dynamic accent that does NOT follow the metric grid (~14% of notes get a
+    // gentle push), so the line has living, unpredictable emphasis. Since
+    // velocity also drives the guitar's brightness, an accent rings a touch
+    // brighter as well as louder — exactly like a stronger pluck.
+    const accent = Math.random() < 0.14 ? 1.22 + Math.random() * 0.16 : 1;
+    const velocity = Math.min(
+      0.98,
+      (0.52 + 0.2 * bol.stress) *
+        groove.velocity *
+        line.velocity *
+        cycleArrival *
+        (0.94 + Math.random() * 0.1) *
+        accent
+    );
     // Round the attack at the seam so the new word swells in under the still-
     // ringing previous note (legato), rather than re-articulating.
     const attack = isWordStart ? 0.022 : undefined;
     // Long, overlapping rings; the cell's last note bridges into the next word.
-    const ring = i === len - 1 ? beat * 2.4 : beat * 1.7;
+    const boundaryTail = (isPhraseEnd || wrapsToStart) && i === len - 1 ? 1.75 : 1;
+    const resolutionTrace = isPhraseStart && i === len - 1 ? 1.65 : 1;
+    const ring =
+      (i === len - 1 ? beat * 2.4 : beat * 1.7) *
+      groove.ring *
+      line.ring *
+      boundaryTail *
+      resolutionTrace;
     mark(pluckNote(synth, voice, letterToFreq(letter), t, velocity, ring, attack));
   });
 
-  if (isPhraseEnd) {
+  if (isPhraseStart && (idx > 0 || isOpeningReturn)) {
+    // Fill the post-resolution breath with a living trace instead of freezing on
+    // the last melody note: a slow, quiet resonance of the word's final pitch
+    // that starts where the word ends and carries into the launch of word 2.
+    const traceStart = startTime + len * beat - beat * 0.28;
+    const traceDuration = beat * (AFTER_RESOLUTION_BREATH_BEATS + 1.05);
+    const finalLetter = letters[letters.length - 1];
+    mark(
+      resonanceTrace(
+        synth,
+        voice,
+        letterToFreq(finalLetter),
+        traceStart,
+        traceDuration,
+        0.11 * line.resolution
+      )
+    );
+    // Add a barely audible tonic sympathetic resonance under the melodic trace:
+    // this is the "pedal" feeling, not another articulated event.
+    mark(
+      resonanceTrace(
+        synth,
+        center,
+        midiToFreq(bassRoot + 12),
+        traceStart + beat * 0.08,
+        traceDuration * 0.92,
+        0.055 * line.resolution
+      )
+    );
+  }
+
+  if (isPhraseEnd || wrapsToStart) {
     // TENSION closing the line: a soft dominant bass (E) only — a falling-fifth
     // E -> A into the next line's tonic. No raised leading tone (G#): it lives
     // outside the minor pentatonic and clashed with the natural melody notes,
     // which is what sounded out of tune. The bass motion carries the cadence.
     const tEnd = startTime + (len - 1) * beat;
-    mark(pluckNote(synth, center, midiToFreq(bassRoot + 7), tEnd, 0.34, 1.2, SOFT));
+    mark(
+      pluckNote(
+        synth,
+        center,
+        midiToFreq(bassRoot + 7),
+        tEnd,
+        0.46 * line.tension,
+        1.7 * line.ring,
+        SOFT
+      )
+    );
   }
 
   return { advance, end };
@@ -889,6 +1140,8 @@ function scheduleWord(
 
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.3;
+const LOOP_RETURN_PAUSE_SECONDS = 0;
+const FINAL_TAIL_SECONDS = 0.9;
 
 export class TseroufPlayer {
   private ctx: AudioContext | null = null;
@@ -906,6 +1159,7 @@ export class TseroufPlayer {
   private nextWordTime = 0;
   private lastVoiceEnd = 0;
   private finishedScheduling = false;
+  private hasLoopedToStart = false;
   private playing = false;
   private paused = false;
 
@@ -938,6 +1192,7 @@ export class TseroufPlayer {
     this.nextWordTime = ctx.currentTime + 0.12;
     this.lastVoiceEnd = this.nextWordTime;
     this.finishedScheduling = false;
+    this.hasLoopedToStart = false;
     this.uiQueue = [];
     this.playing = true;
     this.paused = false;
@@ -977,6 +1232,11 @@ export class TseroufPlayer {
     this.stepSeconds = stepSeconds;
   }
 
+  // Toggles looping for the current playback and future starts.
+  setLoop(loop: boolean): void {
+    this.loop = loop;
+  }
+
   stop(): void {
     if (this.timer !== null) {
       window.clearInterval(this.timer);
@@ -992,7 +1252,7 @@ export class TseroufPlayer {
         const gain = this.synth.master.gain;
         gain.cancelScheduledValues(now);
         gain.setValueAtTime(gain.value, now);
-        gain.linearRampToValueAtTime(0.0001, now + 0.06);
+        gain.linearRampToValueAtTime(0.0001, now + 0.25);
       }
     }
   }
@@ -1037,7 +1297,11 @@ export class TseroufPlayer {
         this.notes,
         this.wordIdx,
         this.nextWordTime,
-        this.stepSeconds
+        this.stepSeconds,
+        {
+          isOpeningReturn: this.wordIdx === 0 && this.hasLoopedToStart,
+          wrapsToStart: this.loop && this.wordIdx === this.notes.length - 1,
+        }
       );
       if (end > this.lastVoiceEnd) this.lastVoiceEnd = end;
       this.uiQueue.push({ time: this.nextWordTime, wordIndex: this.wordIdx });
@@ -1053,9 +1317,11 @@ export class TseroufPlayer {
     }
 
     if (this.finishedScheduling && this.loop) {
-      // Queue the next pass. nextWordTime already carries the closing breath,
-      // so the loop seam keeps the rhythm; ringing tails overlap naturally.
+      // Queue the next pass on the structural grid: no breath at the line
+      // boundary. The common note is tied/lengthened instead of being repeated.
+      this.nextWordTime += LOOP_RETURN_PAUSE_SECONDS;
       this.wordIdx = 0;
+      this.hasLoopedToStart = true;
       this.finishedScheduling = false;
       return;
     }
@@ -1063,7 +1329,7 @@ export class TseroufPlayer {
     if (
       this.finishedScheduling &&
       this.uiQueue.length === 0 &&
-      ctx.currentTime >= this.lastVoiceEnd
+      ctx.currentTime >= this.lastVoiceEnd + FINAL_TAIL_SECONDS
     ) {
       const onEnd = this.onEnd;
       this.stop();

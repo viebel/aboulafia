@@ -8,6 +8,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -20,10 +21,17 @@ import { factorial, key, type Perm } from "@/lib/pancake";
 import {
   INSTRUMENTS,
   renderTseroufWav,
+  tseroufMelodicTone,
+  TSEROUF_SCALE_OFFSETS,
   TseroufPlayer,
   type InstrumentId,
 } from "@/lib/tserouf-audio";
-import { renderTseroufDroneWav, TseroufDronePlayer } from "@/lib/tserouf-drone";
+import {
+  renderTseroufDroneWav,
+  tseroufDroneTone,
+  TSEROUF_DRONE_HARMONICS,
+  TseroufDronePlayer,
+} from "@/lib/tserouf-drone";
 import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
 import { toPng } from "html-to-image";
 import {
@@ -39,6 +47,7 @@ import { useTheme } from "next-themes";
 import {
   createContext,
   Fragment,
+  type CSSProperties,
   useCallback,
   useContext,
   useEffect,
@@ -126,6 +135,7 @@ interface TseroufState {
   letterSet: LetterSet;
   instrument: SoundChoice;
   speed: number;
+  loop: boolean;
 }
 
 function readTseroufState(params: URLSearchParams | null): TseroufState {
@@ -138,20 +148,21 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     DEFAULT_INSTRUMENT
   );
   const speed = readIntParam(params, "speed", SPEED_OPTIONS, DEFAULT_SPEED);
+  const loop = readEnumParam(params, "loop", ["0", "1"], "0") === "1";
 
   // The "elohim" set is a fixed 5-letter Hebrew word, so it pins n and alphabet.
   if (letterSet === "elohim") {
-    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, speed };
+    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, speed, loop };
   }
 
   // The "amash" set is the three mother letters, a fixed 3-letter Hebrew word.
   if (letterSet === "amash") {
-    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, speed };
+    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, speed, loop };
   }
 
   // The "yhw" set is a fixed 3-letter Hebrew word.
   if (letterSet === "yhw") {
-    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, speed };
+    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, speed, loop };
   }
 
   return {
@@ -161,6 +172,7 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     letterSet,
     instrument,
     speed,
+    loop,
   };
 }
 
@@ -185,6 +197,16 @@ const PlayingWordContext = createContext<string | null>(null);
 
 // Clicking a word starts playback from it; tiles call this with their word.
 const PlayWordContext = createContext<((word: string) => void) | null>(null);
+
+interface TonePreviewSettings {
+  kind: SoundKind;
+  playState: "stopped" | "playing" | "paused";
+}
+
+const TonePreviewContext = createContext<TonePreviewSettings>({
+  kind: "invention",
+  playState: "stopped",
+});
 
 interface EdgeSpec {
   path: string;
@@ -225,6 +247,7 @@ export function TseroufView() {
   const [letterSet, setLetterSet] = useState<LetterSet>(initial.letterSet);
   const [instrument, setInstrument] = useState<SoundChoice>(initial.instrument);
   const [speed, setSpeed] = useState<number>(initial.speed);
+  const [loopPlayback, setLoopPlayback] = useState<boolean>(initial.loop);
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
@@ -281,8 +304,9 @@ export function TseroufView() {
       layout,
       instrument,
       speed: String(speed),
+      loop: loopPlayback ? "1" : null,
     });
-  }, [n, alphabet, layout, letterSet, instrument, speed]);
+  }, [n, alphabet, layout, letterSet, instrument, speed, loopPlayback]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -395,7 +419,7 @@ export function TseroufView() {
         : "Playing the music of Tserouf…"
     );
     playerRef.current.play(words, {
-      loop: true,
+      loop: loopPlayback,
       startIndex,
       instrument: kind === "invention" ? (instrument as InstrumentId) : undefined,
       stepSeconds: stepSecondsForSpeed(speed),
@@ -428,7 +452,7 @@ export function TseroufView() {
     // startPlayback closes over current controls but is stable enough here;
     // wordIndexMap changes whenever the sequence does.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [wordIndexMap, instrument, speed, words]
+    [wordIndexMap, instrument, loopPlayback, speed, words]
   );
 
   const togglePlay = () => {
@@ -474,6 +498,12 @@ export function TseroufView() {
     }
   };
 
+  const setLoopPlaybackEnabled = (next: boolean) => {
+    setLoopPlayback(next);
+    playerRef.current?.setLoop(next);
+    setStatus(next ? "Loop enabled." : "Loop disabled.");
+  };
+
   const downloadAudio = async () => {
     if (words.length === 0) return;
     setRenderingAudio(true);
@@ -508,7 +538,8 @@ export function TseroufView() {
 
   // Stop any playback when the sequence changes or the view unmounts.
   useEffect(() => {
-    stopPlayback();
+    const id = window.setTimeout(() => stopPlayback(), 0);
+    return () => window.clearTimeout(id);
   }, [words, stopPlayback]);
 
   useEffect(() => {
@@ -720,6 +751,34 @@ export function TseroufView() {
             />
           </div>
 
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Playback
+            </Label>
+            <div className="flex items-center justify-between rounded-md border px-3 py-2">
+              <Label
+                htmlFor="tserouf-loop-toggle"
+                className="cursor-pointer text-sm font-normal"
+              >
+                Loop after final arrival
+              </Label>
+              <div className="flex items-center gap-2">
+                <span className="text-xs uppercase tracking-wider text-muted-foreground">
+                  {loopPlayback ? "On" : "Off"}
+                </span>
+                <Checkbox
+                  id="tserouf-loop-toggle"
+                  checked={loopPlayback}
+                  disabled={running || words.length === 0}
+                  onCheckedChange={(checked) =>
+                    setLoopPlaybackEnabled(checked === true)
+                  }
+                  aria-label="Toggle playback loop"
+                />
+              </div>
+            </div>
+          </div>
+
           <div className="flex gap-2">
             <Button
               type="button"
@@ -799,13 +858,20 @@ export function TseroufView() {
             <HebrewLettersContext.Provider value={hebrewLetters}>
               <PlayingWordContext.Provider value={playingWord}>
                 <PlayWordContext.Provider value={playFromWord}>
-                  <div ref={renderRef} className="p-2 font-mono text-sm">
-                    {layout === "tree" ? (
-                      <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
-                    ) : (
-                      <FlatWordsView words={words} alphabet={alphabet} n={n} />
-                    )}
-                  </div>
+                  <TonePreviewContext.Provider
+                    value={{
+                      kind: soundKindFor(instrument),
+                      playState,
+                    }}
+                  >
+                    <div ref={renderRef} className="p-2 font-mono text-sm">
+                      {layout === "tree" ? (
+                        <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
+                      ) : (
+                        <FlatWordsView words={words} alphabet={alphabet} n={n} />
+                      )}
+                    </div>
+                  </TonePreviewContext.Provider>
                 </PlayWordContext.Provider>
               </PlayingWordContext.Provider>
             </HebrewLettersContext.Provider>
@@ -1322,6 +1388,7 @@ function WordTile({
   const register = useContext(TileRegisterContext);
   const playingWord = useContext(PlayingWordContext);
   const playWord = useContext(PlayWordContext);
+  const tonePreview = useContext(TonePreviewContext);
   const word = item.word;
   const isActive = playingWord === word;
   const elRef = useRef<HTMLSpanElement | null>(null);
@@ -1356,10 +1423,14 @@ function WordTile({
       }
       title={
         playWord
-          ? `Play from here · ${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`
-          : `${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`
+          ? `Play from here · ${tonePreviewTitle(item.word, tonePreview.kind)} · ${
+              isEvenPermutationWord(item.word) ? "Even" : "Odd"
+            } permutation`
+          : `${tonePreviewTitle(item.word, tonePreview.kind)} · ${
+              isEvenPermutationWord(item.word) ? "Even" : "Odd"
+            } permutation`
       }
-      className={`inline-flex rounded-md border px-1.5 py-0.5 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] ${
+      className={`inline-flex flex-col items-stretch rounded-md border px-1.5 py-1 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] ${
         playWord
           ? "cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
           : ""
@@ -1377,13 +1448,123 @@ function WordTile({
           : "font-[family-name:var(--font-mystic)]"
       }`}
     >
-      {Array.from(item.word).map((letter, index) => (
-        <span key={index} className={letterClassName(stable, index)}>
-          {displayLetter(letter, alphabet, hebrewLetters)}
-        </span>
-      ))}
+      <span className="inline-flex justify-center">
+        {Array.from(item.word).map((letter, index) => (
+          <span key={index} className={letterClassName(stable, index)}>
+            {displayLetter(letter, alphabet, hebrewLetters)}
+          </span>
+        ))}
+      </span>
+      <TonalPreview
+        word={word}
+        kind={tonePreview.kind}
+        active={isActive && tonePreview.playState === "playing"}
+      />
     </span>
   );
+}
+
+function TonalPreview({
+  word,
+  kind,
+  active,
+}: {
+  word: string;
+  kind: SoundKind;
+  active: boolean;
+}) {
+  const tones = tonePreviewTones(word, kind);
+  if (tones.length === 0) return null;
+
+  const width = Math.max(42, tones.length * 13);
+  const height = 30;
+  const xFor = (index: number) =>
+    tones.length === 1 ? width / 2 : 5 + (index * (width - 10)) / (tones.length - 1);
+  const points = tones.map((tone, index) => `${xFor(index)},${tone.y}`).join(" ");
+
+  return (
+    <span
+      dir="ltr"
+      aria-hidden
+      className="relative mx-auto mt-0.5 block overflow-hidden rounded-sm bg-background/35"
+      style={
+        {
+          width,
+          height,
+        } as CSSProperties
+      }
+    >
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="h-full w-full overflow-visible"
+        preserveAspectRatio="xMidYMid meet"
+      >
+        <polyline
+          points={points}
+          fill="none"
+          stroke="currentColor"
+          strokeOpacity="0.45"
+          strokeWidth="1.4"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        {tones.map((tone, index) => (
+          <circle
+            key={`${tone.label}-${index}`}
+            cx={xFor(index)}
+            cy={tone.y}
+            r={active ? 2.2 : 1.7}
+            fill="currentColor"
+            opacity={active ? 0.95 : 0.55}
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
+      </svg>
+    </span>
+  );
+}
+
+function tonePreviewTones(
+  word: string,
+  kind: SoundKind
+): { y: number; label: string }[] {
+  const letters = Array.from(word);
+  const maxLetterIndex = Math.max(
+    0,
+    ...letters.map((letter) => letter.charCodeAt(0) - 97)
+  );
+  const melodicMax =
+    TSEROUF_SCALE_OFFSETS[maxLetterIndex] ?? maxLetterIndex * 2;
+  const droneMax = Math.log2(
+    TSEROUF_DRONE_HARMONICS[maxLetterIndex] ?? maxLetterIndex + 2
+  );
+  const range = kind === "drone" ? [Math.log2(2), droneMax] : [0, melodicMax];
+
+  return letters.map((letter) => {
+    const value =
+      kind === "drone"
+        ? Math.log2(tseroufDroneTone(letter).harmonic)
+        : tseroufMelodicTone(letter).semitone;
+    const [min, max] = range;
+    const norm = max === min ? 0.5 : (value - min) / (max - min);
+    return {
+      y: 25 - norm * 20,
+      label:
+        kind === "drone"
+          ? tseroufDroneTone(letter).label
+          : tseroufMelodicTone(letter).label,
+    };
+  });
+}
+
+function tonePreviewTitle(word: string, kind: SoundKind): string {
+  const labels = Array.from(word).map((letter) =>
+    kind === "drone" ? tseroufDroneTone(letter).label : tseroufMelodicTone(letter).label
+  );
+  return kind === "drone"
+    ? `Overtone contour: ${labels.join(" -> ")}`
+    : `Tone contour: ${labels.join(" -> ")}`;
 }
 
 function FlipConnector({ value }: { value?: number }) {
