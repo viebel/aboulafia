@@ -15,6 +15,8 @@ import {
   factorial,
   forEachZaksFundamentalEdge,
   zaksBlock0,
+  zaksRank,
+  zaksUnrank,
   type PancakeGraph,
   type QuotientGraph,
 } from "./pancake";
@@ -28,6 +30,20 @@ import {
  */
 export type ParityMode = "off" | "both" | "even" | "odd";
 export type EdgeRenderMode = "line" | "density";
+
+/**
+ * Tone-mapping for the Yankelovich density field:
+ *   - "log"      → log1p + percentile white point + gamma (fixed global curve).
+ *   - "equalize" → histogram equalization: scale-free, depends only on the
+ *                  density *rank*, so it uses the full range at any n and reveals
+ *                  the caustic/void web the log curve crushes at large n.
+ *   - "clahe"    → contrast-limited adaptive (local) equalization: per-tile
+ *                  equalization bilinearly blended, so dense centre and sparse
+ *                  rim both keep local contrast.
+ */
+export type YankelovichTone = "log" | "equalize" | "clahe";
+/** Color ramp applied to the normalized Yankelovich tone. */
+export type YankelovichColormap = "gray" | "viridis" | "magma" | "inferno";
 
 /**
  * Color scheme for the Symmetry renderer, used to visualize the dihedral (Dₙ)
@@ -61,6 +77,22 @@ export interface RenderSettings {
   showLabels: boolean;
   parityMode: ParityMode;
   edgeMode?: EdgeRenderMode;
+  /**
+   * Tone-mapping exponent control for the Yankelovich density-field renderer,
+   * as a 1..100 slider (50 ≈ neutral γ = 1). Lower values reveal the faint
+   * chord envelopes; higher values keep only the brightest caustics.
+   */
+  yankelovichGamma?: number;
+  /**
+   * Invert the Yankelovich grayscale: default is bright chords on a black field
+   * (additive "long exposure"); when true it draws dark chords on white (an ink
+   * / pen look that matches the app's light theme). Defaults to false.
+   */
+  yankelovichInvert?: boolean;
+  /** Yankelovich tone-mapping mode (defaults to "log"). */
+  yankelovichTone?: YankelovichTone;
+  /** Yankelovich color ramp (defaults to "gray"). */
+  yankelovichColormap?: YankelovichColormap;
   /** Generator ids whose edges should be skipped at render time. */
   hiddenGenerators: number[];
   /** Symmetry-renderer color scheme (defaults to "parity"). */
@@ -101,6 +133,18 @@ export interface RenderSettings {
   vertexOrbitParts?: OrbitParts;
   /** Restrict the vertex-orbit overlay to the long full-reversal rₙ edges. */
   vertexOrbitLongOnly?: boolean;
+  /**
+   * Recursion level m of the dihedral tower D₃ ⊂ … ⊂ Dₙ to draw the orbit at
+   * (3…n). m = n is the global Dₙ orbit (the whole disk); smaller m shows the
+   * intra-block Dₘ orbit, which lives inside an ever-smaller Zaks sub-block.
+   * Defaults to n.
+   */
+  vertexOrbitLevel?: number;
+  /**
+   * Draw every level from n down to {@link vertexOrbitLevel} at once, each
+   * colored by its recursion depth — the whole nested tower in one figure.
+   */
+  vertexOrbitStack?: boolean;
   /**
    * A single chosen edge {orbitEdgeA, orbitEdgeB} to seed the orbit from
    * (clicking a chord). When set (both ≥ 0) it overrides the vertex's incident
@@ -218,6 +262,17 @@ export function edgeWidthToSlider(width: number): number {
   return clamp(Math.round(t * 100), 1, 100);
 }
 
+/**
+ * Map the Yankelovich gamma slider (1..100) to a tone-mapping exponent applied
+ * after the log-normalized density. Slider 50 is the neutral γ = 1; below it the
+ * exponent drops toward ~0.13 (faint envelopes bloom up), above it it climbs to
+ * ~8 (only the brightest caustics survive).
+ */
+export function sliderToYankelovichGamma(slider: number): number {
+  const s = clamp(slider, 1, 100);
+  return Math.pow(8, (s - 50) / 50);
+}
+
 function constantsFor(n: number, scale: number): SizingConstants {
   // For n >= 8 the per-segment arc length on the cycle is tiny, so we
   // need a thicker stroke to actually see the perimeter at typical
@@ -241,7 +296,20 @@ function point(i: number, total: number, c: number, r: number): [number, number]
  * them, so it should be sized like a permutation graph of order 2n.
  */
 function sizingN(graph: PancakeGraph): number {
-  return graph.kind === "sliding-puzzle" ? 2 * graph.n : graph.n;
+  if (graph.kind === "sliding-puzzle") return 2 * graph.n;
+  // The Sierpiński graph has 3ⁿ vertices, far fewer than n! at large n, so size
+  // it like the permutation graph whose order is closest from below (m! ≤ 3ⁿ).
+  if (graph.kind === "sierpinski") {
+    const v = 3 ** graph.n;
+    let m = 1;
+    let f = 1;
+    while (f * (m + 1) <= v) {
+      m++;
+      f *= m;
+    }
+    return Math.max(3, m);
+  }
+  return graph.n;
 }
 
 /* --------------------------- dihedral symmetry ---------------------------- */
@@ -1235,6 +1303,100 @@ function vertexSeedEdges(
   return longOnly ? all.filter((e) => e[2] === n) : all;
 }
 
+// Hue per recursion level m of the dihedral tower (depth = n − m). The top
+// level keeps the violet of the single-level orbit; deeper levels cycle a
+// distinct palette so adjacent levels read apart. Hex (not hsl) so withAlpha /
+// lightenHex apply.
+const LEVEL_COLORS: readonly string[] = [
+  "#7c3aed", // depth 0 (m = n) — violet-600, matches the classic vertex orbit
+  "#ea580c", // orange-600
+  "#0891b2", // cyan-600
+  "#16a34a", // green-600
+  "#db2777", // pink-600
+  "#ca8a04", // yellow-600
+  "#2563eb", // blue-600
+  "#dc2626", // red-600
+  "#0d9488", // teal-600
+];
+
+/** Color for a chord generated at recursion level m (Dₘ); the mirror image is
+ *  drawn in a lighter tint of the same hue. */
+export function levelColor(m: number, n: number, mirror = false): string {
+  const depth = Math.max(0, Math.min(LEVEL_COLORS.length - 1, n - m));
+  const base = LEVEL_COLORS[depth];
+  return mirror ? lightenHex(base, 0.5) : base;
+}
+
+/** Active recursion levels for the vertex-orbit overlay: a single chosen level
+ *  m, or — when stacking — the whole chain n, n−1, …, m. */
+function orbitLevels(settings: RenderSettings, n: number): number[] {
+  const level = clamp(Math.round(settings.vertexOrbitLevel ?? n), 3, n);
+  if (!(settings.vertexOrbitStack ?? false)) return [level];
+  const out: number[] = [];
+  for (let m = n; m >= level; m--) out.push(m);
+  return out;
+}
+
+/** A single chord drawn by the vertex-orbit overlay, tagged with the recursion
+ *  level it was generated at, its rotation step within that level, and whether
+ *  it is the reflection (mirror) image. */
+interface OrbitSegment {
+  a: number;
+  b: number;
+  level: number;
+  step: number;
+  mirror: boolean;
+}
+
+/**
+ * Orbit of the seed chords under the nested dihedral tower D₃ ⊂ … ⊂ Dₙ of the
+ * Zaks layout. For each requested level m, a chord lying inside a single
+ * size-m! block is rotated within that block (offset ↦ offset + (m−1)! mod m!,
+ * the Cₘ action) and, when reflections are on, mirrored inside it
+ * (offset ↦ m!−1−offset). Level m = n is the global Dₙ orbit (block = whole
+ * disk, the classic single-level view). A chord that straddles a size-m! block
+ * is skipped at that level — it is an rₖ connector that glues sub-blocks
+ * (k > m), so it belongs to a coarser level.
+ */
+function nestedOrbitSegments(
+  seed: IncidentEdge[],
+  n: number,
+  total: number,
+  levels: number[],
+  showRot: boolean,
+  showRef: boolean
+): OrbitSegment[] {
+  const out: OrbitSegment[] = [];
+  for (const m of levels) {
+    const S = factorial(m);
+    const sub = S / m; // (m−1)!
+    for (const [a, b] of seed) {
+      const block = Math.floor(a / S);
+      if (block !== Math.floor(b / S)) continue; // cross-block at this level
+      const start = block * S;
+      const oa = a - start;
+      const ob = b - start;
+      for (let t = 0; t < m; t++) {
+        const ra = (oa + t * sub) % S;
+        const rb = (ob + t * sub) % S;
+        if (showRot) {
+          out.push({ a: start + ra, b: start + rb, level: m, step: t, mirror: false });
+        }
+        if (showRef) {
+          out.push({
+            a: start + (S - 1 - ra),
+            b: start + (S - 1 - rb),
+            level: m,
+            step: t,
+            mirror: true,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Highlight the orbit of the chosen vertex's edges on the canvas: the chords
  * incident to it (emerald), all their rotation images {i+mB} (violet), and all
@@ -1279,31 +1441,18 @@ function drawVertexOrbitToCanvas(
     ctx.lineTo(bx, by);
     ctx.stroke();
   };
-  // [a, b, step] — step is the rotation count m (ρᵐ) within the edge's family.
-  // One hue for the whole orbit: rotation solid, its mirror a lighter dash.
+  // Each chord is colored by the recursion level m (Dₘ) it belongs to: level n
+  // is the global orbit (long chords), deeper levels live inside ever-smaller
+  // Zaks sub-blocks (short chords). Coarse levels paint first so the deep, short
+  // chords stay on top; the lighter reflection twin sits under its rotation.
+  const levels = orbitLevels(settings, n);
   const drawn: Array<[number, number, number]> = [];
-  const rotColor = palette.dihedralAxis;
-  const mirrorColor = lightenHex(palette.dihedralAxis, 0.5);
-  if (showRef) {
-    // Reflection family s·rᵐx = ω(rᵐx): step m is the mirror of rotation step m.
-    for (const [a, b] of seed) {
-      for (let m = 0; m < n; m++) {
-        const ra = ((total - 1 - a - m * B) % total + total) % total;
-        const rb = ((total - 1 - b - m * B) % total + total) % total;
-        drawSeg(ra, rb, withAlpha(mirrorColor, 0.95), lw);
-        drawn.push([ra, rb, m]);
-      }
-    }
-  }
-  if (showRot) {
-    for (const [a, b] of seed) {
-      for (let m = 0; m < n; m++) {
-        const ra = (a + m * B) % total;
-        const rb = (b + m * B) % total;
-        drawSeg(ra, rb, withAlpha(rotColor, 0.92), lw);
-        drawn.push([ra, rb, m]);
-      }
-    }
+  const segs = nestedOrbitSegments(seed, n, total, levels, showRot, showRef);
+  segs.sort((p, q) => q.level - p.level || Number(p.mirror) - Number(q.mirror));
+  for (const s of segs) {
+    const color = levelColor(s.level, n, s.mirror);
+    drawSeg(s.a, s.b, withAlpha(color, s.mirror ? 0.95 : 0.92), lw);
+    drawn.push([s.a, s.b, s.step]);
   }
 
   // Mark the seed endpoint(s) — the chosen vertex, or both ends of a chosen
@@ -1454,7 +1603,44 @@ function drawVertexOrbitToCanvas(
       ctx.fillText(notes[i], c, ny);
     }
   }
+
+  // Legend (stacked levels only): one swatch per recursion level Dₘ, top-left.
+  if (levels.length > 1) {
+    const sw = Math.max(11, 13 * scale);
+    const gap = Math.max(4, 5 * scale);
+    const lfs = Math.max(11, 13 * scale);
+    ctx.font = `600 ${lfs}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    const lx = c - r + Math.max(14, 18 * scale);
+    let ly = cy - r + Math.max(14, 18 * scale) + sw / 2;
+    for (const m of levels) {
+      ctx.fillStyle = levelColor(m, n, false);
+      ctx.fillRect(lx, ly - sw / 2, sw, sw);
+      ctx.lineWidth = Math.max(1, scale);
+      ctx.strokeStyle = withAlpha(palette.background, 0.9);
+      ctx.strokeRect(lx, ly - sw / 2, sw, sw);
+      const txt = `D${toSubscript(m)}`;
+      const tx = lx + sw + gap;
+      ctx.lineWidth = Math.max(2, 3 * scale);
+      ctx.strokeStyle = withAlpha(palette.background, 0.9);
+      ctx.strokeText(txt, tx, ly);
+      ctx.fillStyle = palette.labelFill;
+      ctx.fillText(txt, tx, ly);
+      ly += sw + gap;
+    }
+  }
   ctx.restore();
+}
+
+/** Render an integer as Unicode subscript digits (for Dₘ labels). */
+function toSubscript(value: number): string {
+  const subs = "₀₁₂₃₄₅₆₇₈₉";
+  return String(value)
+    .split("")
+    .map((ch) => subs[ch.charCodeAt(0) - 48] ?? ch)
+    .join("");
 }
 
 /** SVG fragment for the vertex-orbit-edges overlay (mirrors the canvas one). */
@@ -1489,30 +1675,15 @@ function vertexOrbitSVG(
       2
     )}" y2="${by.toFixed(2)}" stroke="${color}" stroke-width="${width}" stroke-opacity="0.92" stroke-linecap="round"/>`;
   };
-  // One hue for the whole orbit: rotation solid, its mirror a lighter dash.
-  const rotColor = palette.dihedralAxis;
-  const mirrorColor = lightenHex(palette.dihedralAxis, 0.5);
+  // Color each chord by its recursion level m (Dₘ); coarse levels first so the
+  // short deep-level chords stay on top, the lighter reflection under rotation.
+  const levels = orbitLevels(settings, n);
   const drawn: Array<[number, number, number]> = [];
-  if (showRef) {
-    // Reflection family s·rᵐx = ω(rᵐx): step m is the mirror of rotation step m.
-    for (const [a, b] of seed) {
-      for (let m = 0; m < n; m++) {
-        const ra = ((total - 1 - a - m * B) % total + total) % total;
-        const rb = ((total - 1 - b - m * B) % total + total) % total;
-        parts.push(segSvg(ra, rb, mirrorColor, lw));
-        drawn.push([ra, rb, m]);
-      }
-    }
-  }
-  if (showRot) {
-    for (const [a, b] of seed) {
-      for (let m = 0; m < n; m++) {
-        const ra = (a + m * B) % total;
-        const rb = (b + m * B) % total;
-        parts.push(segSvg(ra, rb, rotColor, lw));
-        drawn.push([ra, rb, m]);
-      }
-    }
+  const segs = nestedOrbitSegments(seed, n, total, levels, showRot, showRef);
+  segs.sort((p, q) => q.level - p.level || Number(p.mirror) - Number(q.mirror));
+  for (const s of segs) {
+    parts.push(segSvg(s.a, s.b, levelColor(s.level, n, s.mirror), lw));
+    drawn.push([s.a, s.b, s.step]);
   }
 
   const dot = Math.max(4, 6 * scale) * (tinyEdge ? 1.4 : 1);
@@ -1653,6 +1824,36 @@ function vertexOrbitSVG(
       ).toFixed(2)}" stroke-opacity="0.95" paint-order="stroke">${notes[i]}</text>`
     );
   }
+
+  // Legend (stacked levels only): one swatch per recursion level Dₘ, top-left.
+  if (levels.length > 1) {
+    const sw = Math.max(11, 13 * scale);
+    const gap = Math.max(4, 5 * scale);
+    const lfs = Math.max(11, 13 * scale);
+    const lx = c - r + Math.max(14, 18 * scale);
+    let ly = c - r + Math.max(14, 18 * scale) + sw / 2;
+    for (const m of levels) {
+      parts.push(
+        `<rect x="${lx.toFixed(2)}" y="${(ly - sw / 2).toFixed(2)}" width="${sw.toFixed(
+          2
+        )}" height="${sw.toFixed(2)}" fill="${levelColor(m, n, false)}" stroke="${
+          palette.background
+        }" stroke-opacity="0.9" stroke-width="${Math.max(1, scale).toFixed(2)}"/>`
+      );
+      parts.push(
+        `<text x="${(lx + sw + gap).toFixed(2)}" y="${ly.toFixed(
+          2
+        )}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${lfs.toFixed(
+          1
+        )}" font-weight="600" dominant-baseline="middle" fill="${palette.labelFill}" stroke="${
+          palette.background
+        }" stroke-width="${Math.max(2, 3 * scale).toFixed(
+          2
+        )}" stroke-opacity="0.9" paint-order="stroke">D${toSubscript(m)}</text>`
+      );
+      ly += sw + gap;
+    }
+  }
   return parts.join("");
 }
 
@@ -1685,7 +1886,7 @@ export function drawToCanvas(
     panY = 0,
     palette = DEFAULT_PALETTE,
   } = opts;
-  const { path, edges } = graph;
+  const { path, edges, coords } = graph;
   const n = sizingN(graph);
   const total = path.length;
 
@@ -1710,6 +1911,12 @@ export function drawToCanvas(
   const k = constantsFor(n, scale);
   const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
   const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
+  // Explicit 2-D layout (the Sierpiński gasket) when present; otherwise the
+  // vertex sits on the circle at angle 2πi/total.
+  const posXY = (i: number): [number, number] =>
+    coords
+      ? [c + coords[2 * i] * r, cy + coords[2 * i + 1] * r]
+      : pointXY(i, total, c, cy, r);
   // Orbit/blocks coloring applies only to the Zaks layouts and only in line
   // mode (the density binning has no per-edge identity to color).
   const coloring =
@@ -1722,10 +1929,20 @@ export function drawToCanvas(
   // it would completely occlude them (the cycle stroke is wider than the
   // chord deviation from the arc).
   if (settings.showCycle) {
-    ctx.beginPath();
-    ctx.arc(c, cy, r, 0, 2 * Math.PI);
     ctx.strokeStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
     ctx.lineWidth = k.cycleWidth;
+    ctx.beginPath();
+    if (coords) {
+      // Trace the Hamiltonian cycle as a closed polyline through the layout.
+      for (let i = 0; i < total; i++) {
+        const [x, y] = posXY(i);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+    } else {
+      ctx.arc(c, cy, r, 0, 2 * Math.PI);
+    }
     ctx.stroke();
   }
 
@@ -1769,8 +1986,8 @@ export function drawToCanvas(
           arr = [];
           groups.set(color, arr);
         }
-        const [ax, ay] = pointXY(edges[t], total, c, cy, r);
-        const [bx, by] = pointXY(edges[t + 1], total, c, cy, r);
+        const [ax, ay] = posXY(edges[t]);
+        const [bx, by] = posXY(edges[t + 1]);
         arr.push(ax, ay, bx, by);
       }
       // For blocks, draw the short within-block chords first so the long rₙ
@@ -1809,8 +2026,8 @@ export function drawToCanvas(
               const p = graph.vertexParity[i] ^ graph.vertexParity[j];
               if (p !== parityFilter) continue;
             }
-            const [ax, ay] = pointXY(i, total, c, cy, r);
-            const [bx, by] = pointXY(j, total, c, cy, r);
+            const [ax, ay] = posXY(i);
+            const [bx, by] = posXY(j);
             ctx.moveTo(ax, ay);
             ctx.lineTo(bx, by);
           }
@@ -1836,7 +2053,7 @@ export function drawToCanvas(
           curBlock = block;
           ctx.fillStyle = applyAlpha(blockColor(block, graph.n, labelMode), bandAlpha);
         }
-        const [x, y] = pointXY(i, total, c, cy, r);
+        const [x, y] = posXY(i);
         ctx.beginPath();
         ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
         ctx.fill();
@@ -1847,7 +2064,7 @@ export function drawToCanvas(
         ? withAlpha(palette.labelVertexFill, 0.95)
         : withAlpha(palette.cayleyStroke, edgeAlpha);
       for (let i = 0; i < total; i++) {
-        const [x, y] = pointXY(i, total, c, cy, r);
+        const [x, y] = posXY(i);
         ctx.beginPath();
         ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
         ctx.fill();
@@ -1862,7 +2079,7 @@ export function drawToCanvas(
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     for (let i = 0; i < total; i++) {
-      const [x, y] = pointXY(i, total, c, cy, r);
+      const [x, y] = posXY(i);
       ctx.fillText(String(i), x, y);
     }
   }
@@ -2152,6 +2369,724 @@ export function drawZaksSymmetryToCanvas(
 
   ctx.restore();
 }
+
+/* ------------------------------ yankelovich ------------------------------ */
+
+/**
+ * Cached state for the Yankelovich density-field renderer. The symmetrized
+ * float field is the expensive part (it rasterizes the (n-1)! fundamental
+ * chords and composites n rotations), so we keep it across zoom/pan and even
+ * across gamma tweaks — only the cheap grayscale bitmap is rebuilt when gamma
+ * changes.
+ */
+export interface YankelovichFieldCache {
+  /** Identity of the float field: `${n}|${field}|${hidden}`. */
+  key: string;
+  field: number;
+  /** Symmetrized per-pixel chord density, length field·field. */
+  out: Float32Array;
+  /** Normalization value (high percentile of the density). */
+  norm: number;
+  /** Distribution of the per-cell density values across the whole matrix. */
+  histogram: YankelovichHistogram;
+  /** Cached per-cell tone in [0,1] for {@link toneKey}; reused across gamma/
+   *  invert/colormap tweaks so only a tone-*mode* change recomputes it. */
+  toneField?: Float32Array;
+  /** Tone mode baked into {@link toneField}. */
+  toneKey?: YankelovichTone;
+  /** Tone settings (mode+gamma+invert+colormap) baked into {@link bitmap}. */
+  paintKey: string;
+  /** Grayscale field×field image ready to blit onto the display canvas. */
+  bitmap: HTMLCanvasElement;
+}
+
+/** Histogram of the density values stored in the N×N matrix. */
+export interface YankelovichHistogram {
+  /**
+   * Counts of non-empty cells per equal-width bin over (0, max]. Empty (zero)
+   * cells are excluded — they are just the background, and would otherwise
+   * dwarf every other bar.
+   */
+  bins: number[];
+  /** Upper end of the value range (the matrix maximum). */
+  max: number;
+  /** Tone-map normalization value (the high percentile / white point). */
+  norm: number;
+  /** Number of cells with a non-zero value (chord-touched). */
+  nonZero: number;
+  /** Cells inside the inscribed disk (the figure's actual area, not field²). */
+  total: number;
+}
+
+interface YankelovichCanvasOpts {
+  n: number;
+  settings: RenderSettings;
+  cssWidth: number;
+  cssHeight: number;
+  dpr: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
+  topInset?: number;
+  palette?: Palette;
+  cache?: { current: YankelovichFieldCache | null };
+  onFieldTimings?: (timings: YankelovichFieldTimings) => void;
+}
+
+export interface YankelovichFieldTimings {
+  matrixMs: number;
+  symmetryMs: number;
+}
+
+/**
+ * Largest (n-1)! for which the fundamental sector is enumerated exactly. Above
+ * it the field is built by Monte-Carlo sampling instead (10! ≈ 3.6M is the last
+ * exact n = 11; n ≥ 12 samples).
+ */
+const YANKELOVICH_ENUM_LIMIT = 4_000_000;
+
+/** Fixed accumulator grid size (memory: 2 × Float32 × field² during compute). */
+const YANKELOVICH_FIELD_SIZE = 1200;
+/** Base sampled-chord budget at resolution = 1. */
+const YANKELOVICH_SAMPLE_BUDGET = 2_500_000;
+
+/** Accumulator resolution. Kept fixed so quality is comparable across n. */
+function yankelovichFieldSize(): number {
+  return YANKELOVICH_FIELD_SIZE;
+}
+
+/**
+ * Israel Yankelovich's density-field visualization of the Zaks pancake graph.
+ *
+ * Idea: inscribe the n! cycle vertices on a circle, then for every chord
+ * accumulate +1 into each cell of an N×N grid the chord passes through, and
+ * display the grid as grayscale. Where many chords overlap the pixel saturates
+ * to white, so the chord *envelopes* (caustics) emerge — structure the plain
+ * alpha-blended disk hides once it saturates to black.
+ *
+ * It exploits the exact Dₙ symmetry of the Zaks layout to stay cheap: a 360/n
+ * rotation == shifting every index by B = (n-1)!, and the reflection
+ * ω: i ↦ (n!−1)−i mirrors the layout. The exact path rasterizes only one
+ * representative per dihedral orbit (about (n-1)!/2 chords), then sums the n
+ * rotations and their mirrored copies. Antipodal "diameter" chords have a
+ * half-size rotation orbit, so they are deposited at weight 1/2; mirror-invariant
+ * orbits are also deposited at weight 1/2 because the final Dₙ sum visits them
+ * twice.
+ */
+export function drawYankelovichToCanvas(
+  ctx: CanvasRenderingContext2D,
+  opts: YankelovichCanvasOpts
+): void {
+  const {
+    settings,
+    cssWidth,
+    cssHeight,
+    dpr,
+    zoom = 1,
+    panX = 0,
+    panY = 0,
+    topInset = 0,
+  } = opts;
+
+  const w = Math.floor(cssWidth * dpr);
+  const h = Math.floor(cssHeight * dpr);
+  const gammaSlider = settings.yankelovichGamma ?? 50;
+  const invert = settings.yankelovichInvert ?? false;
+  const tone = settings.yankelovichTone ?? "log";
+  const colormap = settings.yankelovichColormap ?? "gray";
+  const paintKey = `${tone}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
+
+  // The expensive density field is built (or cache-reused) here; callers that
+  // want to surface a separate "computing" phase can prime it via
+  // ensureYankelovichField before drawing.
+  const entry = ensureYankelovichField(opts);
+  if (!entry) return;
+
+  if (!entry.bitmap.width || entry.paintKey !== paintKey) {
+    paintYankelovichBitmap(entry, gammaSlider, invert, tone, colormap);
+  }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  // Letterbox matches the field's empty-cell color so it blends seamlessly: the
+  // empty tone is 0, flipped to (invert ? 1 : 0), through the chosen ramp.
+  const [br, bg, bb] = evalColormap(colormap, invert ? 1 : 0);
+  ctx.fillStyle = `rgb(${br}, ${bg}, ${bb})`;
+  ctx.fillRect(0, 0, w, h);
+
+  const inset = Math.max(0, Math.min(h - 1, topInset * dpr));
+  const availableH = Math.max(1, h - inset);
+  const size = Math.min(w, availableH);
+  const dx = (w - size) / 2;
+  const dy = inset + (availableH - size) / 2;
+  const cx = w / 2;
+  const cy = inset + availableH / 2;
+
+  ctx.save();
+  ctx.translate(cx + panX * dpr, cy + panY * dpr);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-cx, -cy);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(entry.bitmap, dx, dy, size, size);
+  ctx.restore();
+}
+
+/**
+ * Build (or cache-reuse) the symmetrized density field for the given options
+ * without painting or blitting. Lets callers run the heavy field computation as
+ * its own phase (showing a distinct "computing" indicator) before the cheap
+ * draw. Returns the cache entry, or null if the target has zero size.
+ */
+export function ensureYankelovichField(
+  opts: YankelovichCanvasOpts
+): YankelovichFieldCache | null {
+  const { n, settings, cssWidth, cssHeight, dpr, cache } = opts;
+  const w = Math.floor(cssWidth * dpr);
+  const h = Math.floor(cssHeight * dpr);
+  if (w <= 0 || h <= 0) return null;
+  const field = yankelovichFieldSize();
+  const fieldKey = yankelovichFieldKey(opts);
+  const existing =
+    cache?.current && cache.current.key === fieldKey ? cache.current : null;
+  if (existing) return existing;
+  const entry = buildYankelovichField(
+    n,
+    field,
+    settings.hiddenGenerators,
+    fieldKey,
+    opts.onFieldTimings
+  );
+  if (cache) cache.current = entry;
+  return entry;
+}
+
+/**
+ * The cache identity of the density field for these options. Exposed so the UI
+ * can tell a cache hit (instant redraw — zoom/pan/gamma) from a miss (heavy
+ * recompute — n/hidden change) and show the right phase indicator.
+ */
+export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
+  const { n, settings } = opts;
+  const field = yankelovichFieldSize();
+  const hiddenKey = [...new Set(settings.hiddenGenerators)]
+    .sort((a, b) => a - b)
+    .join(",");
+  return `${n}|${field}|${hiddenKey}`;
+}
+
+/**
+ * Rasterize one representative per dihedral orbit into an accumulator and
+ * composite the n rotated + n mirrored copies into the symmetrized density field.
+ * Returns a cache entry with an empty (0×0) bitmap; the grayscale image is
+ * painted lazily.
+ */
+function buildYankelovichField(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  key: string,
+  onFieldTimings?: (timings: YankelovichFieldTimings) => void
+): YankelovichFieldCache {
+  const timings: YankelovichFieldTimings = { matrixMs: 0, symmetryMs: 0 };
+  const out =
+    factorial(n - 1) <= YANKELOVICH_ENUM_LIMIT
+      ? yankelovichFieldExact(n, field, hiddenGenerators, timings)
+      : yankelovichFieldSampled(n, field, hiddenGenerators, timings);
+  onFieldTimings?.(timings);
+
+  let maxv = 0;
+  for (let i = 0; i < out.length; i++) if (out[i] > maxv) maxv = out[i];
+  // Normalize on a high percentile, not the raw max, so a single bright
+  // intersection pixel does not wash the whole field out.
+  const norm = percentile(out, maxv, 0.999);
+  const histogram = buildYankelovichHistogram(out, maxv, Math.max(norm, 1e-9), field);
+
+  const bitmap =
+    typeof document !== "undefined"
+      ? document.createElement("canvas")
+      : ({ width: 0, height: 0 } as HTMLCanvasElement);
+
+  return {
+    key,
+    field,
+    out,
+    norm: Math.max(norm, 1e-9),
+    histogram,
+    paintKey: "",
+    bitmap,
+  };
+}
+
+/** Rasterize the chord between cycle positions i and j (angles 2π·/total). */
+function depositChord(
+  buf: Float32Array,
+  field: number,
+  cf: number,
+  rf: number,
+  total: number,
+  i: number,
+  j: number,
+  wgt: number
+): void {
+  const ai = (2 * Math.PI * i) / total;
+  const aj = (2 * Math.PI * j) / total;
+  const x1 = cf + rf * Math.cos(ai);
+  const y1 = cf + rf * Math.sin(ai);
+  const x2 = cf + rf * Math.cos(aj);
+  const y2 = cf + rf * Math.sin(aj);
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  if (len <= 0) return;
+
+  // Exact grid traversal: each crossed cell receives the chord length inside it.
+  // This avoids the blur/energy spread caused by point-sampling plus bilinear splats.
+  let x = Math.floor(x1);
+  let y = Math.floor(y1);
+  const endX = Math.floor(x2);
+  const endY = Math.floor(y2);
+  const stepX = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+  const stepY = dy > 0 ? 1 : dy < 0 ? -1 : 0;
+  const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / dx);
+  const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / dy);
+  let tMaxX =
+    stepX === 0 ? Infinity : ((stepX > 0 ? x + 1 : x) - x1) / dx;
+  let tMaxY =
+    stepY === 0 ? Infinity : ((stepY > 0 ? y + 1 : y) - y1) / dy;
+  let t = 0;
+
+  while (true) {
+    const nextT = Math.min(1, tMaxX, tMaxY);
+    if (x >= 0 && y >= 0 && x < field && y < field && nextT > t) {
+      buf[y * field + x] += wgt * len * (nextT - t);
+    }
+    if (nextT >= 1 || (x === endX && y === endY)) break;
+
+    const hitX = tMaxX <= nextT;
+    const hitY = tMaxY <= nextT;
+    if (hitX) {
+      x += stepX;
+      tMaxX += tDeltaX;
+    }
+    if (hitY) {
+      y += stepY;
+      tMaxY += tDeltaY;
+    }
+    t = nextT;
+  }
+}
+
+/**
+ * Exact density field for small n: rasterize one representative per Dₙ orbit
+ * into an accumulator, then composite rotations and axial reflections.
+ */
+function yankelovichFieldExact(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const cf = field / 2;
+  const rf = field / 2 - 1.5;
+  const acc = new Float32Array(field * field);
+  const hidden = hiddenGeneratorSet(hiddenGenerators);
+
+  const matrixT0 = performance.now();
+  forEachZaksFundamentalEdge(n, (e) => {
+    if (hidden && hidden.has(e.gen)) return;
+    const cCode = canonicalOrbitCode(e.i, e.j, n, total, B);
+    const dCode = canonicalDihedralCode(e.i, e.j, n, total, B);
+    if (cCode !== dCode) return;
+    // Generic orbits (size n) deposit at weight 1; antipodal "diameter" chords
+    // map to themselves after n/2 rotations, so the n-fold composite would visit
+    // them twice. If the Cₙ orbit is also its own mirror, the Dₙ composite visits
+    // it twice too. Each symmetry stabilizer halves the representative's weight.
+    const mirrorInvariant =
+      cCode === canonicalOrbitCode(total - 1 - e.i, total - 1 - e.j, n, total, B);
+    const weight = (e.half ? 0.5 : 1) * (mirrorInvariant ? 0.5 : 1);
+    depositChord(acc, field, cf, rf, total, e.i, e.j, weight);
+  });
+  if (timings) timings.matrixMs = performance.now() - matrixT0;
+
+  // Symmetrize: out(p) = Σₖ acc(R₋ₖ p) + acc(ω R₋ₖ p). The reflection
+  // ω: i ↦ (n!−1)−i maps angle θ to -θ - 2π/total.
+  const symmetryT0 = performance.now();
+  const out = new Float32Array(field * field);
+  const cos = new Float64Array(n);
+  const sin = new Float64Array(n);
+  for (let k = 0; k < n; k++) {
+    const a = (2 * Math.PI * k) / n;
+    cos[k] = Math.cos(a);
+    sin[k] = Math.sin(a);
+  }
+  const delta = (2 * Math.PI) / total;
+  const mirrorCos = Math.cos(delta);
+  const mirrorSin = Math.sin(delta);
+  const sampleAcc = (x: number, y: number): number => {
+    if (x < 0 || y < 0 || x >= field - 1 || y >= field - 1) return 0;
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+    const i = y0 * field + x0;
+    return (
+      acc[i] * (1 - fx) * (1 - fy) +
+      acc[i + 1] * fx * (1 - fy) +
+      acc[i + field] * (1 - fx) * fy +
+      acc[i + field + 1] * fx * fy
+    );
+  };
+
+  for (let oy = 0; oy < field; oy++) {
+    const ry = oy + 0.5 - cf;
+    for (let ox = 0; ox < field; ox++) {
+      const rx = ox + 0.5 - cf;
+      let v = 0;
+      for (let k = 0; k < n; k++) {
+        const ux = rx * cos[k] + ry * sin[k];
+        const uy = -rx * sin[k] + ry * cos[k];
+        v += sampleAcc(cf + ux, cf + uy);
+        v += sampleAcc(
+          cf + ux * mirrorCos - uy * mirrorSin,
+          cf - ux * mirrorSin - uy * mirrorCos
+        );
+      }
+      out[oy * field + ox] = v;
+    }
+  }
+  if (timings) timings.symmetryMs = performance.now() - symmetryT0;
+  return out;
+}
+
+/**
+ * Monte-Carlo density field for large n, where neither the n! cycle nor the
+ * (n-1)! fundamental sector can be enumerated. We draw random cycle positions i,
+ * unrank to the permutation, take its full-reversal rₙ neighbor, rank that back
+ * to a position j, and rasterize the chord — together with its whole dihedral
+ * Dₙ orbit. The Zaks layout has the full Dₙ symmetry: the n rotations
+ * ρᵏ: i ↦ i+kB (B = (n-1)!) and the reflection ω: i ↦ (n!-1)-i are all graph
+ * automorphisms, so each draw expands into 2n exact edges {ρᵏ(i), ρᵏ(j)} and
+ * {ρᵏ(ω(i)), ρᵏ(ω(j))}. Depositing the orbit deterministically makes the field
+ * exactly Dₙ-symmetric (mirror axes included) and cuts the variance, instead of
+ * waiting for random draws to fill the symmetric images. For n > 6 rₙ is the
+ * only generator, so this captures the whole displayed skeleton.
+ */
+function yankelovichFieldSampled(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const matrixT0 = performance.now();
+  const out = new Float32Array(field * field);
+  const hidden = hiddenGeneratorSet(hiddenGenerators);
+  if (hidden && hidden.has(n)) {
+    if (timings) timings.matrixMs = performance.now() - matrixT0;
+    return out;
+  } // rₙ hidden ⇒ nothing to draw
+
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const cf = field / 2;
+  const rf = field / 2 - 1.5;
+
+  // Each random draw expands into 2n dihedral images (n rotations × the ω
+  // reflection), so divide by 2n.
+  const TARGET_CHORDS = YANKELOVICH_SAMPLE_BUDGET;
+  const samples = Math.max(1, Math.round(TARGET_CHORDS / (2 * n)));
+
+  for (let s = 0; s < samples; s++) {
+    const i = Math.floor(Math.random() * total);
+    const p = zaksUnrank(n, i);
+    // rₙ neighbor = full reversal of p.
+    const q = new Uint8Array(n);
+    for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
+    const j = zaksRank(n, q as typeof p);
+    // ω reflection of the chord endpoints (also an edge, by Dₙ symmetry).
+    const wi = total - 1 - i;
+    const wj = total - 1 - j;
+    for (let k = 0; k < n; k++) {
+      const kb = k * B;
+      depositChord(out, field, cf, rf, total, (i + kb) % total, (j + kb) % total, 1);
+      depositChord(out, field, cf, rf, total, (wi + kb) % total, (wj + kb) % total, 1);
+    }
+  }
+  if (timings) timings.matrixMs = performance.now() - matrixT0;
+  return out;
+}
+
+/**
+ * Distribution of the non-empty matrix cells across equal-width value bins.
+ * `total` counts only cells inside the inscribed disk (the figure is a disk, so
+ * the square's corners are empty by construction and must not count as "unfilled").
+ */
+function buildYankelovichHistogram(
+  data: Float32Array,
+  max: number,
+  norm: number,
+  field: number
+): YankelovichHistogram {
+  const BINS = 40;
+  const bins = new Array<number>(BINS).fill(0);
+  const cf = field / 2;
+  const rf = field / 2 - 1.5;
+  const r2 = rf * rf;
+  let nonZero = 0;
+  let diskCells = 0;
+  for (let y = 0; y < field; y++) {
+    const dy = y + 0.5 - cf;
+    for (let x = 0; x < field; x++) {
+      const dx = x + 0.5 - cf;
+      if (dx * dx + dy * dy > r2) continue; // outside the inscribed disk
+      diskCells++;
+      const v = data[y * field + x];
+      if (v <= 0) continue;
+      nonZero++;
+      if (max > 0) bins[Math.min(BINS - 1, Math.floor((v / max) * BINS))]++;
+    }
+  }
+  return { bins, max, norm, nonZero, total: diskCells };
+}
+
+/** Histogram-based percentile of the positive entries of `data` over [0, max]. */
+function percentile(data: Float32Array, max: number, q: number): number {
+  if (max <= 0) return 0;
+  const BINS = 2048;
+  const hist = new Uint32Array(BINS);
+  let count = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    if (v <= 0) continue;
+    const b = Math.min(BINS - 1, Math.floor((v / max) * BINS));
+    hist[b]++;
+    count++;
+  }
+  if (count === 0) return max;
+  const target = q * count;
+  let cum = 0;
+  for (let b = 0; b < BINS; b++) {
+    cum += hist[b];
+    if (cum >= target) return ((b + 1) / BINS) * max;
+  }
+  return max;
+}
+
+/**
+ * Render the cached float field to a bitmap. The per-cell density is mapped to a
+ * normalized tone in [0,1] (log / equalize / clahe), shaped by gamma, optionally
+ * inverted, then colored through the chosen ramp.
+ */
+function paintYankelovichBitmap(
+  entry: YankelovichFieldCache,
+  gammaSlider: number,
+  invert: boolean,
+  tone: YankelovichTone,
+  colormap: YankelovichColormap
+): void {
+  const { field, out, norm, histogram, bitmap } = entry;
+  if (typeof document === "undefined") return;
+  bitmap.width = field;
+  bitmap.height = field;
+  const bctx = bitmap.getContext("2d");
+  if (!bctx) return;
+  const img = bctx.createImageData(field, field);
+  const data = img.data;
+
+  // The tone field (log/equalize/clahe) is the costly part; cache it by mode so
+  // gamma/invert/colormap tweaks only redo the cheap final mapping below.
+  if (entry.toneKey !== tone || !entry.toneField) {
+    entry.toneField = yankelovichToneField(out, field, tone, histogram.max, norm);
+    entry.toneKey = tone;
+  }
+  const t = entry.toneField;
+  const gamma = sliderToYankelovichGamma(gammaSlider);
+  for (let i = 0; i < out.length; i++) {
+    const shade = Math.pow(t[i], gamma);
+    const u = invert ? 1 - shade : shade;
+    const [r, g, b] = evalColormap(colormap, u);
+    const p = i * 4;
+    data[p] = r;
+    data[p + 1] = g;
+    data[p + 2] = b;
+    data[p + 3] = 255;
+  }
+  bctx.putImageData(img, 0, 0);
+  entry.paintKey = `${tone}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
+}
+
+/** Per-cell normalized tone in [0,1] for the chosen tone-mapping mode. */
+function yankelovichToneField(
+  out: Float32Array,
+  field: number,
+  tone: YankelovichTone,
+  max: number,
+  norm: number
+): Float32Array {
+  const t = new Float32Array(out.length);
+  if (tone === "log") {
+    const denom = Math.log1p(norm);
+    for (let i = 0; i < out.length; i++) {
+      const x = denom > 0 ? Math.log1p(out[i]) / denom : 0;
+      t[i] = x > 1 ? 1 : x < 0 ? 0 : x;
+    }
+    return t;
+  }
+  if (tone === "equalize") {
+    const B = 4096;
+    const hist = new Float64Array(B);
+    let c = 0;
+    if (max > 0) {
+      for (let i = 0; i < out.length; i++) {
+        const v = out[i];
+        if (v <= 0) continue;
+        hist[Math.min(B - 1, Math.floor((v / max) * B))]++;
+        c++;
+      }
+    }
+    let cum = 0;
+    for (let b = 0; b < B; b++) {
+      cum += hist[b];
+      hist[b] = c > 0 ? cum / c : 0;
+    }
+    for (let i = 0; i < out.length; i++) {
+      const v = out[i];
+      t[i] = v > 0 ? hist[Math.min(B - 1, Math.floor((v / max) * B))] : 0;
+    }
+    return t;
+  }
+  // clahe
+  claheToneField(out, field, max, t);
+  return t;
+}
+
+/**
+ * Contrast-limited adaptive histogram equalization: equalize per tile (over the
+ * tile's non-empty cells, with a clip limit), then bilinearly blend the four
+ * surrounding tile mappings per pixel so tile seams disappear. Empty cells stay 0.
+ */
+function claheToneField(
+  out: Float32Array,
+  field: number,
+  max: number,
+  t: Float32Array
+): void {
+  if (max <= 0) return;
+  const TILES = 8;
+  const B = 256;
+  const tw = field / TILES;
+  const hist = new Float64Array(TILES * TILES * B);
+  const cnt = new Float64Array(TILES * TILES);
+  const binOf = (v: number) => Math.min(B - 1, Math.floor((v / max) * B));
+
+  for (let y = 0; y < field; y++) {
+    const ty = Math.min(TILES - 1, Math.floor(y / tw));
+    for (let x = 0; x < field; x++) {
+      const v = out[y * field + x];
+      if (v <= 0) continue;
+      const tx = Math.min(TILES - 1, Math.floor(x / tw));
+      hist[(ty * TILES + tx) * B + binOf(v)]++;
+      cnt[ty * TILES + tx]++;
+    }
+  }
+
+  // Clip-limit each tile histogram, redistribute the excess, then make a CDF.
+  for (let tile = 0; tile < TILES * TILES; tile++) {
+    const total = cnt[tile];
+    const base = tile * B;
+    if (total <= 0) continue;
+    const limit = (10 * total) / B; // contrast clip
+    let excess = 0;
+    for (let b = 0; b < B; b++) {
+      if (hist[base + b] > limit) {
+        excess += hist[base + b] - limit;
+        hist[base + b] = limit;
+      }
+    }
+    const add = excess / B;
+    let cum = 0;
+    for (let b = 0; b < B; b++) {
+      cum += hist[base + b] + add;
+      hist[base + b] = cum / total;
+    }
+  }
+
+  for (let y = 0; y < field; y++) {
+    const fy = y / tw - 0.5;
+    const ty0 = Math.floor(fy);
+    const ay = fy - ty0;
+    for (let x = 0; x < field; x++) {
+      const i = y * field + x;
+      const v = out[i];
+      if (v <= 0) {
+        t[i] = 0;
+        continue;
+      }
+      const bin = binOf(v);
+      const fx = x / tw - 0.5;
+      const tx0 = Math.floor(fx);
+      const ax = fx - tx0;
+      let acc = 0;
+      let wsum = 0;
+      for (let cy = 0; cy <= 1; cy++) {
+        const wy = cy ? ay : 1 - ay;
+        const tcy = Math.min(TILES - 1, Math.max(0, ty0 + cy));
+        for (let cx = 0; cx <= 1; cx++) {
+          const wx = cx ? ax : 1 - ax;
+          const tcx = Math.min(TILES - 1, Math.max(0, tx0 + cx));
+          const tile = tcy * TILES + tcx;
+          if (cnt[tile] <= 0) continue;
+          const w = wx * wy;
+          acc += w * hist[tile * B + bin];
+          wsum += w;
+        }
+      }
+      t[i] = wsum > 0 ? acc / wsum : 0;
+    }
+  }
+}
+
+/** Evaluate a color ramp at t∈[0,1], returning [r,g,b] in 0..255. */
+function evalColormap(
+  name: YankelovichColormap,
+  t: number
+): [number, number, number] {
+  const x = t < 0 ? 0 : t > 1 ? 1 : t;
+  if (name === "gray") {
+    const g = Math.round(255 * x);
+    return [g, g, g];
+  }
+  const stops = COLORMAPS[name];
+  const seg = x * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(seg));
+  const f = seg - i;
+  const a = stops[i];
+  const b = stops[i + 1];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f),
+  ];
+}
+
+const COLORMAPS: Record<
+  Exclude<YankelovichColormap, "gray">,
+  ReadonlyArray<readonly [number, number, number]>
+> = {
+  viridis: [
+    [68, 1, 84], [71, 44, 122], [59, 81, 139], [44, 113, 142], [33, 144, 141],
+    [39, 173, 129], [92, 200, 99], [170, 220, 50], [253, 231, 37],
+  ],
+  magma: [
+    [0, 0, 4], [28, 16, 68], [79, 18, 123], [129, 37, 129], [181, 54, 122],
+    [229, 80, 100], [251, 135, 97], [254, 194, 135], [252, 253, 191],
+  ],
+  inferno: [
+    [0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66],
+    [245, 125, 21], [250, 193, 39], [252, 255, 164], [252, 255, 164],
+  ],
+};
 
 /* -------------------------------- quotient -------------------------------- */
 
@@ -2454,12 +3389,18 @@ interface SvgOpts {
  */
 export function toSVG(opts: SvgOpts): string {
   const { graph, settings, size, palette = DEFAULT_PALETTE } = opts;
-  const { path, edges } = graph;
+  const { path, edges, coords } = graph;
   const n = sizingN(graph);
   const total = path.length;
   const c = size / 2;
   const r = size * 0.405;
   const scale = size / 1000;
+  // Explicit 2-D layout (the Sierpiński gasket) when present; otherwise the
+  // vertex sits on the circle at angle 2πi/total.
+  const pos = (i: number): [number, number] =>
+    coords
+      ? [c + coords[2 * i] * r, c + coords[2 * i + 1] * r]
+      : point(i, total, c, r);
 
   const k = constantsFor(n, scale);
   const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
@@ -2475,9 +3416,23 @@ export function toSVG(opts: SvgOpts): string {
   // wider cycle outline (especially important for short chords near the
   // perimeter, e.g. parity-preserving generators in pancake-Zaks).
   if (settings.showCycle) {
-    parts.push(
-      `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`
-    );
+    if (coords) {
+      // Trace the Hamiltonian cycle as a closed polyline through the layout, so
+      // the cycle is visible on top of the gasket instead of as a bare circle.
+      let d = "";
+      for (let i = 0; i < total; i++) {
+        const [x, y] = pos(i);
+        d += `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
+      }
+      d += "Z";
+      parts.push(
+        `<path d="${d}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}" stroke-linejoin="round" stroke-linecap="round"/>`
+      );
+    } else {
+      parts.push(
+        `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`
+      );
+    }
   }
 
   const coloring = dihedralColoring(graph, settings);
@@ -2499,8 +3454,8 @@ export function toSVG(opts: SvgOpts): string {
           : edges[t + 2] < graph.n
             ? palette.blockWithinStroke
             : palette.blockBetweenStroke;
-      const [ax, ay] = point(edges[t], total, c, r);
-      const [bx, by] = point(edges[t + 1], total, c, r);
+      const [ax, ay] = pos(edges[t]);
+      const [bx, by] = pos(edges[t + 1]);
       groups.set(
         color,
         (groups.get(color) ?? "") +
@@ -2540,8 +3495,8 @@ export function toSVG(opts: SvgOpts): string {
             const p = graph.vertexParity[i] ^ graph.vertexParity[j];
             if (p !== pass.filter) continue;
           }
-          const [ax, ay] = point(i, total, c, r);
-          const [bx, by] = point(j, total, c, r);
+          const [ax, ay] = pos(i);
+          const [bx, by] = pos(j);
           d += `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
         }
         if (d.length === 0) continue;
@@ -2558,7 +3513,7 @@ export function toSVG(opts: SvgOpts): string {
     const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
     const B = total / graph.n;
     for (let i = 0; i < total; i++) {
-      const [x, y] = point(i, total, c, r);
+      const [x, y] = pos(i);
       const fill =
         coloring === "blocks"
           ? blockColor(Math.floor(i / B), graph.n, labelMode)
@@ -2575,7 +3530,7 @@ export function toSVG(opts: SvgOpts): string {
     if (settings.showLabels && n <= 5) {
       const fs = total <= 24 ? 12 : 6;
       for (let i = 0; i < total; i++) {
-        const [x, y] = point(i, total, c, r);
+        const [x, y] = pos(i);
         parts.push(
           `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
         );

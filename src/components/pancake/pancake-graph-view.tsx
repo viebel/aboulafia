@@ -23,6 +23,7 @@ import {
   asymmetricTreeCompressionFactor,
   buildPancakeGraph,
   buildZaksSymmetryGraph,
+  buildZaksSamplingGraph,
   buildQuotientGraph,
   EDGE_DISTANCE_BIN_DEGREES,
   factorial,
@@ -42,6 +43,14 @@ import {
 import {
   drawQuotientToCanvas,
   drawToCanvas,
+  drawYankelovichToCanvas,
+  ensureYankelovichField,
+  yankelovichFieldKey,
+  type YankelovichFieldCache,
+  type YankelovichFieldTimings,
+  type YankelovichHistogram,
+  type YankelovichTone,
+  type YankelovichColormap,
   drawZaksSymmetryToCanvas,
   type ZaksSymmetrySectors,
   edgeAlphaToSlider,
@@ -52,6 +61,7 @@ import {
   toSymmetrySVG,
   toZaksSymmetrySVG,
   computeZaksOrbits,
+  levelColor,
   type OrbitInfo,
   type OrbitParts,
   type ParityMode,
@@ -64,7 +74,7 @@ import {
   readNonNegIntParam,
   writeUrlParams,
 } from "@/lib/url-state";
-import { AlertTriangle, Download, Loader2, Minus, Pause, Play, Plus, RotateCcw } from "lucide-react";
+import { Download, Loader2, Minus, Pause, Play, Plus, RotateCcw } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import {
   useCallback,
@@ -75,10 +85,26 @@ import {
   type PointerEvent,
   type WheelEvent,
 } from "react";
+import { flushSync } from "react-dom";
 
 const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 
 const SVG_VIEWBOX = 1200;
+
+function secondsLabel(ms: number): string {
+  return `${NUMBER_FORMAT.format(Math.round(ms / 100) / 10)} s`;
+}
+
+function yankelovichPhaseTimings(
+  field: YankelovichFieldTimings,
+  canvasMs: number
+): PhaseTiming[] {
+  return [
+    { id: "matrix", label: "Matrix", elapsedMs: field.matrixMs },
+    { id: "symmetries", label: "Symmetries", elapsedMs: field.symmetryMs },
+    { id: "canvas", label: "Canvas", elapsedMs: canvasMs },
+  ];
+}
 
 /**
  * Density-appropriate starting positions for the edge strength/width
@@ -149,9 +175,59 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "hypercube",
   "sliding-puzzle",
   "simplex",
+  "sierpinski",
 ];
 
-type Renderer = "svg" | "canvas" | "density" | "quotient" | "symmetry";
+type Renderer =
+  | "svg"
+  | "canvas"
+  | "density"
+  | "quotient"
+  | "symmetry"
+  | "yankelovich";
+
+/** The Yankelovich density-field renderer relies on the exact Zaks layout. */
+function supportsYankelovich(preset: GraphPreset): boolean {
+  return preset === "pancake-zaks";
+}
+
+/**
+ * The Yankelovich renderer never enumerates the n! cycle (it samples chords via
+ * the analytic Zaks rank/unrank), so it can go well past the other renderers'
+ * ceiling. 15! ≈ 1.3·10¹² vertices is still fine to sample.
+ */
+const YANKELOVICH_MAX_N = 15;
+
+const YANKELOVICH_TONES: readonly YankelovichTone[] = [
+  "log",
+  "equalize",
+  "clahe",
+];
+const YANKELOVICH_TONE_LABELS: Record<YankelovichTone, string> = {
+  log: "Log (default)",
+  equalize: "Equalize",
+  clahe: "CLAHE (local)",
+};
+const YANKELOVICH_COLORMAPS: readonly YankelovichColormap[] = [
+  "gray",
+  "viridis",
+  "magma",
+  "inferno",
+];
+const YANKELOVICH_COLORMAP_LABELS: Record<YankelovichColormap, string> = {
+  gray: "Grayscale",
+  viridis: "Viridis",
+  magma: "Magma",
+  inferno: "Inferno",
+};
+
+/** Highest n offered for a given preset + renderer combination. */
+function maxNForRenderer(preset: GraphPreset, renderer: Renderer): number {
+  if (renderer === "yankelovich" && supportsYankelovich(preset)) {
+    return YANKELOVICH_MAX_N;
+  }
+  return graphMaxN(preset);
+}
 
 /** Number of quotient blocks = n·(n-1)···(n-depth+1). */
 function quotientBlockCount(n: number, depth: number): number {
@@ -172,6 +248,7 @@ const ZOOM_FACTOR = 1.5;
 const WHEEL_LINE_HEIGHT = 16;
 const WHEEL_DELTA_LINE = 1;
 const WHEEL_DELTA_PAGE = 2;
+const STAGE_INFO_BAR_CLEARANCE = 52;
 
 interface RunMetrics {
   vertices: number;
@@ -181,7 +258,22 @@ interface RunMetrics {
   evenEdges: number;
   oddEdges: number;
   elapsedMs: number;
+  timings: PhaseTiming[];
 }
+
+interface PhaseTiming {
+  id: string;
+  label: string;
+  elapsedMs: number;
+}
+
+const BUILD_PHASE_LABELS: Record<string, string> = {
+  cycle: "Order",
+  index: "Index",
+  parity: "Parity",
+  edges: "Edges",
+  lite: "Graph",
+};
 
 const PARITY_MODE_LABELS: Record<ParityMode, string> = {
   off: "Single color",
@@ -196,6 +288,7 @@ const RENDERERS: readonly Renderer[] = [
   "density",
   "quotient",
   "symmetry",
+  "yankelovich",
 ];
 const PARITY_MODES = Object.keys(PARITY_MODE_LABELS) as ParityMode[];
 
@@ -221,6 +314,9 @@ const SLIDER_RANGE: readonly number[] = Array.from(
   { length: 100 },
   (_, i) => i + 1
 );
+// Dihedral recursion level m for the vertex-orbit overlay (3…n); the renderer
+// clamps to [3, n], so the exact upper bound here is not critical.
+const LEVEL_RANGE: readonly number[] = Array.from({ length: 38 }, (_, i) => i + 3);
 
 /** The n a preset starts at: the global default, clamped to its maximum. */
 function defaultNFor(preset: GraphPreset): NValue {
@@ -242,23 +338,35 @@ interface GraphState {
   vertexOrbitIndex: number;
   vertexOrbitParts: OrbitParts;
   vertexOrbitLongOnly: boolean;
+  vertexOrbitLevel: number;
+  vertexOrbitStack: boolean;
   orbitEdgeA: number;
   orbitEdgeB: number;
   showLabels: boolean;
   alpha: number;
   width: number;
+  yankelovichGamma: number;
+  yankelovichInvert: boolean;
+  yankelovichTone: YankelovichTone;
+  yankelovichColormap: YankelovichColormap;
   quotientDepth: number;
 }
 
 /** Restore the explorer's controls from the URL query string (deep linking). */
 function readGraphState(params: URLSearchParams | null): GraphState {
   const preset = readEnumParam(params, "g", GRAPH_PRESETS, "pancake-zaks");
-  const allowedN = N_OPTIONS.filter((opt) => opt <= graphMaxN(preset));
-  const n = readIntParam(params, "n", allowedN, defaultNFor(preset)) as NValue;
 
   let renderer = readEnumParam(params, "r", RENDERERS, "svg");
   if (renderer === "quotient" && !supportsQuotient(preset)) renderer = "svg";
   if (renderer === "symmetry" && !supportsSymmetry({ preset })) renderer = "svg";
+  if (renderer === "yankelovich" && !supportsYankelovich(preset)) renderer = "svg";
+
+  // The n ceiling depends on the renderer: Yankelovich samples chords, so it
+  // reaches n = 15 where the other renderers top out at graphMaxN(preset).
+  const allowedN = N_OPTIONS.filter(
+    (opt) => opt <= maxNForRenderer(preset, renderer)
+  );
+  const n = readIntParam(params, "n", allowedN, defaultNFor(preset)) as NValue;
 
   const rec = recommendedEdgeSliders(n, preset);
 
@@ -277,11 +385,22 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     vertexOrbitIndex: readNonNegIntParam(params, "vi"),
     vertexOrbitParts: readEnumParam(params, "vp", ORBIT_PARTS, "both"),
     vertexOrbitLongOnly: readEnumParam(params, "vl", ["0", "1"], "0") === "1",
+    vertexOrbitLevel: readIntParam(params, "vlvl", LEVEL_RANGE, n),
+    vertexOrbitStack: readEnumParam(params, "vst", ["0", "1"], "0") === "1",
     orbitEdgeA: readNonNegIntParam(params, "ea", -1),
     orbitEdgeB: readNonNegIntParam(params, "eb", -1),
     showLabels: readEnumParam(params, "lbl", ["0", "1"], "0") === "1",
     alpha: readIntParam(params, "alpha", SLIDER_RANGE, rec.alpha),
     width: readIntParam(params, "width", SLIDER_RANGE, rec.width),
+    yankelovichGamma: readIntParam(params, "yg", SLIDER_RANGE, 50),
+    yankelovichInvert: readEnumParam(params, "yi", ["0", "1"], "0") === "1",
+    yankelovichTone: readEnumParam(params, "yt", YANKELOVICH_TONES, "log"),
+    yankelovichColormap: readEnumParam(
+      params,
+      "ycm",
+      YANKELOVICH_COLORMAPS,
+      "gray"
+    ),
     quotientDepth: readIntParam(
       params,
       "depth",
@@ -305,6 +424,18 @@ export function PancakeGraphView() {
   // graphs the SVG string + DOM injection can take a while *after* the graph is
   // ready, so we surface it as its own "Rendering…" state.
   const [isRendering, setIsRendering] = useState(false);
+  // The Yankelovich density field has a heavy compute phase (sampling /
+  // rasterizing the chords) distinct from the cheap draw; surfaced separately so
+  // the user sees "Computing…" then "Rendering…".
+  const [isComputing, setIsComputing] = useState(false);
+  // Distribution of the Yankelovich matrix values, surfaced from the cached
+  // field so the sidebar can show a histogram.
+  const [yankelovichHistogram, setYankelovichHistogram] =
+    useState<YankelovichHistogram | null>(null);
+  const [yankelovichTimings, setYankelovichTimings] = useState<PhaseTiming[]>([]);
+  const [yankelovichField, setYankelovichField] = useState<number | null>(null);
+  const [yankelovichStage, setYankelovichStage] = useState<string | null>(null);
+  const [yankelovichTotalMs, setYankelovichTotalMs] = useState<number | null>(null);
 
   const [settings, setSettings] = useState<RenderSettings>({
     alpha: initial.alpha,
@@ -324,8 +455,14 @@ export function PancakeGraphView() {
     vertexOrbitIndex: initial.vertexOrbitIndex,
     vertexOrbitParts: initial.vertexOrbitParts,
     vertexOrbitLongOnly: initial.vertexOrbitLongOnly,
+    vertexOrbitLevel: initial.vertexOrbitLevel,
+    vertexOrbitStack: initial.vertexOrbitStack,
     orbitEdgeA: initial.orbitEdgeA,
     orbitEdgeB: initial.orbitEdgeB,
+    yankelovichGamma: initial.yankelovichGamma,
+    yankelovichInvert: initial.yankelovichInvert,
+    yankelovichTone: initial.yankelovichTone,
+    yankelovichColormap: initial.yankelovichColormap,
     hiddenGenerators: [],
   });
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
@@ -351,6 +488,11 @@ export function PancakeGraphView() {
   // Cached fundamental-sector geometry for the canvas symmetry renderer, reused
   // across zoom/pan/alpha/width so only n/size/parity/hidden changes re-enumerate.
   const symSectorCacheRef = useRef<ZaksSymmetrySectors | null>(null);
+  // Cached symmetrized density field for the Yankelovich renderer, reused across
+  // zoom/pan (and gamma tweaks reuse the float field, repainting only the
+  // grayscale bitmap) so only n/size/hidden changes re-rasterize.
+  const yankelovichCacheRef = useRef<YankelovichFieldCache | null>(null);
+  const yankelovichTotalStartRef = useRef<number | null>(null);
   const panStartRef = useRef<{
     pointerId: number;
     x: number;
@@ -367,10 +509,6 @@ export function PancakeGraphView() {
   const axisDownRef = useRef<{ x: number; y: number } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
-  const estimatedVertices = graphVertexCount(n, preset);
-  const estimatedEdges = graphEdgeCount(n, preset);
-  const isHeavy = estimatedVertices >= 300_000 || estimatedEdges >= 1_000_000;
-  const isVeryHeavy = estimatedVertices > 1_000_000 || estimatedEdges > 10_000_000;
   // SVG is never blocked by graph size — the user can always opt into the
   // vector renderer even for dense graphs (it may be slow, but that is their
   // choice).
@@ -381,6 +519,10 @@ export function PancakeGraphView() {
   // is active we build the lightweight payload instead (and rebuild the full
   // graph lazily if the user switches to a graph-dependent renderer).
   const symmetryLite = preset === "pancake-zaks" && renderer === "symmetry";
+  // The Yankelovich density field is built straight from the Zaks recursion too,
+  // so it shares the lightweight O((n-1)!) build path (no full n! graph).
+  const yankelovich = supportsYankelovich(preset) && renderer === "yankelovich";
+  const liteBuild = symmetryLite || yankelovich;
   // Vector renders above this many segments are slow enough to be worth a
   // visible "Rendering…" phase; smaller ones draw synchronously to keep slider
   // tweaks snappy and flicker-free. Symmetry only emits a 1/n sector.
@@ -392,8 +534,9 @@ export function PancakeGraphView() {
     (activeRenderer === "svg" || activeRenderer === "symmetry") &&
     svgRenderLoad >= 120_000;
   const availableNOptions = useMemo(
-    () => N_OPTIONS.filter((option) => option <= graphMaxN(preset)),
-    [preset]
+    () =>
+      N_OPTIONS.filter((option) => option <= maxNForRenderer(preset, renderer)),
+    [preset, renderer]
   );
 
   // Reflect every control in the URL so a given view can be shared and
@@ -414,6 +557,11 @@ export function PancakeGraphView() {
       vi: settings.showVertexOrbit ? String(settings.vertexOrbitIndex) : null,
       vp: settings.showVertexOrbit ? settings.vertexOrbitParts : null,
       vl: settings.showVertexOrbit && settings.vertexOrbitLongOnly ? "1" : null,
+      vlvl:
+        settings.showVertexOrbit && (settings.vertexOrbitLevel ?? n) !== n
+          ? String(settings.vertexOrbitLevel)
+          : null,
+      vst: settings.showVertexOrbit && settings.vertexOrbitStack ? "1" : null,
       ea:
         settings.showVertexOrbit && (settings.orbitEdgeA ?? -1) >= 0
           ? String(settings.orbitEdgeA)
@@ -425,6 +573,19 @@ export function PancakeGraphView() {
       lbl: settings.showLabels ? "1" : null,
       alpha: String(settings.alpha),
       width: String(settings.width),
+      yg:
+        (settings.yankelovichGamma ?? 50) !== 50
+          ? String(settings.yankelovichGamma)
+          : null,
+      yi: settings.yankelovichInvert ? "1" : null,
+      yt:
+        (settings.yankelovichTone ?? "log") !== "log"
+          ? settings.yankelovichTone
+          : null,
+      ycm:
+        (settings.yankelovichColormap ?? "gray") !== "gray"
+          ? settings.yankelovichColormap
+          : null,
       depth: String(quotientDepth),
     });
   }, [
@@ -442,11 +603,17 @@ export function PancakeGraphView() {
     settings.vertexOrbitIndex,
     settings.vertexOrbitParts,
     settings.vertexOrbitLongOnly,
+    settings.vertexOrbitLevel,
+    settings.vertexOrbitStack,
     settings.orbitEdgeA,
     settings.orbitEdgeB,
     settings.showLabels,
     settings.alpha,
     settings.width,
+    settings.yankelovichGamma,
+    settings.yankelovichInvert,
+    settings.yankelovichTone,
+    settings.yankelovichColormap,
     quotientDepth,
   ]);
 
@@ -455,22 +622,72 @@ export function PancakeGraphView() {
     const signal = ac.signal;
 
     const run = async () => {
-      setRunning(true);
+      if (yankelovich) flushSync(() => setRunning(true));
+      else setRunning(true);
       const t0 = performance.now();
+      if (yankelovich) {
+        yankelovichTotalStartRef.current = t0;
+        setYankelovichTotalMs(null);
+      } else {
+        yankelovichTotalStartRef.current = null;
+        setYankelovichTotalMs(null);
+        setYankelovichStage(null);
+      }
+      const timings: PhaseTiming[] = [];
+      let activePhase: string | null = null;
+      let activePhaseStart = t0;
+      const startPhase = (phase: string) => {
+        const now = performance.now();
+        if (activePhase) {
+          timings.push({
+            id: activePhase,
+            label: BUILD_PHASE_LABELS[activePhase] ?? activePhase,
+            elapsedMs: Math.round(now - activePhaseStart),
+          });
+        }
+        activePhase = phase;
+        activePhaseStart = now;
+      };
+      const finishPhase = () => {
+        if (!activePhase) return;
+        const now = performance.now();
+        timings.push({
+          id: activePhase,
+          label: BUILD_PHASE_LABELS[activePhase] ?? activePhase,
+          elapsedMs: Math.round(now - activePhaseStart),
+        });
+        activePhase = null;
+      };
       try {
-        if (symmetryLite) {
+        if (liteBuild) {
           // Built from the recursive fundamental sector only — O((n-1)!), no
           // path/edge arrays. It is synchronous (no chunking needed even at the
           // n = 11 ceiling), so yield one frame first: otherwise setRunning(true)
           // and the blocking build run in the same task and the browser never
           // paints the loading spinner until everything is already done.
-          setStatus(`Computing ${graphPresetLabel(preset)} symmetry for n = ${n}…`);
+          const graphStatus = `Computing ${graphPresetLabel(preset)} symmetry for n = ${n}…`;
+          if (yankelovich) {
+            flushSync(() => {
+              setYankelovichStage("Graph");
+              setStatus(graphStatus);
+            });
+          } else {
+            setStatus(graphStatus);
+          }
           await new Promise<void>((resolve) =>
             requestAnimationFrame(() => resolve())
           );
           if (signal.aborted) return;
-          const g = buildZaksSymmetryGraph(n);
+          startPhase("lite");
+          // Past the enumeration ceiling (n ≥ 12) even the (n-1)! fundamental
+          // sector is too large to materialize; the Yankelovich renderer samples
+          // chords analytically, so hand it the O(n²) sampling payload instead.
+          const g =
+            yankelovich && factorial(n - 1) > 4_000_000
+              ? buildZaksSamplingGraph(n)
+              : buildZaksSymmetryGraph(n);
           if (signal.aborted) return;
+          finishPhase();
           setGraph(g);
           setSettings((s) => {
             const initialHidden = defaultHiddenGenerators(g);
@@ -487,6 +704,7 @@ export function PancakeGraphView() {
             evenEdges: g.evenEdgeCount,
             oddEdges: g.oddEdgeCount,
             elapsedMs: Math.round(performance.now() - t0),
+            timings: [...timings],
           });
           setStatus(`${graphPresetLabel(preset)} drawn.`);
           return;
@@ -497,10 +715,13 @@ export function PancakeGraphView() {
           preset,
           (phase, done, total) => {
             if (signal.aborted) return;
+            if (phase !== activePhase) startPhase(phase);
             const pct = ((done / total) * 100).toFixed(1);
             const label =
               phase === "cycle"
                 ? `Ordering vertices: ${NUMBER_FORMAT.format(done)} / ${NUMBER_FORMAT.format(total)} (${pct}%)`
+                : phase === "index"
+                  ? `Indexing vertices: ${NUMBER_FORMAT.format(done)} / ${NUMBER_FORMAT.format(total)} (${pct}%)`
                 : phase === "edges"
                   ? `Building edges: ${NUMBER_FORMAT.format(done)} / ${NUMBER_FORMAT.format(total)} (${pct}%)`
                   : phase === "parity"
@@ -511,6 +732,7 @@ export function PancakeGraphView() {
           signal
         );
         if (signal.aborted) return;
+        finishPhase();
         setGraph(g);
         // Different presets/n use different generator-id schemes, so reset the
         // hide-list to the new graph's default (empty for most graphs; the
@@ -531,6 +753,7 @@ export function PancakeGraphView() {
           evenEdges: g.evenEdgeCount,
           oddEdges: g.oddEdgeCount,
           elapsedMs: elapsed,
+          timings: [...timings],
         });
         setStatus(`${graphPresetLabel(preset)} drawn.`);
       } catch (e) {
@@ -548,7 +771,7 @@ export function PancakeGraphView() {
       ac.abort();
       clearTimeout(id);
     };
-  }, [n, preset, symmetryLite]);
+  }, [n, preset, liteBuild, yankelovich]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -783,6 +1006,152 @@ export function PancakeGraphView() {
     };
   }, [symmetryLite, graph, settings, stageSize, zoom, pan.x, pan.y, showRenderProgress]);
 
+  // Yankelovich density-field renderer (pancake-zaks only). The expensive
+  // rasterize + n-fold composite is cached by n/size/hidden, so zoom/pan and
+  // gamma tweaks redraw inline (gamma only repaints the grayscale bitmap).
+  useEffect(() => {
+    if (!yankelovich) return;
+    if (running) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const { width, height } = stageSize;
+    if (width === 0 || height === 0) return;
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const draw = () => {
+      drawYankelovichToCanvas(ctx, {
+        n,
+        settings,
+        cssWidth: width,
+        cssHeight: height,
+        dpr,
+        zoom,
+        panX: pan.x,
+        panY: pan.y,
+        topInset: STAGE_INFO_BAR_CLEARANCE,
+        cache: yankelovichCacheRef,
+      });
+    };
+
+    // Only a new field (n / resolution / hidden change) rasterizes — heavy at
+    // large n; cache hits (zoom/pan/gamma) draw inline so interaction stays
+    // smooth. Compare the exact cache key so a resolution bump is treated as a
+    // miss and gets the "Computing…" phase.
+    const fieldReady =
+      yankelovichCacheRef.current?.key ===
+      yankelovichFieldKey({
+        n,
+        settings,
+        cssWidth: width,
+        cssHeight: height,
+        dpr,
+      });
+    // Mirror the cached field's value histogram into state for the sidebar.
+    // Always called from a rAF callback (never synchronously in the effect body)
+    // so it does not trip the cascading-render lint rule.
+    const publishHistogram = () => {
+      const entry = yankelovichCacheRef.current;
+      setYankelovichHistogram(entry?.histogram ?? null);
+      setYankelovichField(entry?.field ?? null);
+    };
+
+    // Cache hits (zoom/pan/gamma/invert) redraw inline; any rebuild (cache miss)
+    // goes through the deferred "Computing…" phase, since even the draft now
+    // super-samples 4× and is never instant.
+    if (fieldReady) {
+      setYankelovichTotalMs(null);
+      setYankelovichTimings([]);
+      const totalT0 = yankelovichTotalStartRef.current ?? performance.now();
+      const renderT0 = performance.now();
+      draw();
+      const canvasMs = performance.now() - renderT0;
+      const totalMs = performance.now() - totalT0;
+      yankelovichTotalStartRef.current = null;
+      const id = requestAnimationFrame(() => {
+        setYankelovichTimings([
+          { id: "canvas", label: "Canvas", elapsedMs: canvasMs },
+        ]);
+        setYankelovichTotalMs(totalMs);
+        publishHistogram();
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    // Two visible phases: the heavy density-field computation (sampling /
+    // rasterization) first, then the cheap tone-map + blit. Each is deferred a
+    // frame so its indicator can paint before the blocking work runs.
+    let cancelled = false;
+    let raf2 = 0;
+    let raf3 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      if (cancelled) return;
+      if (yankelovichTotalStartRef.current === null) {
+        yankelovichTotalStartRef.current = performance.now();
+      }
+      flushSync(() => {
+        setIsComputing(true);
+        setYankelovichStage("Matrix");
+        setYankelovichTotalMs(null);
+        setYankelovichTimings([]);
+        setStatus(`Computing field for n = ${n}…`);
+      });
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        const fieldTimings: YankelovichFieldTimings = {
+          matrixMs: 0,
+          symmetryMs: 0,
+        };
+        ensureYankelovichField({
+          n,
+          settings,
+          cssWidth: width,
+          cssHeight: height,
+          dpr,
+          cache: yankelovichCacheRef,
+          onFieldTimings: (timings) => {
+            fieldTimings.matrixMs = timings.matrixMs;
+            fieldTimings.symmetryMs = timings.symmetryMs;
+          },
+        });
+        flushSync(() => {
+          setIsComputing(false);
+          setIsRendering(true);
+          setYankelovichStage("Canvas");
+          setStatus(`Rendering n = ${n}…`);
+        });
+        raf3 = requestAnimationFrame(() => {
+          if (cancelled) return;
+          const renderT0 = performance.now();
+          draw();
+          const canvasMs = performance.now() - renderT0;
+          const totalT0 = yankelovichTotalStartRef.current ?? renderT0;
+          const totalMs = performance.now() - totalT0;
+          yankelovichTotalStartRef.current = null;
+          setYankelovichTimings(yankelovichPhaseTimings(fieldTimings, canvasMs));
+          setYankelovichTotalMs(totalMs);
+          publishHistogram();
+          setIsRendering(false);
+          setYankelovichStage(null);
+          setStatus(`${graphPresetLabel(preset)} drawn.`);
+        });
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      cancelAnimationFrame(raf3);
+      setIsComputing(false);
+      setIsRendering(false);
+      setYankelovichStage(null);
+      yankelovichTotalStartRef.current = null;
+    };
+  }, [yankelovich, running, n, preset, settings, stageSize, zoom, pan.x, pan.y]);
+
   // Zoom/pan for SVG are driven through the viewBox rather than a CSS
   // transform: changing the viewBox re-rasterizes the vectors crisply at
   // any zoom, whereas `transform: scale()` bitmap-scales a 100k-path SVG
@@ -857,6 +1226,14 @@ export function PancakeGraphView() {
             cssHeight: svgExportSize,
             dpr: 1,
           });
+        } else if (yankelovich) {
+          drawYankelovichToCanvas(ctx, {
+            n: graph.n,
+            settings,
+            cssWidth: svgExportSize,
+            cssHeight: svgExportSize,
+            dpr: 1,
+          });
         } else if (activeRenderer === "quotient") {
           if (!quotient) throw new Error("Quotient is still building.");
           drawQuotientToCanvas(ctx, {
@@ -898,11 +1275,16 @@ export function PancakeGraphView() {
         setStatus(`PNG export error: ${msg}`);
       }
     }, 30);
-  }, [activeRenderer, symmetryLite, graph, quotient, settings, svgExportSize]);
+  }, [activeRenderer, symmetryLite, yankelovich, graph, quotient, settings, svgExportSize]);
 
   const svgDownloadDisabled = useMemo(() => {
     if (!graph) return true;
-    if (activeRenderer === "density" || activeRenderer === "quotient") return true;
+    if (
+      activeRenderer === "density" ||
+      activeRenderer === "quotient" ||
+      activeRenderer === "yankelovich"
+    )
+      return true;
     // The symmetry renderer emits an ~n× smaller file (one sector + rotations),
     // so it stays exportable exactly where the flat SVG would be too large.
     if (activeRenderer === "symmetry" && supportsSymmetry(graph)) return false;
@@ -930,7 +1312,12 @@ export function PancakeGraphView() {
     // Edge density changes too, so move the strength/width sliders to a
     // density-appropriate recommendation for the new graph.
     const rec = recommendedEdgeSliders(nextN, nextPreset);
-    setSettings((s) => ({ ...s, alpha: rec.alpha, width: rec.width }));
+    setSettings((s) => ({
+      ...s,
+      alpha: rec.alpha,
+      width: rec.width,
+      vertexOrbitLevel: nextN,
+    }));
 
     // Reset the quotient depth to the new graph's best default.
     setQuotientDepth(defaultQuotientDepth(nextN, nextPreset));
@@ -952,6 +1339,10 @@ export function PancakeGraphView() {
     }
     // The symmetry renderer only applies to the Zaks pancake layout.
     if (renderer === "symmetry" && !supportsSymmetry({ preset: nextPreset })) {
+      setRenderer("svg");
+    }
+    // The Yankelovich density field is built only for the Zaks pancake layout.
+    if (renderer === "yankelovich" && !supportsYankelovich(nextPreset)) {
       setRenderer("svg");
     }
     setPreset(nextPreset);
@@ -1125,11 +1516,19 @@ export function PancakeGraphView() {
 
   const domainPieceCount = n;
   const vertexCount = factorial(n);
+  // Dihedral recursion level for the vertex-orbit overlay, clamped to [3, n].
+  const orbitLevel = Math.min(Math.max(settings.vertexOrbitLevel ?? n, 3), n);
+  const stackLevels = Array.from(
+    { length: n - orbitLevel + 1 },
+    (_, i) => n - i
+  );
 
   // Stop the animation if the vertex-orbit overlay is turned off, so the
   // play/pause state never lingers while the controls are hidden.
   useEffect(() => {
-    if (!settings.showVertexOrbit && orbitPlaying) setOrbitPlaying(false);
+    if (settings.showVertexOrbit || !orbitPlaying) return;
+    const id = requestAnimationFrame(() => setOrbitPlaying(false));
+    return () => cancelAnimationFrame(id);
   }, [settings.showVertexOrbit, orbitPlaying]);
 
   // Vertex-orbit animation loop: advance the chosen vertex one step at a time
@@ -1137,7 +1536,9 @@ export function PancakeGraphView() {
   // time accumulator so the cadence tracks `orbitSpeed` (vertices/second)
   // regardless of frame rate, and speed changes apply immediately.
   const orbitSpeedRef = useRef(orbitSpeed);
-  orbitSpeedRef.current = orbitSpeed;
+  useEffect(() => {
+    orbitSpeedRef.current = orbitSpeed;
+  }, [orbitSpeed]);
   useEffect(() => {
     if (!orbitPlaying || !settings.showVertexOrbit) return;
     let raf = 0;
@@ -1270,6 +1671,8 @@ export function PancakeGraphView() {
     }));
   };
 
+  const stepTimings = yankelovich ? yankelovichTimings : (metrics?.timings ?? []);
+
   return (
     <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
       <Card className="self-start lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
@@ -1359,17 +1762,6 @@ export function PancakeGraphView() {
                   ))}
                 </SelectContent>
               </Select>
-              {isVeryHeavy ? (
-                <HeavyWarning
-                  title="Massive graph"
-                  body={`${NUMBER_FORMAT.format(estimatedVertices)} vertices and about ${NUMBER_FORMAT.format(estimatedEdges)} edges. Canvas is recommended on-screen; SVG may freeze the browser at this size.`}
-                />
-              ) : isHeavy ? (
-                <HeavyWarning
-                  title="Heavy computation"
-                  body={`${NUMBER_FORMAT.format(estimatedVertices)} vertices and about ${NUMBER_FORMAT.format(estimatedEdges)} edges. Building the graph takes a few seconds; Canvas is recommended on-screen.`}
-                />
-              ) : null}
             </div>
 
             <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
@@ -1382,11 +1774,45 @@ export function PancakeGraphView() {
               />
               <Stat label="Even edges" value={metrics?.evenEdges} />
               <Stat label="Odd edges" value={metrics?.oddEdges} />
+              {yankelovich ? (
+                <Stat
+                  label="Matrix size"
+                  value={
+                    yankelovichField
+                      ? `${NUMBER_FORMAT.format(yankelovichField)} × ${NUMBER_FORMAT.format(yankelovichField)}`
+                      : undefined
+                  }
+                  full
+                />
+              ) : null}
+              {yankelovich ? (
+                <Stat
+                  label="Total time"
+                  value={
+                    yankelovichTotalMs === null
+                      ? undefined
+                      : secondsLabel(yankelovichTotalMs)
+                  }
+                  full
+                />
+              ) : null}
               <Stat
-                label="Time"
-                value={metrics ? `${NUMBER_FORMAT.format(metrics.elapsedMs)} ms` : undefined}
+                label={yankelovich ? "Graph time" : "Time"}
+                value={metrics ? secondsLabel(metrics.elapsedMs) : undefined}
                 full
               />
+              {stepTimings.length ? (
+                <div className="col-span-2 flex items-start justify-between gap-3">
+                  <dt className="text-xs text-muted-foreground">Steps</dt>
+                  <dd className="space-y-0.5 text-right font-mono text-xs">
+                    {stepTimings.map((step, i) => (
+                      <span key={`${step.id}-${i}`} className="block">
+                        {step.label} {secondsLabel(step.elapsedMs)}
+                      </span>
+                    ))}
+                  </dd>
+                </div>
+              ) : null}
             </dl>
           </section>
 
@@ -1410,7 +1836,16 @@ export function PancakeGraphView() {
                   if (v === "svg" && !canUseInteractiveSvg) return;
                   if (v === "quotient" && !supportsQuotient(preset)) return;
                   if (v === "symmetry" && !supportsSymmetry({ preset })) return;
-                  setRenderer(v as Renderer);
+                  if (v === "yankelovich" && !supportsYankelovich(preset)) return;
+                  const next = v as Renderer;
+                  // Leaving Yankelovich for a renderer that enumerates the graph
+                  // must drop n back under that renderer's ceiling.
+                  const cap = maxNForRenderer(preset, next);
+                  if (n > cap) {
+                    setN(cap as NValue);
+                    resetViewForGraph(cap, preset);
+                  }
+                  setRenderer(next);
                 }}
                 className="grid grid-cols-2 gap-2"
               >
@@ -1442,6 +1877,12 @@ export function PancakeGraphView() {
                   checked={activeRenderer === "symmetry"}
                   disabled={!supportsSymmetry({ preset })}
                 />
+                <RendererRadio
+                  value="yankelovich"
+                  label="Yankelovich"
+                  checked={activeRenderer === "yankelovich"}
+                  disabled={!supportsYankelovich(preset)}
+                />
               </RadioGroup>
               {activeRenderer === "density" ? (
                 <p className="text-[11px] leading-snug text-muted-foreground">
@@ -1467,6 +1908,18 @@ export function PancakeGraphView() {
                   via n rotated copies. Identical picture, but the SVG is ~n×
                   smaller — so large n (≥ 9) stays exportable instead of
                   producing a multi-megabyte file.
+                </p>
+              ) : null}
+              {activeRenderer === "yankelovich" ? (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Yankelovich mode (after Israel Yankelovich) rasterizes every
+                  chord into a grid, adding 1 per cell a chord crosses, then shows
+                  the grid as grayscale — so overlapping chords build up bright
+                  envelopes (caustics) instead of saturating to a black disk. Up
+                  to n = 11 it rasterizes the 360/n fundamental sector exactly;
+                  beyond that it samples chords via analytic Zaks rank/unrank, so
+                  it reaches n = 15 ({NUMBER_FORMAT.format(factorial(15))}{" "}
+                  vertices) without ever enumerating the cycle.
                 </p>
               ) : null}
             </div>
@@ -1770,6 +2223,69 @@ export function PancakeGraphView() {
                         the rₙ tag confirms it&apos;s still the full reversal.
                       </p>
                     ) : null}
+                    {n >= 4 ? (
+                      <div className="space-y-2 border-t border-violet-200/60 pt-2.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-medium">
+                            Nested symmetry D<sub>{orbitLevel}</sub>
+                          </span>
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            level {orbitLevel} / {n}
+                          </span>
+                        </div>
+                        <Slider
+                          value={[orbitLevel]}
+                          min={3}
+                          max={n}
+                          step={1}
+                          onValueChange={([v]) => setS("vertexOrbitLevel", v)}
+                          aria-label="Dihedral recursion level"
+                        />
+                        <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
+                          <span>
+                            D<sub>3</sub> deep
+                          </span>
+                          <span>
+                            D<sub>{n}</sub> global
+                          </span>
+                        </div>
+                        <p className="text-[11px] leading-snug text-muted-foreground">
+                          The orbit under the level-m dihedral group: the whole
+                          disk at m = {n}, shrinking into one ever-smaller Zaks
+                          sub-block as m → 3 — the nested tower D<sub>3</sub> ⊂ …
+                          ⊂ D<sub>{n}</sub>.
+                        </p>
+                        <label className="flex cursor-pointer items-center gap-2 text-[11px]">
+                          <input
+                            type="checkbox"
+                            className="h-3.5 w-3.5 accent-violet-600"
+                            checked={settings.vertexOrbitStack ?? false}
+                            onChange={(e) =>
+                              setS("vertexOrbitStack", e.target.checked)
+                            }
+                          />
+                          <span>Stack all levels n → m, colored by depth</span>
+                        </label>
+                        {settings.vertexOrbitStack ? (
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 pt-0.5">
+                            {stackLevels.map((lv) => (
+                              <span
+                                key={lv}
+                                className="inline-flex items-center gap-1 text-[11px]"
+                              >
+                                <span
+                                  className="inline-block h-3 w-3 rounded-sm ring-1 ring-black/10"
+                                  style={{ backgroundColor: levelColor(lv, n) }}
+                                />
+                                <span className="font-mono">
+                                  D<sub>{lv}</sub>
+                                </span>
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -1800,6 +2316,105 @@ export function PancakeGraphView() {
               </div>
             ) : null}
 
+            {yankelovich ? (
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-2">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Tone mapping
+                  </Label>
+                  <Select
+                    value={settings.yankelovichTone ?? "log"}
+                    onValueChange={(v) =>
+                      setS("yankelovichTone", v as YankelovichTone)
+                    }
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent position="popper">
+                      {YANKELOVICH_TONES.map((t) => (
+                        <SelectItem key={t} value={t}>
+                          {YANKELOVICH_TONE_LABELS[t]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Colormap
+                  </Label>
+                  <Select
+                    value={settings.yankelovichColormap ?? "gray"}
+                    onValueChange={(v) =>
+                      setS("yankelovichColormap", v as YankelovichColormap)
+                    }
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent position="popper">
+                      {YANKELOVICH_COLORMAPS.map((c) => (
+                        <SelectItem key={c} value={c}>
+                          {YANKELOVICH_COLORMAP_LABELS[c]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            ) : null}
+
+            {yankelovich ? (
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                <span className="font-medium">Equalize</span> /{" "}
+                <span className="font-medium">CLAHE</span> are scale-free: they
+                reveal the caustic/void web at any n (the log curve flattens it as
+                n grows). CLAHE adds local contrast.
+              </p>
+            ) : null}
+
+            {yankelovich ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Envelope contrast
+                  </Label>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {settings.yankelovichGamma ?? 50}
+                  </span>
+                </div>
+                <Slider
+                  value={[settings.yankelovichGamma ?? 50]}
+                  min={1}
+                  max={100}
+                  step={1}
+                  onValueChange={([v]) => setS("yankelovichGamma", v)}
+                />
+                <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <span>faint envelopes</span>
+                  <span>bright caustics</span>
+                </div>
+                <label className="flex cursor-pointer items-center gap-2 pt-1 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-primary"
+                    checked={settings.yankelovichInvert ?? false}
+                    onChange={(e) =>
+                      setS("yankelovichInvert", e.target.checked)
+                    }
+                  />
+                  <span>Invert — dark chords on white</span>
+                </label>
+              </div>
+            ) : null}
+
+            {yankelovich ? (
+              <FieldHistogram histogram={yankelovichHistogram} />
+            ) : null}
+
+            {!yankelovich ? (
+            <>
             <div className="space-y-2">
               <div className="flex items-center justify-between">
               <Label className="text-xs uppercase tracking-wider text-muted-foreground">
@@ -1843,6 +2458,8 @@ export function PancakeGraphView() {
               <span>thick</span>
             </div>
           </div>
+            </>
+            ) : null}
 
             <div className="space-y-2">
               <Label className="text-xs uppercase tracking-wider text-muted-foreground">
@@ -2028,8 +2645,13 @@ export function PancakeGraphView() {
           className="relative h-[calc(100vh-9rem)] min-h-[680px] w-full bg-white"
         >
           {running || (activeRenderer === "quotient" && quotientLoading) ? (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-white">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 bg-white">
               <Loader2 className="h-12 w-12 animate-spin text-muted-foreground" />
+              {yankelovichStage ? (
+                <p className="font-mono text-5xl font-semibold tracking-tight text-amber-700">
+                  {yankelovichStage}
+                </p>
+              ) : null}
               <div className="flex flex-col items-center gap-1 text-center">
                 <p className="font-mono text-sm">n = {n}</p>
                 <p className="max-w-md text-sm text-muted-foreground">
@@ -2059,6 +2681,7 @@ export function PancakeGraphView() {
                 {activeRenderer === "canvas" ||
                 activeRenderer === "density" ||
                 activeRenderer === "quotient" ||
+                yankelovich ||
                 symmetryLite ? (
                   <canvas ref={canvasRef} className="block h-full w-full" />
                 ) : (
@@ -2068,37 +2691,59 @@ export function PancakeGraphView() {
                   />
                 )}
               </div>
-              {isRendering ? (
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-3 bg-white/55 backdrop-blur-[1px]">
-                  <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-                  <span className="text-sm font-medium text-muted-foreground">
-                    Rendering…
+              {isComputing || isRendering ? (
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-5 bg-white">
+                  <Loader2
+                    className={`h-12 w-12 animate-spin ${
+                      isComputing ? "text-amber-600" : "text-sky-600"
+                    }`}
+                  />
+                  <span
+                    className={`font-mono text-5xl font-semibold tracking-tight ${
+                      isComputing ? "text-amber-700" : "text-sky-700"
+                    }`}
+                  >
+                    {yankelovichStage ??
+                      (isComputing ? "Computing density field…" : "Rendering…")}
                   </span>
+                  <span className="text-sm text-muted-foreground">{status}</span>
                 </div>
               ) : null}
               <div className="absolute left-3 top-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border bg-background/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
                 <span className="font-mono">n = {n}</span>
-                {isRendering || graph ? (
+                {isComputing || isRendering || graph ? (
                   <>
                     <span>·</span>
                     <span
                       className={`inline-flex items-center gap-1 ${
-                        isRendering ? "text-amber-600" : "text-emerald-600"
+                        isComputing
+                          ? "text-amber-600"
+                          : isRendering
+                            ? "text-sky-600"
+                            : "text-emerald-600"
                       }`}
                       title={
-                        isRendering
-                          ? "Generating and drawing the figure"
-                          : "Figure is fully drawn"
+                        isComputing
+                          ? "Computing the density field"
+                          : isRendering
+                            ? "Drawing the figure"
+                            : "Figure is fully drawn"
                       }
                     >
                       <span
                         className={`inline-block h-2 w-2 rounded-full ${
-                          isRendering
+                          isComputing
                             ? "animate-pulse bg-amber-500"
-                            : "bg-emerald-500"
+                            : isRendering
+                              ? "animate-pulse bg-sky-500"
+                              : "bg-emerald-500"
                         }`}
                       />
-                      {isRendering ? "Rendering" : "Done"}
+                      {isComputing
+                        ? "Computing"
+                        : isRendering
+                          ? "Rendering"
+                          : "Done"}
                     </span>
                   </>
                 ) : null}
@@ -2433,6 +3078,80 @@ function DistanceHistogram({
   );
 }
 
+function FieldHistogram({
+  histogram,
+}: {
+  histogram: YankelovichHistogram | null;
+}) {
+  if (!histogram) {
+    return (
+      <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
+        <h3 className="text-xs font-medium">Matrix value histogram</h3>
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          Computing the density field…
+        </p>
+      </div>
+    );
+  }
+  const { bins, max, norm, nonZero, total } = histogram;
+  const maxCount = bins.reduce((m, c) => Math.max(m, c), 0);
+  const logMax = Math.log1p(maxCount);
+  // Bin index where the tone-map white point (norm) falls.
+  const normBin =
+    max > 0 ? Math.min(bins.length - 1, Math.floor((norm / max) * bins.length)) : 0;
+  const filledPct = total > 0 ? (nonZero / total) * 100 : 0;
+
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <h3 className="text-xs font-medium">Matrix value histogram</h3>
+          <p className="text-[10px] text-muted-foreground">
+            density per cell · log count · {bins.length} bins
+          </p>
+        </div>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {filledPct.toFixed(1)}% of disk filled
+        </span>
+      </div>
+
+      <div className="flex h-20 items-end gap-px">
+        {bins.map((count, i) => {
+          const h = logMax > 0 ? (Math.log1p(count) / logMax) * 100 : 0;
+          const isNorm = i === normBin;
+          return (
+            <div
+              key={i}
+              className="flex-1 rounded-sm"
+              style={{
+                height: `${count > 0 ? Math.max(h, 3) : 0}%`,
+                backgroundColor: isNorm
+                  ? "#f59e0b"
+                  : "rgba(99, 102, 241, 0.7)",
+              }}
+              title={`[${((i / bins.length) * max).toFixed(0)} – ${(
+                ((i + 1) / bins.length) *
+                max
+              ).toFixed(0)}]: ${NUMBER_FORMAT.format(count)} cells`}
+            />
+          );
+        })}
+      </div>
+
+      <div className="flex justify-between font-mono text-[10px] text-muted-foreground">
+        <span>0</span>
+        <span>max {NUMBER_FORMAT.format(Math.round(max))}</span>
+      </div>
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        Distribution of the N×N density matrix (empty cells excluded). The{" "}
+        <span className="font-medium text-amber-600">amber</span> bar is the
+        normalization white point (p99.9); everything at or above it maps to
+        full white.
+      </p>
+    </div>
+  );
+}
+
 function ParityCount({
   color,
   label,
@@ -2455,18 +3174,6 @@ function ParityCount({
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
           {label}
         </span>
-      </div>
-    </div>
-  );
-}
-
-function HeavyWarning({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="flex gap-2 rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900">
-      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-      <div className="space-y-0.5">
-        <p className="font-medium">{title}</p>
-        <p className="leading-snug">{body}</p>
       </div>
     </div>
   );
