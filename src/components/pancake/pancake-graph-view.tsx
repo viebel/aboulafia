@@ -1417,33 +1417,28 @@ export function PancakeGraphView() {
                 <RendererRadio
                   value="svg"
                   label="SVG"
-                  hint="vector · crisp zoom"
                   checked={activeRenderer === "svg"}
                   disabled={!canUseInteractiveSvg}
                 />
                 <RendererRadio
                   value="canvas"
                   label="Canvas"
-                  hint="raster · large n"
                   checked={activeRenderer === "canvas"}
                 />
                 <RendererRadio
                   value="density"
                   label="Density"
-                  hint="x-ray · binned"
                   checked={activeRenderer === "density"}
                 />
                 <RendererRadio
                   value="quotient"
                   label="Quotient"
-                  hint="blocks · recursive"
                   checked={activeRenderer === "quotient"}
                   disabled={!supportsQuotient(preset)}
                 />
                 <RendererRadio
                   value="symmetry"
                   label="Symmetry"
-                  hint="vector · 360/n folds"
                   checked={activeRenderer === "symmetry"}
                   disabled={!supportsSymmetry({ preset })}
                 />
@@ -2290,13 +2285,11 @@ function IndexStepper({
 function RendererRadio({
   value,
   label,
-  hint,
   checked,
   disabled,
 }: {
   value: Renderer;
   label: string;
-  hint: string;
   checked: boolean;
   disabled?: boolean;
 }) {
@@ -2312,12 +2305,7 @@ function RendererRadio({
       }`}
     >
       <RadioGroupItem id={`renderer-${value}`} value={value} disabled={disabled} />
-      <div className="flex flex-col">
-        <span className="font-medium">{label}</span>
-        <span className="text-[10px] font-normal text-muted-foreground">
-          {hint}
-        </span>
-      </div>
+      <span className="font-medium">{label}</span>
     </Label>
   );
 }
