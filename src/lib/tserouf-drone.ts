@@ -605,7 +605,7 @@ export class TseroufDronePlayer {
   private notes: TseroufNote[] = [];
   private noteSeconds = DEFAULT_NOTE_SECONDS;
   private loop = false;
-  private onStep?: (wordIndex: number) => void;
+  private onStep?: (wordIndex: number, letterIndex?: number) => void;
   private onEnd?: () => void;
 
   private wordIdx = 0;
@@ -615,7 +615,7 @@ export class TseroufDronePlayer {
   private playing = false;
   private paused = false;
 
-  private uiQueue: { time: number; wordIndex: number }[] = [];
+  private uiQueue: { time: number; wordIndex: number; letterIndex: number }[] = [];
 
   get isPlaying(): boolean {
     return this.playing;
@@ -744,7 +744,15 @@ export class TseroufDronePlayer {
         this.nextWordTime
       );
       if (end > this.lastVoiceEnd) this.lastVoiceEnd = end;
-      this.uiQueue.push({ time: this.nextWordTime, wordIndex: this.wordIdx });
+      const word = this.notes[this.wordIdx]?.word ?? "";
+      const { beat } = chantTiming(this.notes, this.wordIdx, this.noteSeconds);
+      this.uiQueue.push(
+        ...Array.from(word).map((_, letterIndex) => ({
+          time: this.nextWordTime + letterIndex * beat,
+          wordIndex: this.wordIdx,
+          letterIndex,
+        }))
+      );
 
       this.nextWordTime += advance;
       this.wordIdx += 1;
@@ -753,7 +761,7 @@ export class TseroufDronePlayer {
 
     while (this.uiQueue.length > 0 && this.uiQueue[0].time <= ctx.currentTime) {
       const next = this.uiQueue.shift()!;
-      this.onStep?.(next.wordIndex);
+      this.onStep?.(next.wordIndex, next.letterIndex);
     }
 
     if (this.finishedScheduling && this.loop) {

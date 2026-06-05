@@ -48,6 +48,8 @@ import {
   createContext,
   Fragment,
   type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent,
   useCallback,
   useContext,
   useEffect,
@@ -110,23 +112,9 @@ type SoundKind = "invention" | "drone";
 const soundKindFor = (choice: SoundChoice): SoundKind =>
   choice === DRONE_CHOICE ? "drone" : "invention";
 
-// A single speed control, as a percentage of each engine's natural tempo (the
-// two engines have very different default note lengths, so one *relative* knob
-// scales both while keeping their character). 100% = default.
-const SPEED_MIN = 50;
-const SPEED_MAX = 200;
-const SPEED_STEP = 10;
-const SPEED_OPTIONS: readonly number[] = Array.from(
-  { length: (SPEED_MAX - SPEED_MIN) / SPEED_STEP + 1 },
-  (_, i) => SPEED_MIN + i * SPEED_STEP
-);
-const DEFAULT_SPEED = 100;
-// The reference tempo (100%) is what used to be 80%: 0.18 / 0.8 = 0.225 and
-// 0.66 / 0.8 = 0.825, i.e. a touch slower than the old default.
-const BASE_STEP_SECONDS = 0.225; // invention: seconds per note at 100%
-const BASE_NOTE_SECONDS = 0.825; // meditation/chant: seconds per note at 100%
-const stepSecondsForSpeed = (speed: number) => BASE_STEP_SECONDS / (speed / 100);
-const noteSecondsForSpeed = (speed: number) => BASE_NOTE_SECONDS / (speed / 100);
+const TEMPO_OPTIONS = [60, 72, 88, 108, 128, 152, 176, 208, 240] as const;
+const DEFAULT_TEMPO = 128;
+const secondsPerBeat = (tempo: number) => 60 / tempo;
 
 interface TseroufState {
   n: NValue;
@@ -134,7 +122,7 @@ interface TseroufState {
   layout: Layout;
   letterSet: LetterSet;
   instrument: SoundChoice;
-  speed: number;
+  tempo: number;
   loop: boolean;
 }
 
@@ -147,22 +135,22 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     SOUND_IDS,
     DEFAULT_INSTRUMENT
   );
-  const speed = readIntParam(params, "speed", SPEED_OPTIONS, DEFAULT_SPEED);
+  const tempo = readIntParam(params, "tempo", TEMPO_OPTIONS, DEFAULT_TEMPO);
   const loop = readEnumParam(params, "loop", ["0", "1"], "0") === "1";
 
   // The "elohim" set is a fixed 5-letter Hebrew word, so it pins n and alphabet.
   if (letterSet === "elohim") {
-    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, speed, loop };
+    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, loop };
   }
 
   // The "amash" set is the three mother letters, a fixed 3-letter Hebrew word.
   if (letterSet === "amash") {
-    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, speed, loop };
+    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, loop };
   }
 
   // The "yhw" set is a fixed 3-letter Hebrew word.
   if (letterSet === "yhw") {
-    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, speed, loop };
+    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, loop };
   }
 
   return {
@@ -171,7 +159,7 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     layout,
     letterSet,
     instrument,
-    speed,
+    tempo,
     loop,
   };
 }
@@ -192,20 +180,27 @@ function useHebrewLetters(): readonly string[] {
 type TileRegister = (word: string, el: HTMLElement | null) => void;
 const TileRegisterContext = createContext<TileRegister | null>(null);
 
-// The permutation currently sounding during playback, so tiles can highlight.
-const PlayingWordContext = createContext<string | null>(null);
+interface PlaybackFocus {
+  word: string;
+  wordIndex: number;
+  sequenceIndex: number;
+  sequenceLength: number;
+  letterIndex: number;
+  mode: PlaybackMode;
+}
+
+// The permutation and letter currently sounding during playback.
+const PlayingFocusContext = createContext<PlaybackFocus | null>(null);
 
 // Clicking a word starts playback from it; tiles call this with their word.
 const PlayWordContext = createContext<((word: string) => void) | null>(null);
 
 interface TonePreviewSettings {
   kind: SoundKind;
-  playState: "stopped" | "playing" | "paused";
 }
 
 const TonePreviewContext = createContext<TonePreviewSettings>({
   kind: "invention",
-  playState: "stopped",
 });
 
 interface EdgeSpec {
@@ -238,6 +233,17 @@ type RecCell =
   | { kind: "pair"; words: ZaksWord[] }
   | { kind: "group"; level: number; children: RecCell[] };
 
+type PlaybackMode = "impro" | "zaks";
+
+interface ImproPathStep {
+  word: string;
+  sourceIndex: number;
+  note: ZaksWord;
+  role: string;
+  duration: string;
+  durationRatio: number;
+}
+
 export function TseroufView() {
   const searchParams = useSearchParams();
   const initial = useMemo(() => readTseroufState(searchParams), [searchParams]);
@@ -246,8 +252,9 @@ export function TseroufView() {
   const [layout, setLayout] = useState<Layout>(initial.layout);
   const [letterSet, setLetterSet] = useState<LetterSet>(initial.letterSet);
   const [instrument, setInstrument] = useState<SoundChoice>(initial.instrument);
-  const [speed, setSpeed] = useState<number>(initial.speed);
+  const [tempo, setTempo] = useState<number>(initial.tempo);
   const [loopPlayback, setLoopPlayback] = useState<boolean>(initial.loop);
+  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("impro");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
@@ -256,7 +263,7 @@ export function TseroufView() {
   const [playState, setPlayState] = useState<"stopped" | "playing" | "paused">(
     "stopped"
   );
-  const [playingWord, setPlayingWord] = useState<string | null>(null);
+  const [playingFocus, setPlayingFocus] = useState<PlaybackFocus | null>(null);
   const [renderingAudio, setRenderingAudio] = useState(false);
   const renderRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<TseroufPlayer | TseroufDronePlayer | null>(null);
@@ -271,6 +278,21 @@ export function TseroufView() {
   const recursiveCell = useMemo(
     () => (words.length > 0 ? buildRecursiveCells(words, n) : null),
     [n, words]
+  );
+  const improPath = useMemo(
+    () => buildImprovisationPath(words, baseWord),
+    [baseWord, words]
+  );
+  const improEnabled = n === 4 && improPath.length > 0;
+  const effectivePlaybackMode: PlaybackMode =
+    playbackMode === "impro" && !improEnabled ? "zaks" : playbackMode;
+  const playbackSteps = useMemo(
+    () => (effectivePlaybackMode === "impro" ? improPath : null),
+    [effectivePlaybackMode, improPath]
+  );
+  const playbackNotes = useMemo(
+    () => (playbackSteps ? playbackSteps.map((step) => step.note) : words),
+    [playbackSteps, words]
   );
   const clipboardText = useMemo(
     () =>
@@ -303,10 +325,10 @@ export function TseroufView() {
       alphabet,
       layout,
       instrument,
-      speed: String(speed),
+      tempo: String(tempo),
       loop: loopPlayback ? "1" : null,
     });
-  }, [n, alphabet, layout, letterSet, instrument, speed, loopPlayback]);
+  }, [n, alphabet, layout, letterSet, instrument, tempo, loopPlayback]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -398,12 +420,17 @@ export function TseroufView() {
   const stopPlayback = useCallback(() => {
     playerRef.current?.stop();
     setPlayState("stopped");
-    setPlayingWord(null);
+    setPlayingFocus(null);
   }, []);
 
-  const startPlayback = (startIndex = 0) => {
-    if (words.length === 0) return;
-    const kind = soundKindFor(instrument);
+  const startPlayback = (
+    startIndex = 0,
+    mode: PlaybackMode = effectivePlaybackMode
+  ) => {
+    const activeSteps = mode === "impro" ? improPath : null;
+    const activeNotes = activeSteps ? activeSteps.map((step) => step.note) : words;
+    if (activeNotes.length === 0) return;
+    const kind = mode === "impro" ? "invention" : soundKindFor(instrument);
     // The drone and the invention are different engines; swap the player if the
     // selected kind no longer matches the one we built last time.
     if (!playerRef.current || playerKindRef.current !== kind) {
@@ -414,20 +441,51 @@ export function TseroufView() {
     }
     setPlayState("playing");
     setStatus(
-      kind === "drone"
+      mode === "impro"
+        ? "Playing the guitar improvisation path…"
+        : kind === "drone"
         ? "Playing the zikr drone of Tserouf…"
         : "Playing the music of Tserouf…"
     );
-    playerRef.current.play(words, {
+    playerRef.current.play(activeNotes, {
       loop: loopPlayback,
       startIndex,
-      instrument: kind === "invention" ? (instrument as InstrumentId) : undefined,
-      stepSeconds: stepSecondsForSpeed(speed),
-      noteSeconds: noteSecondsForSpeed(speed),
-      onStep: (index) => setPlayingWord(words[index]?.word ?? null),
+      loopStartIndex:
+        mode === "impro" &&
+        activeNotes.length > 1 &&
+        activeNotes[0]?.word === activeNotes[activeNotes.length - 1]?.word
+          ? 1
+          : 0,
+      instrument:
+        kind === "invention"
+          ? mode === "impro"
+            ? "guitar"
+            : (instrument as InstrumentId)
+          : undefined,
+      playbackStyle: mode === "impro" ? "guitar-impro" : "strict",
+      stepSeconds: secondsPerBeat(tempo),
+      noteSeconds: secondsPerBeat(tempo),
+      onStep: (index, letterIndex = 0) => {
+        const note = activeNotes[index];
+        const pathStep = activeSteps?.[index];
+        const sourceIndex = pathStep?.sourceIndex ?? index;
+        const word = note?.word;
+        setPlayingFocus(
+          word === undefined
+            ? null
+            : {
+                word,
+                wordIndex: sourceIndex,
+                sequenceIndex: index,
+                sequenceLength: activeNotes.length,
+                letterIndex,
+                mode,
+              }
+        );
+      },
       onEnd: () => {
         setPlayState("stopped");
-        setPlayingWord(null);
+        setPlayingFocus(null);
         setStatus("Tserouf playback finished.");
       },
     });
@@ -444,15 +502,31 @@ export function TseroufView() {
 
   const playFromWord = useCallback(
     (word: string) => {
+      const pathIndex = playbackSteps?.findIndex((step) => step.word === word);
+      if (improEnabled && pathIndex !== undefined && pathIndex >= 0) {
+        playerRef.current?.stop();
+        startPlayback(pathIndex, "impro");
+        return;
+      }
       const index = wordIndexMap.get(word);
       if (index === undefined) return;
       playerRef.current?.stop();
-      startPlayback(index);
+      setPlaybackMode("zaks");
+      startPlayback(index, "zaks");
     },
     // startPlayback closes over current controls but is stable enough here;
     // wordIndexMap changes whenever the sequence does.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [wordIndexMap, instrument, loopPlayback, speed, words]
+    [
+      effectivePlaybackMode,
+      improEnabled,
+      wordIndexMap,
+      instrument,
+      loopPlayback,
+      playbackMode,
+      tempo,
+      words,
+    ]
   );
 
   const togglePlay = () => {
@@ -465,10 +539,20 @@ export function TseroufView() {
     if (playState === "paused") {
       playerRef.current?.resume();
       setPlayState("playing");
-      setStatus("Playing the music of Tserouf…");
+      setStatus(
+        effectivePlaybackMode === "impro"
+          ? "Playing the guitar improvisation path…"
+          : "Playing the music of Tserouf…"
+      );
       return;
     }
     startPlayback();
+  };
+
+  const handlePlaybackModeChange = (mode: PlaybackMode) => {
+    if (mode === "impro" && !improEnabled) return;
+    setPlaybackMode(mode);
+    if (playState !== "stopped") stopPlayback();
   };
 
   const resetPlayback = () => {
@@ -476,13 +560,13 @@ export function TseroufView() {
     setStatus("Ready.");
   };
 
-  const handleSpeedChange = (value: number) => {
-    setSpeed(value);
+  const handleTempoChange = (value: number) => {
+    setTempo(value);
     const player = playerRef.current;
     if (player instanceof TseroufPlayer) {
-      player.setStepSeconds(stepSecondsForSpeed(value));
+      player.setStepSeconds(secondsPerBeat(value));
     } else if (player instanceof TseroufDronePlayer) {
-      player.setNoteSeconds(noteSecondsForSpeed(value));
+      player.setNoteSeconds(secondsPerBeat(value));
     }
   };
 
@@ -510,18 +594,23 @@ export function TseroufView() {
     setStatus("Rendering audio…");
     try {
       const blob =
-        soundKindFor(instrument) === "drone"
-          ? await renderTseroufDroneWav(words, {
-              noteSeconds: noteSecondsForSpeed(speed),
+        effectivePlaybackMode !== "impro" && soundKindFor(instrument) === "drone"
+          ? await renderTseroufDroneWav(playbackNotes, {
+              noteSeconds: secondsPerBeat(tempo),
             })
-          : await renderTseroufWav(words, {
-              instrument: instrument as InstrumentId,
-              stepSeconds: stepSecondsForSpeed(speed),
+          : await renderTseroufWav(playbackNotes, {
+              instrument:
+                effectivePlaybackMode === "impro"
+                  ? "guitar"
+                  : (instrument as InstrumentId),
+              playbackStyle:
+                effectivePlaybackMode === "impro" ? "guitar-impro" : "strict",
+              stepSeconds: secondsPerBeat(tempo),
             });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `tserouf_${baseWord}_${instrument}.wav`;
+      a.download = `tserouf_${baseWord}_${effectivePlaybackMode}_${instrument}.wav`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -640,6 +729,49 @@ export function TseroufView() {
             </Select>
           </div>
 
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              variant={playState !== "stopped" ? "default" : "outline"}
+              size="icon"
+              className="h-11 w-11"
+              aria-label={
+                playState === "playing"
+                  ? "Pause playback"
+                  : playState === "paused"
+                  ? "Resume playback"
+                  : "Start playback"
+              }
+              title={
+                playState === "playing"
+                  ? "Pause"
+                  : playState === "paused"
+                  ? "Resume"
+                  : "Play"
+              }
+              onClick={togglePlay}
+              disabled={running || words.length === 0}
+            >
+              {playState === "playing" ? (
+                <Pause className="h-5 w-5" />
+              ) : (
+                <Play className="h-5 w-5" />
+              )}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-11 w-11"
+              aria-label="Reset playback"
+              title="Reset"
+              onClick={resetPlayback}
+              disabled={running || playState === "stopped"}
+            >
+              <RotateCcw className="h-5 w-5" />
+            </Button>
+          </div>
+
           <Button
             type="button"
             variant="outline"
@@ -731,24 +863,10 @@ export function TseroufView() {
           </div>
 
           <div className="space-y-2">
-            <div className="flex items-baseline justify-between">
-              <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-                Speed
-              </Label>
-              <span className="text-xs tabular-nums text-muted-foreground">
-                {speed}%
-              </span>
-            </div>
-            <input
-              type="range"
-              min={SPEED_MIN}
-              max={SPEED_MAX}
-              step={SPEED_STEP}
-              value={speed}
-              onChange={(e) => handleSpeedChange(Number(e.target.value))}
-              className="w-full accent-primary"
-              aria-label="Playback speed"
-            />
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Tempo
+            </Label>
+            <TempoKnob tempo={tempo} onChange={handleTempoChange} />
           </div>
 
           <div className="space-y-2">
@@ -777,38 +895,6 @@ export function TseroufView() {
                 />
               </div>
             </div>
-          </div>
-
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              variant={playState !== "stopped" ? "default" : "outline"}
-              className="flex-1"
-              onClick={togglePlay}
-              disabled={running || words.length === 0}
-            >
-              {playState === "playing" ? (
-                <Pause className="h-4 w-4" />
-              ) : (
-                <Play className="h-4 w-4" />
-              )}
-              {playState === "playing"
-                ? "pause"
-                : playState === "paused"
-                ? "resume"
-                : "play the music of Tserouf"}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              aria-label="Reset playback"
-              title="Reset"
-              onClick={resetPlayback}
-              disabled={running || playState === "stopped"}
-            >
-              <RotateCcw className="h-4 w-4" />
-            </Button>
           </div>
 
           <Button
@@ -856,16 +942,58 @@ export function TseroufView() {
             </div>
           ) : recursiveCell ? (
             <HebrewLettersContext.Provider value={hebrewLetters}>
-              <PlayingWordContext.Provider value={playingWord}>
+              <PlayingFocusContext.Provider value={playingFocus}>
                 <PlayWordContext.Provider value={playFromWord}>
                   <TonePreviewContext.Provider
                     value={{
                       kind: soundKindFor(instrument),
-                      playState,
                     }}
                   >
+                    <div className="mb-4 flex justify-end">
+                      <div className="grid grid-cols-2 gap-1 rounded-md border p-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={
+                            effectivePlaybackMode === "impro" ? "default" : "ghost"
+                          }
+                          className="h-8"
+                          onClick={() => handlePlaybackModeChange("impro")}
+                          disabled={!improEnabled}
+                        >
+                          Impro path
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={
+                            effectivePlaybackMode === "zaks" ? "default" : "ghost"
+                          }
+                          className="h-8"
+                          onClick={() => handlePlaybackModeChange("zaks")}
+                        >
+                          Full Zaks
+                        </Button>
+                      </div>
+                    </div>
                     <div ref={renderRef} className="p-2 font-mono text-sm">
-                      {layout === "tree" ? (
+                      {effectivePlaybackMode === "impro" ? (
+                        <ImproPathView
+                          path={improPath}
+                          activeIndex={
+                            playingFocus?.mode === "impro"
+                              ? playingFocus.sequenceIndex
+                              : null
+                          }
+                          alphabet={alphabet}
+                          kind={soundKindFor(instrument)}
+                          onStepClick={(index) => {
+                            playerRef.current?.stop();
+                            setPlaybackMode("impro");
+                            startPlayback(index, "impro");
+                          }}
+                        />
+                      ) : layout === "tree" ? (
                         <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
                       ) : (
                         <FlatWordsView words={words} alphabet={alphabet} n={n} />
@@ -873,7 +1001,7 @@ export function TseroufView() {
                     </div>
                   </TonePreviewContext.Provider>
                 </PlayWordContext.Provider>
-              </PlayingWordContext.Provider>
+              </PlayingFocusContext.Provider>
             </HebrewLettersContext.Provider>
           ) : null}
         </CardContent>
@@ -912,6 +1040,425 @@ function SourcePassage() {
       </figcaption>
     </figure>
   );
+}
+
+function TempoKnob({
+  tempo,
+  onChange,
+}: {
+  tempo: number;
+  onChange: (tempo: number) => void;
+}) {
+  const optionIndex = Math.max(
+    0,
+    TEMPO_OPTIONS.findIndex((option) => option === tempo)
+  );
+  const option = TEMPO_OPTIONS[optionIndex] ?? TEMPO_OPTIONS[0];
+  const pct = optionIndex / Math.max(1, TEMPO_OPTIONS.length - 1);
+  const angle = -135 + pct * 270;
+  const progressDeg = pct * 270;
+
+  const setFromPointer = (event: PointerEvent<HTMLButtonElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let degrees =
+      (Math.atan2(event.clientY - cy, event.clientX - cx) * 180) / Math.PI + 90;
+    if (degrees > 180) degrees -= 360;
+    const clamped = Math.max(-135, Math.min(135, degrees));
+    const nextPct = (clamped + 135) / 270;
+    const nextIndex = Math.round(nextPct * (TEMPO_OPTIONS.length - 1));
+    onChange(TEMPO_OPTIONS[nextIndex]);
+  };
+
+  const setByStep = (delta: number) => {
+    const nextIndex = Math.max(
+      0,
+      Math.min(TEMPO_OPTIONS.length - 1, optionIndex + delta)
+    );
+    onChange(TEMPO_OPTIONS[nextIndex]);
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "ArrowRight" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setByStep(1);
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
+      event.preventDefault();
+      setByStep(-1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      onChange(TEMPO_OPTIONS[0]);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      onChange(TEMPO_OPTIONS[TEMPO_OPTIONS.length - 1]);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      role="slider"
+      aria-label="Tempo"
+      aria-valuemin={TEMPO_OPTIONS[0]}
+      aria-valuemax={TEMPO_OPTIONS[TEMPO_OPTIONS.length - 1]}
+      aria-valuenow={option}
+      aria-valuetext={`${option} BPM`}
+      title={`${option} BPM`}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId);
+        setFromPointer(event);
+      }}
+      onPointerMove={(event) => {
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          setFromPointer(event);
+        }
+      }}
+      onKeyDown={handleKeyDown}
+      className="group flex w-full items-center justify-center rounded-md border bg-card/50 py-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+    >
+      <span
+        className="relative flex h-28 w-28 items-center justify-center rounded-full border bg-background shadow-inner"
+        aria-hidden
+        style={{
+          backgroundImage: `conic-gradient(from 225deg, var(--primary) 0deg, var(--primary) ${progressDeg}deg, transparent ${progressDeg}deg)`,
+        }}
+      >
+        <span className="absolute inset-3 rounded-full bg-card" />
+        <span
+          className="absolute left-1/2 top-1/2 h-10 w-1 origin-bottom rounded-full bg-primary"
+          style={{
+            transform: `translate(-50%, -100%) rotate(${angle}deg)`,
+          }}
+        />
+        <span className="relative flex flex-col items-center leading-none">
+          <span className="font-mono text-2xl tabular-nums">{option}</span>
+          <span className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+            BPM
+          </span>
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function ImproPathView({
+  path,
+  activeIndex,
+  alphabet,
+  kind,
+  onStepClick,
+}: {
+  path: ImproPathStep[];
+  activeIndex: number | null;
+  alphabet: Alphabet;
+  kind: SoundKind;
+  onStepClick: (index: number) => void;
+}) {
+  const stable = stablePositions(path.map((step) => step.note));
+  const containerRef = useRef<HTMLDivElement>(null);
+  const tileRefs = useRef<(HTMLElement | null)[]>([]);
+  const [edges, setEdges] = useState<EdgeSpec[]>([]);
+  const [overlaySize, setOverlaySize] = useState<{ w: number; h: number }>({
+    w: 0,
+    h: 0,
+  });
+  const grid = useMemo(() => improTimeGrid(path), [path]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const measure = () => {
+      const cRect = container.getBoundingClientRect();
+      setOverlaySize({ w: cRect.width, h: cRect.height });
+      const specs: EdgeSpec[] = [];
+      for (const row of grid.rows) {
+        for (let i = 0; i < row.cells.length - 1; i++) {
+          const current = row.cells[i];
+          const next = row.cells[i + 1];
+          const aEl = tileRefs.current[current.index];
+          const bEl = tileRefs.current[next.index];
+          if (!aEl || !bEl) continue;
+          specs.push(
+            buildEdge(
+              relRect(aEl, cRect),
+              relRect(bEl, cRect),
+              current.step.note.flip
+            )
+          );
+        }
+      }
+      setEdges(specs);
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    let cancelled = false;
+    if (typeof document !== "undefined" && document.fonts?.ready) {
+      document.fonts.ready.then(() => {
+        if (!cancelled) measure();
+      });
+    }
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [alphabet, grid, path]);
+
+  return (
+    <section
+      className="block max-w-full rounded-xl p-4"
+      style={{
+        backgroundColor: tintFor(0, 0.035),
+      }}
+    >
+      <div
+        ref={containerRef}
+        className="relative flex w-full flex-col gap-8 font-mono text-sm"
+      >
+        {grid.rows.map((row, rowIndex) => (
+          <div
+            key={rowIndex}
+            className="grid w-full items-start"
+            style={{
+              gridTemplateColumns: `repeat(${grid.unitsPerRow}, minmax(22px, 1fr))`,
+              backgroundImage:
+                "linear-gradient(to right, rgba(217,119,6,0.18) 1px, transparent 1px)",
+              backgroundSize: `${100 / grid.unitsPerRow}% 100%`,
+              paddingTop: 8,
+              paddingBottom: 8,
+            }}
+          >
+            {row.cells.map(({ step, index, start, span }) => (
+              <ImproPathTile
+                key={`${index}-${step.word}`}
+                step={step}
+                index={index}
+                active={activeIndex === index}
+                stable={stable}
+                alphabet={alphabet}
+                kind={kind}
+                register={(el) => {
+                  tileRefs.current[index] = el;
+                }}
+                onClick={() => onStepClick(index)}
+                style={{
+                  gridColumn: `${start + 1} / span ${span}`,
+                }}
+              />
+            ))}
+          </div>
+        ))}
+        <EdgeOverlay
+          edges={edges}
+          width={overlaySize.w}
+          height={overlaySize.h}
+        />
+      </div>
+    </section>
+  );
+}
+
+function ImproPathTile({
+  step,
+  index,
+  active,
+  stable,
+  alphabet,
+  kind,
+  register,
+  onClick,
+  style,
+}: {
+  step: ImproPathStep;
+  index: number;
+  active: boolean;
+  stable: boolean[];
+  alphabet: Alphabet;
+  kind: SoundKind;
+  register: (el: HTMLButtonElement | null) => void;
+  onClick: () => void;
+  style?: CSSProperties;
+}) {
+  const isHebrew = alphabet === "hebrew";
+  const hebrewLetters = useHebrewLetters();
+  const playingFocus = useContext(PlayingFocusContext);
+
+  return (
+    <button
+      ref={register}
+      type="button"
+      dir={isHebrew ? "rtl" : "ltr"}
+      onClick={onClick}
+      title={`${index + 1}. ${step.role} · ${tonePreviewTitle(step.word, kind)}`}
+      style={style}
+      className={`mx-2 inline-flex flex-col items-stretch rounded-md border px-1.5 py-1 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background ${parityClassName(
+        step.word
+      )} ${
+        active
+          ? `ring-2 ring-offset-1 ring-offset-background ${
+              isEvenPermutationWord(step.word)
+                ? "ring-sky-500 dark:ring-sky-300"
+                : "ring-rose-500 dark:ring-rose-300"
+            }`
+          : ""
+      } ${
+        isHebrew
+          ? "font-[family-name:var(--font-hebrew)] font-medium"
+          : "font-[family-name:var(--font-mystic)]"
+      }`}
+    >
+      <span className="mb-0.5 flex items-center justify-between gap-3 font-mono text-[10px] leading-none opacity-70">
+        <span dir="ltr">{index + 1}</span>
+        <span dir="ltr">{step.duration}</span>
+      </span>
+      <span className="inline-flex justify-center">
+        {Array.from(step.word).map((letter, letterIndex) => (
+          <span
+            key={letterIndex}
+            className={letterClassName(
+              stable,
+              letterIndex,
+              active && playingFocus?.letterIndex === letterIndex
+            )}
+          >
+            {displayLetter(letter, alphabet, hebrewLetters)}
+          </span>
+        ))}
+      </span>
+      <TonalPreview word={step.word} kind={kind} />
+    </button>
+  );
+}
+
+function improTimeGrid(path: ImproPathStep[]): {
+  unitsPerRow: number;
+  rows: {
+    cells: { step: ImproPathStep; index: number; start: number; span: number }[];
+  }[];
+} {
+  const unitsPerRow = 24;
+  const rows: {
+    cells: { step: ImproPathStep; index: number; start: number; span: number }[];
+  }[] = [];
+  let currentRow: {
+    cells: { step: ImproPathStep; index: number; start: number; span: number }[];
+  } = { cells: [] };
+  let cursor = 0;
+  for (const [index, step] of path.entries()) {
+    const span = Math.max(1, Math.round(step.durationRatio * 4));
+    if (currentRow.cells.length > 0 && cursor + span > unitsPerRow) {
+      rows.push(currentRow);
+      currentRow = { cells: [] };
+      cursor = 0;
+    }
+    currentRow.cells.push({ step, index, start: cursor, span });
+    cursor += span;
+  }
+  if (currentRow.cells.length > 0) rows.push(currentRow);
+  return { unitsPerRow, rows };
+}
+
+function buildImprovisationPath(
+  words: ZaksWord[],
+  baseWord: string
+): ImproPathStep[] {
+  if (words.length === 0) return [];
+
+  const sourceByWord = new Map(words.map((item, index) => [item.word, index]));
+  const letters = Array.from(baseWord);
+  const candidates =
+    letters.length === 4
+      ? fourLetterImproTargets(letters)
+      : fallbackImproTargets(words);
+
+  const selected = candidates
+    .map(({ word, role, duration }) => {
+      const sourceIndex = sourceByWord.get(word);
+      if (sourceIndex === undefined) return null;
+      return { word, role, duration, durationRatio: durationRatioValue(duration), sourceIndex };
+    })
+    .filter(
+      (
+        step
+      ): step is {
+        word: string;
+        role: string;
+        duration: string;
+        durationRatio: number;
+        sourceIndex: number;
+      } => step !== null
+    );
+
+  return selected.map((step, index) => {
+    const next = selected[index + 1];
+    return {
+      ...step,
+      note: {
+        word: step.word,
+        flip: next ? suffixFlipBetween(step.word, next.word) : undefined,
+        durationRatio: step.durationRatio,
+      },
+    };
+  });
+}
+
+function fourLetterImproTargets(
+  letters: string[]
+): { word: string; role: string; duration: string }[] {
+  const [a, b, c, d] = letters;
+  return [
+    { word: `${a}${b}${c}${d}`, role: "home", duration: "2" },
+    { word: `${a}${b}${d}${c}`, role: "first turn", duration: "1" },
+    { word: `${a}${c}${d}${b}`, role: "open fifth", duration: "1" },
+    { word: `${a}${c}${b}${d}`, role: "descent", duration: "1/2" },
+    { word: `${d}${b}${c}${a}`, role: "answer", duration: "3/2" },
+    { word: `${d}${b}${a}${c}`, role: "detour", duration: "1" },
+    { word: `${d}${c}${a}${b}`, role: "far mirror", duration: "1" },
+    { word: `${d}${c}${b}${a}`, role: "release", duration: "3/2" },
+    { word: `${a}${b}${c}${d}`, role: "home", duration: "2" },
+  ];
+}
+
+function fallbackImproTargets(
+  words: ZaksWord[]
+): { word: string; role: string; duration: string }[] {
+  const roles = [
+    "home",
+    "turn",
+    "departure",
+    "answer",
+    "detour",
+    "far",
+    "release",
+    "return",
+    "home",
+  ];
+  return words
+    .slice(0, Math.min(roles.length, words.length))
+    .map((word, i) => ({ word: word.word, role: roles[i] ?? "path", duration: "1" }))
+    .filter(
+      (item): item is { word: string; role: string; duration: string } =>
+        item.word !== undefined
+    );
+}
+
+function durationRatioValue(duration: string): number {
+  if (duration === "1/2") return 0.5;
+  if (duration === "3/2") return 1.5;
+  return Number(duration) || 1;
+}
+
+function suffixFlipBetween(from: string, to: string): number | undefined {
+  if (from.length !== to.length) return undefined;
+  for (let k = 2; k <= from.length; k++) {
+    const prefix = from.slice(0, from.length - k);
+    const suffix = Array.from(from.slice(from.length - k)).reverse().join("");
+    if (prefix + suffix === to) return k;
+  }
+  return undefined;
 }
 
 function buildRecursiveCells(words: ZaksWord[], level: number): RecCell {
@@ -1386,11 +1933,11 @@ function WordTile({
   const isHebrew = alphabet === "hebrew";
   const hebrewLetters = useHebrewLetters();
   const register = useContext(TileRegisterContext);
-  const playingWord = useContext(PlayingWordContext);
+  const playingFocus = useContext(PlayingFocusContext);
   const playWord = useContext(PlayWordContext);
   const tonePreview = useContext(TonePreviewContext);
   const word = item.word;
-  const isActive = playingWord === word;
+  const isActive = playingFocus?.word === word;
   const elRef = useRef<HTMLSpanElement | null>(null);
   const setRef = useCallback(
     (el: HTMLSpanElement | null) => {
@@ -1450,7 +1997,14 @@ function WordTile({
     >
       <span className="inline-flex justify-center">
         {Array.from(item.word).map((letter, index) => (
-          <span key={index} className={letterClassName(stable, index)}>
+          <span
+            key={index}
+            className={letterClassName(
+              stable,
+              index,
+              isActive && playingFocus?.letterIndex === index
+            )}
+          >
             {displayLetter(letter, alphabet, hebrewLetters)}
           </span>
         ))}
@@ -1458,7 +2012,6 @@ function WordTile({
       <TonalPreview
         word={word}
         kind={tonePreview.kind}
-        active={isActive && tonePreview.playState === "playing"}
       />
     </span>
   );
@@ -1467,11 +2020,9 @@ function WordTile({
 function TonalPreview({
   word,
   kind,
-  active,
 }: {
   word: string;
   kind: SoundKind;
-  active: boolean;
 }) {
   const tones = tonePreviewTones(word, kind);
   if (tones.length === 0) return null;
@@ -1514,9 +2065,9 @@ function TonalPreview({
             key={`${tone.label}-${index}`}
             cx={xFor(index)}
             cy={tone.y}
-            r={active ? 2.2 : 1.7}
+            r={1.7}
             fill="currentColor"
-            opacity={active ? 0.95 : 0.55}
+            opacity={0.55}
             vectorEffect="non-scaling-stroke"
           />
         ))}
@@ -1587,8 +2138,16 @@ function parityClassName(word: string): string {
     : "border-rose-300/50 bg-rose-500/12 text-rose-700 dark:border-rose-400/35 dark:bg-rose-400/15 dark:text-rose-200";
 }
 
-function letterClassName(stable: boolean[], index: number): string {
-  if (!stable[index]) return "inline-block px-1";
+function letterClassName(
+  stable: boolean[],
+  index: number,
+  active = false
+): string {
+  const activeClass = active
+    ? "rounded-sm bg-current/20 ring-1 ring-current/70"
+    : "";
+
+  if (!stable[index]) return ["inline-block px-1", activeClass].filter(Boolean).join(" ");
 
   const startsRun = !stable[index - 1];
   const endsRun = !stable[index + 1];
@@ -1597,6 +2156,7 @@ function letterClassName(stable: boolean[], index: number): string {
     "inline-block px-1 bg-current/10",
     startsRun ? "rounded-s" : "",
     endsRun ? "rounded-e" : "",
+    activeClass,
   ]
     .filter(Boolean)
     .join(" ");

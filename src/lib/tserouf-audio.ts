@@ -96,6 +96,7 @@ export interface TseroufNote {
   // Suffix-reversal length used to reach the *next* word. Larger = deeper
   // structural boundary = longer breath after this word.
   flip?: number;
+  durationRatio?: number;
 }
 
 export interface TseroufPlayOptions {
@@ -105,20 +106,27 @@ export interface TseroufPlayOptions {
   noteSeconds?: number;
   loop?: boolean;
   instrument?: InstrumentId;
+  playbackStyle?: TseroufPlaybackStyle;
   // Index of the word to start playback from (defaults to 0). Lets the UI
   // jump into the piece at a clicked word.
   startIndex?: number;
-  onStep?: (wordIndex: number) => void;
+  // When looping, restart from this index instead of always replaying index 0.
+  // Useful when the final cell is already the visual/musical return home.
+  loopStartIndex?: number;
+  onStep?: (wordIndex: number, letterIndex?: number) => void;
   onEnd?: () => void;
 }
 
 export interface TseroufRenderOptions {
   stepSeconds?: number;
   instrument?: InstrumentId;
+  playbackStyle?: TseroufPlaybackStyle;
   // Cap the rendered content so files stay reasonable for large permutation
   // counts. The closing reverb tail is added on top.
   maxSeconds?: number;
 }
+
+export type TseroufPlaybackStyle = "strict" | "guitar-impro";
 
 interface Voice {
   in: GainNode;
@@ -878,11 +886,11 @@ function scheduleWord(
   idx: number,
   startTime: number,
   stepSeconds: number,
-  options: { isOpeningReturn?: boolean; wrapsToStart?: boolean } = {}
+  options: { previousWord?: string; wrapsToStart?: boolean } = {}
 ): { advance: number; end: number } {
   const note = notes[idx];
   const letters = Array.from(note.word);
-  const isOpeningReturn = options.isOpeningReturn ?? false;
+  const previousWord = options.previousWord ?? "";
   const wrapsToStart = options.wrapsToStart ?? false;
   const { len, beat, advance, isPhraseStart, isPhraseEnd } = wordTiming(
     notes,
@@ -895,7 +903,6 @@ function scheduleWord(
   const center = synth.center;
   const bassRoot = TSEROUF_ROOT_MIDI - 12;
   const line = lineGroove(idx, len);
-  const cycleArrival = isOpeningReturn ? 1.26 : 1;
   let end = startTime;
   const mark = (t: number) => {
     if (t > end) end = t;
@@ -941,15 +948,14 @@ function scheduleWord(
     // here as pure bass motion — no struck chord at all — so the arrival stays
     // completely inside the melodic texture. A slightly longer ring seats it.
     // (This also serves as the baya stroke on this downbeat.)
-    // On loop return, the first word of the whole piece is the real culmination.
     mark(
       pluckNote(
         synth,
         center,
         midiToFreq(bassRoot),
         startTime,
-        0.55 * line.resolution * cycleArrival,
-        3.4 * line.ring * (isOpeningReturn ? 1.35 : 1),
+        0.55 * line.resolution,
+        3.4 * line.ring,
         SOFT
       )
     );
@@ -959,8 +965,7 @@ function scheduleWord(
   // the first of the next (…adcb -> bcda…). Rather than restrike that repeated
   // note, tie it over: skip the new line's first note and let the previous
   // one ring through the downbeat where the resolution lands.
-  const prevWord =
-    idx > 0 ? notes[idx - 1].word : isOpeningReturn ? notes[notes.length - 1].word : "";
+  const prevWord = idx > 0 ? notes[idx - 1].word : previousWord;
   const tieFirst =
     isPhraseStart && prevWord.length > 0 && prevWord[prevWord.length - 1] === letters[0];
 
@@ -1020,7 +1025,6 @@ function scheduleWord(
       (0.52 + 0.2 * bol.stress) *
         groove.velocity *
         line.velocity *
-        cycleArrival *
         launchAttack *
         (0.94 + Math.random() * 0.1) *
         accent
@@ -1074,9 +1078,189 @@ function scheduleWord(
   return { advance, end };
 }
 
+function wordUiEvents(
+  notes: TseroufNote[],
+  idx: number,
+  startTime: number,
+  stepSeconds: number
+): { time: number; wordIndex: number; letterIndex: number }[] {
+  const word = notes[idx]?.word ?? "";
+  const letters = Array.from(word);
+  const isBlueWord = isEvenPermutation(word);
+  const { len, beat } = wordTiming(notes, idx, stepSeconds);
+
+  return letters.map((_, letterIndex) => {
+    const groove = wordGrooveStep(letterIndex, len, isBlueWord, idx);
+    return {
+      time: Math.max(startTime, startTime + letterIndex * beat + groove.time * beat),
+      wordIndex: idx,
+      letterIndex,
+    };
+  });
+}
+
+interface GuitarImproTiming {
+  beat: number;
+  phraseEnd: number;
+  advance: number;
+  phase: number;
+}
+
+function guitarImproTiming(
+  notes: TseroufNote[],
+  idx: number,
+  stepSeconds: number
+): GuitarImproTiming {
+  const len = Math.max(1, notes[idx]?.word.length ?? 1);
+  const last = Math.max(1, notes.length - 1);
+  const phase = idx / last;
+  const ratio = notes[idx]?.durationRatio ?? 1;
+  const beat = stepSeconds * ratio;
+  const hasRepeat = ratio >= 1.5 && len >= 3;
+  const fragmentBeats = hasRepeat ? (ratio >= 2 ? 2 : 1) * beat * 0.5 : 0;
+  const phraseEnd = len * beat + fragmentBeats;
+  const breath =
+    ratio >= 2 ? beat * 0.5 : ratio <= 0.5 ? 0 : idx % 3 === 0 ? beat * 0.25 : 0;
+  return { beat, phraseEnd, advance: phraseEnd + breath, phase };
+}
+
+function scheduleGuitarImproWord(
+  synth: Synth,
+  notes: TseroufNote[],
+  idx: number,
+  startTime: number,
+  stepSeconds: number,
+  options: { wrapsToStart?: boolean } = {}
+): { advance: number; end: number } {
+  const note = notes[idx];
+  const letters = Array.from(note.word);
+  const len = Math.max(1, letters.length);
+  const { beat, phraseEnd, advance, phase } = guitarImproTiming(
+    notes,
+    idx,
+    stepSeconds
+  );
+  const isBlueWord = isEvenPermutation(note.word);
+  const voice = isBlueWord ? synth.even : synth.odd;
+  const center = synth.center;
+  const bassRoot = TSEROUF_ROOT_MIDI - 12; // open A, one octave below the melody root.
+  const density = Math.sin(Math.PI * Math.min(1, phase));
+  const finalReturn = phase >= 0.84 || options.wrapsToStart;
+  let end = startTime;
+  const mark = (t: number) => {
+    if (t > end) end = t;
+  };
+
+  // Continuous/semi-continuous open-string ground: A and E, with rare D colour.
+  mark(pluckNote(synth, center, midiToFreq(bassRoot), startTime, 0.2 + 0.11 * density, beat * 5.2, 0.035));
+  if (idx % 2 === 0 || phase < 0.2) {
+    mark(
+      pluckNote(
+        synth,
+        center,
+        midiToFreq(bassRoot + 7),
+        startTime + beat * 1.7,
+        0.12 + 0.07 * density,
+        beat * 4.2,
+        0.04
+      )
+    );
+  }
+  if (phase > 0.45 && phase < 0.82 && idx % 4 === 1) {
+    mark(
+      pluckNote(
+        synth,
+        center,
+        midiToFreq(bassRoot + 5),
+        startTime + beat * 2.45,
+        0.08,
+        beat * 3.2,
+        0.045
+      )
+    );
+  }
+
+  const baseVelocity =
+    phase < 0.18 ? 0.34 : phase < 0.55 ? 0.5 : phase < 0.84 ? 0.64 : 0.42;
+  letters.forEach((letter, i) => {
+    const pos = len <= 1 ? 0 : i / (len - 1);
+    const t = startTime + i * beat;
+    const swell = 0.92 + 0.16 * Math.sin(Math.PI * pos);
+    const velocity = Math.min(0.88, baseVelocity * swell * (0.94 + Math.random() * 0.1));
+    const ring =
+      beat *
+      (phase < 0.18 ? 3.3 : phase < 0.55 ? 2.15 : phase < 0.84 ? 1.55 : 2.45);
+    mark(
+      pluckNote(
+        synth,
+        voice,
+        letterToFreq(letter),
+        t,
+        velocity,
+        ring,
+        i === 0 ? 0.028 : undefined,
+        phase < 0.18 && i === 0 ? 16 : 0
+      )
+    );
+
+    const next = letters[i + 1];
+    // Guitaristic comments on the cell, kept inside A C D E, with rare G colour.
+    if (letter === "b" && (next === "c" || phase > 0.55)) {
+      mark(pluckNote(synth, voice, letterToFreq("c"), t + beat * 0.42, velocity * 0.42, beat * 0.9, 0.018));
+    }
+    if (letter === "d" && (next === "c" || phase > 0.5)) {
+      mark(pluckNote(synth, voice, letterToFreq("c"), t + beat * 0.36, velocity * 0.36, beat * 0.75, 0.015));
+    }
+    if (phase > 0.58 && phase < 0.78 && i === 1 && idx % 4 === 1) {
+      mark(pluckNote(synth, voice, letterToFreq("e"), t + beat * 0.55, velocity * 0.26, beat * 1.2, 0.02));
+    }
+  });
+
+  if (phase >= 0.55 && phase < 0.84 && len >= 3) {
+    const fragment = idx % 2 === 0 ? letters.slice(-2) : letters.slice(0, 2);
+    fragment.forEach((letter, j) => {
+      const t = startTime + len * beat + j * beat * 0.78;
+      mark(
+        pluckNote(
+          synth,
+          voice,
+          letterToFreq(letter),
+          t,
+          0.46 + 0.08 * j,
+          beat * 1.35,
+          0.012
+        )
+      );
+    });
+  }
+
+  if (finalReturn) {
+    const cadenceTime = startTime + phraseEnd - beat * 0.45;
+    mark(pluckNote(synth, center, midiToFreq(bassRoot + 7), cadenceTime, 0.26, beat * 2.4, 0.04));
+    mark(pluckNote(synth, center, midiToFreq(bassRoot), cadenceTime + beat * 0.95, 0.42, beat * 4.6, 0.04));
+  }
+
+  return { advance, end };
+}
+
+function guitarImproUiEvents(
+  notes: TseroufNote[],
+  idx: number,
+  startTime: number,
+  stepSeconds: number
+): { time: number; wordIndex: number; letterIndex: number }[] {
+  const word = notes[idx]?.word ?? "";
+  const letters = Array.from(word);
+  const { beat } = guitarImproTiming(notes, idx, stepSeconds);
+  return letters.map((_, letterIndex) => ({
+    time: startTime + letterIndex * beat,
+    wordIndex: idx,
+    letterIndex,
+  }));
+}
+
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.3;
-const LOOP_RETURN_PAUSE_SECONDS = 0;
 const FINAL_TAIL_SECONDS = 0.9;
 
 export class TseroufPlayer {
@@ -1088,10 +1272,12 @@ export class TseroufPlayer {
   private stepSeconds = 0.18;
   private loop = false;
   private instrument: InstrumentId = "guitar";
-  private onStep?: (wordIndex: number) => void;
+  private playbackStyle: TseroufPlaybackStyle = "strict";
+  private onStep?: (wordIndex: number, letterIndex?: number) => void;
   private onEnd?: () => void;
 
   private wordIdx = 0;
+  private loopStartIndex = 0;
   private nextWordTime = 0;
   private lastVoiceEnd = 0;
   private finishedScheduling = false;
@@ -1099,7 +1285,7 @@ export class TseroufPlayer {
   private playing = false;
   private paused = false;
 
-  private uiQueue: { time: number; wordIndex: number }[] = [];
+  private uiQueue: { time: number; wordIndex: number; letterIndex: number }[] = [];
 
   get isPlaying(): boolean {
     return this.playing;
@@ -1120,11 +1306,13 @@ export class TseroufPlayer {
     this.stepSeconds = options.stepSeconds ?? 0.18;
     this.loop = options.loop ?? false;
     if (options.instrument) this.instrument = options.instrument;
+    this.playbackStyle = options.playbackStyle ?? "strict";
     this.synth!.instrument = this.instrument;
     this.onStep = options.onStep;
     this.onEnd = options.onEnd;
 
     this.wordIdx = clampStartIndex(options.startIndex, notes.length);
+    this.loopStartIndex = clampStartIndex(options.loopStartIndex, notes.length);
     this.nextWordTime = ctx.currentTime + 0.12;
     this.lastVoiceEnd = this.nextWordTime;
     this.finishedScheduling = false;
@@ -1228,19 +1416,42 @@ export class TseroufPlayer {
       !this.finishedScheduling &&
       this.nextWordTime < ctx.currentTime + SCHEDULE_AHEAD
     ) {
-      const { advance, end } = scheduleWord(
-        synth,
-        this.notes,
-        this.wordIdx,
-        this.nextWordTime,
-        this.stepSeconds,
-        {
-          isOpeningReturn: this.wordIdx === 0 && this.hasLoopedToStart,
-          wrapsToStart: this.loop && this.wordIdx === this.notes.length - 1,
-        }
-      );
+      const wrapsToStart = this.loop && this.wordIdx === this.notes.length - 1;
+      const { advance, end } =
+        this.playbackStyle === "guitar-impro"
+          ? scheduleGuitarImproWord(
+              synth,
+              this.notes,
+              this.wordIdx,
+              this.nextWordTime,
+              this.stepSeconds,
+              { wrapsToStart }
+            )
+          : scheduleWord(
+              synth,
+              this.notes,
+              this.wordIdx,
+              this.nextWordTime,
+              this.stepSeconds,
+              {
+                previousWord:
+                  this.wordIdx === 0 && this.hasLoopedToStart
+                    ? this.notes[this.notes.length - 1]?.word
+                    : undefined,
+                wrapsToStart,
+              }
+            );
       if (end > this.lastVoiceEnd) this.lastVoiceEnd = end;
-      this.uiQueue.push({ time: this.nextWordTime, wordIndex: this.wordIdx });
+      this.uiQueue.push(
+        ...(this.playbackStyle === "guitar-impro"
+          ? guitarImproUiEvents(
+              this.notes,
+              this.wordIdx,
+              this.nextWordTime,
+              this.stepSeconds
+            )
+          : wordUiEvents(this.notes, this.wordIdx, this.nextWordTime, this.stepSeconds))
+      );
 
       this.nextWordTime += advance;
       this.wordIdx += 1;
@@ -1249,14 +1460,13 @@ export class TseroufPlayer {
 
     while (this.uiQueue.length > 0 && this.uiQueue[0].time <= ctx.currentTime) {
       const next = this.uiQueue.shift()!;
-      this.onStep?.(next.wordIndex);
+      this.onStep?.(next.wordIndex, next.letterIndex);
     }
 
     if (this.finishedScheduling && this.loop) {
-      // Queue the next pass on the structural grid: no breath at the line
-      // boundary. The common note is tied/lengthened instead of being repeated.
-      this.nextWordTime += LOOP_RETURN_PAUSE_SECONDS;
-      this.wordIdx = 0;
+      // Queue the next pass on the structural grid. The boundary note is tied
+      // instead of being repeated, just like any other line transition.
+      this.wordIdx = this.loopStartIndex;
       this.hasLoopedToStart = true;
       this.finishedScheduling = false;
       return;
@@ -1281,6 +1491,7 @@ export async function renderTseroufWav(
   options: TseroufRenderOptions = {}
 ): Promise<Blob> {
   const stepSeconds = options.stepSeconds ?? 0.18;
+  const playbackStyle = options.playbackStyle ?? "strict";
   const maxSeconds = options.maxSeconds ?? 75;
   const sampleRate = 44100;
 
@@ -1288,7 +1499,10 @@ export async function renderTseroufWav(
   let cursor = lead;
   let count = 0;
   for (let i = 0; i < notes.length; i++) {
-    cursor += wordTiming(notes, i, stepSeconds).advance;
+    cursor +=
+      playbackStyle === "guitar-impro"
+        ? guitarImproTiming(notes, i, stepSeconds).advance
+        : wordTiming(notes, i, stepSeconds).advance;
     count++;
     if (cursor >= maxSeconds) break;
   }
@@ -1307,7 +1521,10 @@ export async function renderTseroufWav(
 
   let startTime = lead;
   for (let i = 0; i < count; i++) {
-    const { advance } = scheduleWord(synth, notes, i, startTime, stepSeconds);
+    const { advance } =
+      playbackStyle === "guitar-impro"
+        ? scheduleGuitarImproWord(synth, notes, i, startTime, stepSeconds)
+        : scheduleWord(synth, notes, i, startTime, stepSeconds);
     startTime += advance;
   }
 
