@@ -8,7 +8,6 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -46,7 +45,6 @@ import { useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
   createContext,
-  Fragment,
   type CSSProperties,
   type KeyboardEvent,
   type PointerEvent,
@@ -90,12 +88,12 @@ const SOURCE_TRANSLATION_OUTRO =
   "From here on, go out and calculate what the mouth cannot speak\nand the ear cannot hear";
 type NValue = (typeof N_OPTIONS)[number];
 type Alphabet = "latin" | "hebrew";
-type Layout = "flat" | "tree";
+type Layout = "flat" | "hamilton";
 type LetterSet = "sequence" | "elohim" | "amash" | "yhw";
 
 const DEFAULT_N: NValue = 3;
 const ALPHABETS: readonly Alphabet[] = ["latin", "hebrew"];
-const LAYOUTS: readonly Layout[] = ["flat", "tree"];
+const URL_LAYOUTS = ["flat", "tree", "hamilton"] as const;
 const LETTER_SETS: readonly LetterSet[] = ["sequence", "elohim", "amash", "yhw"];
 const INSTRUMENT_IDS = INSTRUMENTS.map((i) => i.id) as readonly InstrumentId[];
 const DEFAULT_INSTRUMENT: InstrumentId = "guitar";
@@ -115,6 +113,26 @@ const soundKindFor = (choice: SoundChoice): SoundKind =>
 const TEMPO_OPTIONS = [60, 72, 88, 108, 128, 152, 176, 208, 240] as const;
 const DEFAULT_TEMPO = 128;
 const secondsPerBeat = (tempo: number) => 60 / tempo;
+const RHYTHM_VOLUME_OPTIONS = Array.from({ length: 21 }, (_, i) => i * 10);
+const DEFAULT_RHYTHM_VOLUME = 100;
+const WAV_LOOP_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8] as const;
+const WAV_LOOP_PARAM_OPTIONS = [
+  ...WAV_LOOP_OPTIONS.map(String),
+  "infinite",
+] as const;
+const DEFAULT_WAV_LOOPS = 1;
+type WavLoops = (typeof WAV_LOOP_OPTIONS)[number] | "infinite";
+const wavLoopRenderCount = (loops: WavLoops) => (loops === "infinite" ? 10 : loops);
+function previousWavLoops(current: WavLoops): WavLoops {
+  if (current === "infinite") return WAV_LOOP_OPTIONS[WAV_LOOP_OPTIONS.length - 1];
+  const index = WAV_LOOP_OPTIONS.indexOf(current);
+  return WAV_LOOP_OPTIONS[Math.max(0, index - 1)];
+}
+function nextWavLoops(current: WavLoops): WavLoops {
+  if (current === "infinite") return WAV_LOOP_OPTIONS[WAV_LOOP_OPTIONS.length - 1];
+  const index = WAV_LOOP_OPTIONS.indexOf(current);
+  return WAV_LOOP_OPTIONS[Math.min(WAV_LOOP_OPTIONS.length - 1, index + 1)];
+}
 
 interface TseroufState {
   n: NValue;
@@ -123,12 +141,15 @@ interface TseroufState {
   letterSet: LetterSet;
   instrument: SoundChoice;
   tempo: number;
+  rhythmVolume: number;
+  wavLoops: WavLoops;
   loop: boolean;
 }
 
 function readTseroufState(params: URLSearchParams | null): TseroufState {
   const letterSet = readEnumParam(params, "set", LETTER_SETS, "sequence");
-  const layout = readEnumParam(params, "layout", LAYOUTS, "flat");
+  const layoutParam = readEnumParam(params, "layout", URL_LAYOUTS, "flat");
+  const layout: Layout = layoutParam === "tree" ? "hamilton" : layoutParam;
   const instrument = readEnumParam(
     params,
     "instrument",
@@ -136,21 +157,35 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     DEFAULT_INSTRUMENT
   );
   const tempo = readIntParam(params, "tempo", TEMPO_OPTIONS, DEFAULT_TEMPO);
+  const rhythmVolume = readIntParam(
+    params,
+    "rhythm",
+    RHYTHM_VOLUME_OPTIONS,
+    DEFAULT_RHYTHM_VOLUME
+  );
+  const wavLoopParam = readEnumParam(
+    params,
+    "wavLoops",
+    WAV_LOOP_PARAM_OPTIONS,
+    String(DEFAULT_WAV_LOOPS)
+  );
+  const wavLoops: WavLoops =
+    wavLoopParam === "infinite" ? "infinite" : (Number(wavLoopParam) as WavLoops);
   const loop = readEnumParam(params, "loop", ["0", "1"], "0") === "1";
 
   // The "elohim" set is a fixed 5-letter Hebrew word, so it pins n and alphabet.
   if (letterSet === "elohim") {
-    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, loop };
+    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, rhythmVolume, wavLoops, loop };
   }
 
   // The "amash" set is the three mother letters, a fixed 3-letter Hebrew word.
   if (letterSet === "amash") {
-    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, loop };
+    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, rhythmVolume, wavLoops, loop };
   }
 
   // The "yhw" set is a fixed 3-letter Hebrew word.
   if (letterSet === "yhw") {
-    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, loop };
+    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, rhythmVolume, wavLoops, loop };
   }
 
   return {
@@ -160,6 +195,8 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     letterSet,
     instrument,
     tempo,
+    rhythmVolume,
+    wavLoops,
     loop,
   };
 }
@@ -253,7 +290,11 @@ export function TseroufView() {
   const [letterSet, setLetterSet] = useState<LetterSet>(initial.letterSet);
   const [instrument, setInstrument] = useState<SoundChoice>(initial.instrument);
   const [tempo, setTempo] = useState<number>(initial.tempo);
-  const [loopPlayback, setLoopPlayback] = useState<boolean>(initial.loop);
+  const [rhythmVolume, setRhythmVolume] = useState<number>(
+    initial.rhythmVolume
+  );
+  const [wavLoops, setWavLoops] = useState<WavLoops>(initial.wavLoops);
+  const [loopPlayback] = useState<boolean>(initial.loop);
   const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("impro");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
@@ -326,9 +367,22 @@ export function TseroufView() {
       layout,
       instrument,
       tempo: String(tempo),
+      rhythm:
+        rhythmVolume === DEFAULT_RHYTHM_VOLUME ? null : String(rhythmVolume),
+      wavLoops: wavLoops === DEFAULT_WAV_LOOPS ? null : String(wavLoops),
       loop: loopPlayback ? "1" : null,
     });
-  }, [n, alphabet, layout, letterSet, instrument, tempo, loopPlayback]);
+  }, [
+    n,
+    alphabet,
+    layout,
+    letterSet,
+    instrument,
+    tempo,
+    rhythmVolume,
+    wavLoops,
+    loopPlayback,
+  ]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -463,6 +517,7 @@ export function TseroufView() {
             : (instrument as InstrumentId)
           : undefined,
       playbackStyle: mode === "impro" ? "guitar-impro" : "strict",
+      rhythmVolume: rhythmVolume / 100,
       stepSeconds: secondsPerBeat(tempo),
       noteSeconds: secondsPerBeat(tempo),
       onStep: (index, letterIndex = 0) => {
@@ -525,6 +580,7 @@ export function TseroufView() {
       loopPlayback,
       playbackMode,
       tempo,
+      rhythmVolume,
       words,
     ]
   );
@@ -570,6 +626,13 @@ export function TseroufView() {
     }
   };
 
+  const handleRhythmVolumeChange = (value: number) => {
+    setRhythmVolume(value);
+    if (playerRef.current instanceof TseroufPlayer) {
+      playerRef.current.setRhythmVolume(value / 100);
+    }
+  };
+
   const handleInstrumentChange = (value: SoundChoice) => {
     setInstrument(value);
     const kind = soundKindFor(value);
@@ -582,21 +645,18 @@ export function TseroufView() {
     }
   };
 
-  const setLoopPlaybackEnabled = (next: boolean) => {
-    setLoopPlayback(next);
-    playerRef.current?.setLoop(next);
-    setStatus(next ? "Loop enabled." : "Loop disabled.");
-  };
-
   const downloadAudio = async () => {
     if (words.length === 0) return;
     setRenderingAudio(true);
     setStatus("Rendering audio…");
+    const exportLoopCount = wavLoopRenderCount(wavLoops);
     try {
       const blob =
         effectivePlaybackMode !== "impro" && soundKindFor(instrument) === "drone"
           ? await renderTseroufDroneWav(playbackNotes, {
               noteSeconds: secondsPerBeat(tempo),
+              loopCount: exportLoopCount,
+              maxSeconds: 150 * exportLoopCount,
             })
           : await renderTseroufWav(playbackNotes, {
               instrument:
@@ -605,12 +665,23 @@ export function TseroufView() {
                   : (instrument as InstrumentId),
               playbackStyle:
                 effectivePlaybackMode === "impro" ? "guitar-impro" : "strict",
+              rhythmVolume: rhythmVolume / 100,
+              loopCount: exportLoopCount,
+              loopStartIndex:
+                effectivePlaybackMode === "impro" &&
+                playbackNotes.length > 1 &&
+                playbackNotes[0]?.word === playbackNotes[playbackNotes.length - 1]?.word
+                  ? 1
+                  : 0,
+              maxSeconds: 75 * exportLoopCount,
               stepSeconds: secondsPerBeat(tempo),
             });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `tserouf_${baseWord}_${effectivePlaybackMode}_${instrument}.wav`;
+      a.download = `tserouf_${baseWord}_${effectivePlaybackMode}_${instrument}${
+        exportLoopCount > 1 ? `_x${exportLoopCount}` : ""
+      }.wav`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -770,6 +841,58 @@ export function TseroufView() {
             >
               <RotateCcw className="h-5 w-5" />
             </Button>
+            <div className="ml-auto flex h-11 items-center rounded-md border">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-9 w-7 rounded-none px-0"
+                onClick={() =>
+                  setWavLoops((current) => previousWavLoops(current))
+                }
+                disabled={wavLoops !== "infinite" && wavLoops <= WAV_LOOP_OPTIONS[0]}
+                aria-label="Decrease WAV loops"
+              >
+                −
+              </Button>
+              <div
+                className="flex h-9 min-w-7 items-center justify-center border-x font-mono text-sm tabular-nums"
+                aria-live="polite"
+              >
+                {wavLoops === "infinite" ? "∞" : wavLoops}
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-9 w-7 rounded-none px-0"
+                onClick={() =>
+                  setWavLoops((current) => nextWavLoops(current))
+                }
+                disabled={
+                  wavLoops !== "infinite" &&
+                  wavLoops >= WAV_LOOP_OPTIONS[WAV_LOOP_OPTIONS.length - 1]
+                }
+                aria-label="Increase WAV loops"
+              >
+                +
+              </Button>
+              <Button
+                type="button"
+                variant={wavLoops === "infinite" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-9 w-8 rounded-l-none border-l px-0"
+                onClick={() =>
+                  setWavLoops((current) =>
+                    current === "infinite" ? DEFAULT_WAV_LOOPS : "infinite"
+                  )
+                }
+                aria-label="Infinite WAV loops"
+                title="Infinite"
+              >
+                ∞
+              </Button>
+            </div>
           </div>
 
           <Button
@@ -802,11 +925,11 @@ export function TseroufView() {
               <Button
                 type="button"
                 size="sm"
-                variant={layout === "tree" ? "default" : "ghost"}
+                variant={layout === "hamilton" ? "default" : "ghost"}
                 className="h-8"
-                onClick={() => setLayout("tree")}
+                onClick={() => setLayout("hamilton")}
               >
-                Tree
+                Hamilton
               </Button>
             </div>
           </div>
@@ -870,31 +993,30 @@ export function TseroufView() {
           </div>
 
           <div className="space-y-2">
-            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-              Playback
-            </Label>
-            <div className="flex items-center justify-between rounded-md border px-3 py-2">
+            <div className="flex items-center justify-between">
               <Label
-                htmlFor="tserouf-loop-toggle"
-                className="cursor-pointer text-sm font-normal"
+                htmlFor="tserouf-rhythm-volume"
+                className="text-xs uppercase tracking-wider text-muted-foreground"
               >
-                Loop after final arrival
+                Rhythm
               </Label>
-              <div className="flex items-center gap-2">
-                <span className="text-xs uppercase tracking-wider text-muted-foreground">
-                  {loopPlayback ? "On" : "Off"}
-                </span>
-                <Checkbox
-                  id="tserouf-loop-toggle"
-                  checked={loopPlayback}
-                  disabled={running || words.length === 0}
-                  onCheckedChange={(checked) =>
-                    setLoopPlaybackEnabled(checked === true)
-                  }
-                  aria-label="Toggle playback loop"
-                />
-              </div>
+              <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                {rhythmVolume}%
+              </span>
             </div>
+            <input
+              id="tserouf-rhythm-volume"
+              type="range"
+              min={0}
+              max={200}
+              step={10}
+              value={rhythmVolume}
+              onChange={(event) =>
+                handleRhythmVolumeChange(Number(event.currentTarget.value))
+              }
+              className="w-full accent-primary"
+              aria-label="Rhythm volume"
+            />
           </div>
 
           <Button
@@ -925,7 +1047,7 @@ export function TseroufView() {
             <Stat label="Permutations" value={factorial(n)} />
             <Stat
               label="Layout"
-              value={layout === "tree" ? "Tree" : "Flat"}
+              value={layout === "hamilton" ? "Hamilton" : "Flat"}
             />
             <Stat label="Algorithm" value="Zaks suffix" />
             <Stat label="Status" value={status} full />
@@ -961,7 +1083,7 @@ export function TseroufView() {
                           onClick={() => handlePlaybackModeChange("impro")}
                           disabled={!improEnabled}
                         >
-                          Impro path
+                          {alphabet === "hebrew" ? "שירה" : "Shira"}
                         </Button>
                         <Button
                           type="button"
@@ -972,7 +1094,7 @@ export function TseroufView() {
                           className="h-8"
                           onClick={() => handlePlaybackModeChange("zaks")}
                         >
-                          Full Zaks
+                          {alphabet === "hebrew" ? "ישרה" : "Yeshara"}
                         </Button>
                       </div>
                     </div>
@@ -993,8 +1115,8 @@ export function TseroufView() {
                             startPlayback(index, "impro");
                           }}
                         />
-                      ) : layout === "tree" ? (
-                        <TreeView cell={recursiveCell} alphabet={alphabet} n={n} />
+                      ) : layout === "hamilton" ? (
+                        <HamiltonWordsView words={words} alphabet={alphabet} n={n} />
                       ) : (
                         <FlatWordsView words={words} alphabet={alphabet} n={n} />
                       )}
@@ -1513,11 +1635,14 @@ function durationRatioValue(duration: string): number {
 function suffixFlipBetween(from: string, to: string): number | undefined {
   if (from.length !== to.length) return undefined;
   for (let k = 2; k <= from.length; k++) {
-    const prefix = from.slice(0, from.length - k);
-    const suffix = Array.from(from.slice(from.length - k)).reverse().join("");
-    if (prefix + suffix === to) return k;
+    if (reverseWordSuffix(from, k) === to) return k;
   }
   return undefined;
+}
+
+function reverseWordSuffix(word: string, k: number): string {
+  const split = word.length - k;
+  return word.slice(0, split) + Array.from(word.slice(split)).reverse().join("");
 }
 
 function buildRecursiveCells(words: ZaksWord[], level: number): RecCell {
@@ -1530,161 +1655,6 @@ function buildRecursiveCells(words: ZaksWord[], level: number): RecCell {
     children.push(buildRecursiveCells(words.slice(i, i + childSize), level - 1));
   }
   return { kind: "group", level, children };
-}
-
-function TreeView({
-  cell,
-  alphabet,
-  n,
-}: {
-  cell: RecCell;
-  alphabet: Alphabet;
-  n: number;
-}) {
-  return (
-    <div className="tserouf-tree w-full overflow-x-auto pb-4">
-      <ul>
-        <TreeNode cell={cell} alphabet={alphabet} n={n} />
-      </ul>
-    </div>
-  );
-}
-
-function TreeNode({
-  cell,
-  alphabet,
-  n,
-}: {
-  cell: RecCell;
-  alphabet: Alphabet;
-  n: number;
-}) {
-  if (cell.kind === "pair") {
-    return (
-      <li>
-        <TreeLeaf words={cell.words} alphabet={alphabet} />
-      </li>
-    );
-  }
-
-  if (cell.level <= 3) {
-    return (
-      <li>
-        <TreeLeaf words={collectWords(cell)} alphabet={alphabet} />
-      </li>
-    );
-  }
-
-  const fixedLen = n - cell.level;
-  const sample = firstWordOf(cell);
-  const prefix = sample.slice(0, fixedLen);
-
-  return (
-    <li>
-      <TreeBranchLabel
-        prefix={prefix}
-        level={cell.level}
-        n={n}
-        alphabet={alphabet}
-      />
-      <ul>
-        {cell.children.map((child, i) => (
-          <TreeNode key={i} cell={child} alphabet={alphabet} n={n} />
-        ))}
-      </ul>
-    </li>
-  );
-}
-
-function TreeBranchLabel({
-  prefix,
-  level,
-  n,
-  alphabet,
-}: {
-  prefix: string;
-  level: number;
-  n: number;
-  alphabet: Alphabet;
-}) {
-  const isHebrew = alphabet === "hebrew";
-  const hebrewLetters = useHebrewLetters();
-  const depth = n - level;
-  const alpha = Math.min(0.34, 0.07 + depth * 0.06);
-
-  return (
-    <span
-      className="relative z-10 inline-flex flex-col items-center gap-0.5"
-      title={prefix ? `Fixed prefix: ${displayWord(prefix, alphabet, hebrewLetters)}` : "Full set — no letter fixed yet"}
-    >
-      <span
-        className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border px-2 text-lg leading-none"
-        style={{
-          backgroundColor: `rgba(180, 120, 24, ${alpha})`,
-          borderColor: `rgba(120, 75, 15, ${Math.min(0.5, 0.15 + depth * 0.06)})`,
-        }}
-      >
-        {prefix ? (
-          <span
-            dir={isHebrew ? "rtl" : "ltr"}
-            className={`[unicode-bidi:isolate] ${
-              isHebrew
-                ? "font-[family-name:var(--font-hebrew)] font-medium"
-                : "font-[family-name:var(--font-mystic)]"
-            }`}
-          >
-            {displayWord(prefix, alphabet, hebrewLetters)}
-          </span>
-        ) : (
-          <span className="text-muted-foreground">•</span>
-        )}
-      </span>
-      <span className="font-mono text-[10px] text-muted-foreground">
-        k={level}
-      </span>
-    </span>
-  );
-}
-
-function TreeLeaf({
-  words,
-  alphabet,
-}: {
-  words: ZaksWord[];
-  alphabet: Alphabet;
-}) {
-  const stable = stablePositions(words);
-  const isHebrew = alphabet === "hebrew";
-
-  return (
-    <div
-      dir={isHebrew ? "rtl" : "ltr"}
-      className="relative z-10 inline-flex flex-col items-center gap-0.5 rounded-md p-1.5"
-      style={{ backgroundColor: "rgba(180, 120, 24, 0.06)" }}
-    >
-      {words.map((item, i) => (
-        <Fragment key={`${i}-${item.word}`}>
-          <WordTile item={item} stable={stable} alphabet={alphabet} />
-          <FlipConnector value={item.flip} />
-        </Fragment>
-      ))}
-    </div>
-  );
-}
-
-function firstWordOf(cell: RecCell): string {
-  let current = cell;
-  while (current.kind === "group") {
-    current = current.children[0];
-  }
-  return current.words[0]?.word ?? "";
-}
-
-function collectWords(cell: RecCell): ZaksWord[] {
-  if (cell.kind === "pair") return cell.words;
-  const out: ZaksWord[] = [];
-  for (const child of cell.children) out.push(...collectWords(child));
-  return out;
 }
 
 function FlatWordsView({
@@ -1767,6 +1737,172 @@ function FlatWordsView({
         <EdgeOverlay edges={edges} width={overlaySize.w} height={overlaySize.h} />
       </div>
     </TileRegisterContext.Provider>
+  );
+}
+
+function HamiltonWordsView({
+  words,
+  alphabet,
+  n,
+}: {
+  words: ZaksWord[];
+  alphabet: Alphabet;
+  n: number;
+}) {
+  const { resolvedTheme } = useTheme();
+  const hebrewLetters = useHebrewLetters();
+  const playingFocus = useContext(PlayingFocusContext);
+  const playWord = useContext(PlayWordContext);
+  const tonePreview = useContext(TonePreviewContext);
+  const isHebrew = alphabet === "hebrew";
+  const total = words.length;
+  const showLabels = total <= 120;
+  const size = n <= 4 ? 720 : n === 5 ? 980 : n === 6 ? 1180 : 1400;
+  const center = size / 2;
+  const radius = size * (showLabels ? 0.36 : 0.43);
+  const labelRadius = size * 0.44;
+  const dotRadius = showLabels ? 2.6 : Math.max(1.2, Math.min(2.2, 90 / total));
+  const isDark = resolvedTheme === "dark";
+  const cycleStroke = isDark ? "rgba(252, 211, 77, 0.34)" : "rgba(217, 119, 6, 0.38)";
+  const pointFill = isDark ? "rgba(252, 211, 77, 0.72)" : "rgba(180, 83, 9, 0.68)";
+  const activeFill = isDark ? "#fef3c7" : "#92400e";
+  const graphStroke = cycleStroke;
+
+  const points = useMemo(
+    () =>
+      words.map((item, index) => {
+        const angle = (2 * Math.PI * index) / total;
+        return {
+          item,
+          index,
+          x: center + radius * Math.cos(angle),
+          y: center + radius * Math.sin(angle),
+          labelX: center + labelRadius * Math.cos(angle),
+          labelY: center + labelRadius * Math.sin(angle),
+          display: displayWord(item.word, alphabet, hebrewLetters),
+        };
+      }),
+    [alphabet, center, hebrewLetters, labelRadius, radius, total, words]
+  );
+  const pancakeEdgePath = useMemo(() => {
+    const indexByWord = new Map(words.map((item, index) => [item.word, index]));
+    const segments: string[] = [];
+
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i].word;
+      for (let k = 2; k <= n; k++) {
+        const j = indexByWord.get(reverseWordSuffix(word, k));
+        if (j === undefined || j <= i) continue;
+        segments.push(
+          `M ${points[i].x.toFixed(2)} ${points[i].y.toFixed(2)} L ${points[j].x.toFixed(2)} ${points[j].y.toFixed(2)}`
+        );
+      }
+    }
+
+    return segments.join(" ");
+  }, [n, points, words]);
+
+  if (total === 0) return null;
+
+  const play = (word: string) => {
+    playWord?.(word);
+  };
+
+  return (
+    <div className="w-full overflow-auto pb-4">
+      <div
+        className="relative mx-auto"
+        style={{ width: size, height: size } as CSSProperties}
+      >
+        <svg
+          viewBox={`0 0 ${size} ${size}`}
+          className="absolute inset-0 h-full w-full"
+          aria-hidden={showLabels}
+        >
+          <circle
+            cx={center}
+            cy={center}
+            r={radius}
+            fill="none"
+            stroke={cycleStroke}
+            strokeWidth={Math.max(2, size / 360)}
+          />
+          {pancakeEdgePath ? (
+            <path
+              d={pancakeEdgePath}
+              fill="none"
+              stroke={graphStroke}
+              strokeWidth={Math.max(2, size / 360)}
+              strokeLinecap="round"
+            />
+          ) : null}
+          {points.map(({ item, index, x, y, display }) => {
+            const isActive = playingFocus?.word === item.word;
+            const title = `${display} · ${tonePreviewTitle(item.word, tonePreview.kind)}`;
+            return (
+              <circle
+                key={`${index}-${item.word}`}
+                cx={x}
+                cy={y}
+                r={isActive ? dotRadius * 2.3 : dotRadius}
+                fill={isActive ? activeFill : pointFill}
+                stroke={isActive ? activeFill : "none"}
+                strokeWidth={isActive ? 2 : 0}
+                role={!showLabels && playWord ? "button" : undefined}
+                tabIndex={!showLabels && playWord ? 0 : undefined}
+                aria-label={!showLabels ? title : undefined}
+                className={!showLabels && playWord ? "cursor-pointer" : undefined}
+                onClick={!showLabels && playWord ? () => play(item.word) : undefined}
+                onKeyDown={
+                  !showLabels && playWord
+                    ? (e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          play(item.word);
+                        }
+                      }
+                    : undefined
+                }
+              >
+                <title>{title}</title>
+              </circle>
+            );
+          })}
+        </svg>
+        {showLabels
+          ? points.map(({ item, index, labelX, labelY, display }) => {
+              const isActive = playingFocus?.word === item.word;
+              return (
+                <button
+                  key={`${index}-${item.word}`}
+                  type="button"
+                  dir={isHebrew ? "rtl" : "ltr"}
+                  title={`${display} · ${tonePreviewTitle(item.word, tonePreview.kind)}`}
+                  onClick={() => play(item.word)}
+                  className={`absolute rounded-md border bg-background/90 px-1.5 py-0.5 text-lg leading-6 shadow-sm [unicode-bidi:isolate] ${
+                    playWord
+                      ? "cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+                      : ""
+                  } ${parityClassName(item.word)} ${
+                    isActive ? "ring-2 ring-amber-500 ring-offset-1 ring-offset-background" : ""
+                  } ${
+                    isHebrew
+                      ? "font-[family-name:var(--font-hebrew)] font-medium"
+                      : "font-[family-name:var(--font-mystic)]"
+                  }`}
+                  style={{
+                    left: labelX,
+                    top: labelY,
+                    transform: "translate(-50%, -50%)",
+                  }}
+                >
+                  {display}
+                </button>
+              );
+            })
+          : null}
+      </div>
+    </div>
   );
 }
 
@@ -2183,20 +2319,6 @@ function tonePreviewTitle(word: string, kind: SoundKind): string {
   return kind === "drone"
     ? `Overtone contour: ${labels.join(" -> ")}`
     : `Tone contour: ${labels.join(" -> ")}`;
-}
-
-function FlipConnector({ value }: { value?: number }) {
-  if (!value) return null;
-  return (
-    <span
-      dir="ltr"
-      aria-hidden
-      title={`Reverses the last ${value} letters`}
-      className="inline-flex items-center self-center px-0.5 font-mono text-[10px] leading-none text-amber-700/70 underline decoration-dotted underline-offset-2 dark:text-amber-300/60"
-    >
-      {value}
-    </span>
-  );
 }
 
 function parityClassName(word: string): string {

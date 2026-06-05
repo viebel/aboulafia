@@ -107,6 +107,7 @@ export interface TseroufPlayOptions {
   loop?: boolean;
   instrument?: InstrumentId;
   playbackStyle?: TseroufPlaybackStyle;
+  rhythmVolume?: number;
   // Index of the word to start playback from (defaults to 0). Lets the UI
   // jump into the piece at a clicked word.
   startIndex?: number;
@@ -121,6 +122,9 @@ export interface TseroufRenderOptions {
   stepSeconds?: number;
   instrument?: InstrumentId;
   playbackStyle?: TseroufPlaybackStyle;
+  rhythmVolume?: number;
+  loopCount?: number;
+  loopStartIndex?: number;
   // Cap the rendered content so files stay reasonable for large permutation
   // counts. The closing reverb tail is added on top.
   maxSeconds?: number;
@@ -663,11 +667,66 @@ function instrumentBuffer(synth: Synth, freq: number, variant = 0): AudioBuffer 
   return buffer;
 }
 
+type HandDrumKind = "bass" | "tone" | "slap";
+
+function handDrumBuffer(
+  synth: Synth,
+  kind: HandDrumKind,
+  variant = 0
+): AudioBuffer {
+  const key = `hand-drum:${kind}:${variant}`;
+  const cached = synth.bufferCache.get(key);
+  if (cached) return cached;
+
+  const sr = synth.ctx.sampleRate;
+  const seconds = kind === "bass" ? 0.5 : kind === "tone" ? 0.34 : 0.18;
+  const total = Math.floor(sr * seconds);
+  const buffer = synth.ctx.createBuffer(1, total, sr);
+  const d = buffer.getChannelData(0);
+  const drift = (variant - 2.5) / 2.5;
+  const pitchShift = 1 + drift * (kind === "bass" ? 0.035 : kind === "tone" ? 0.06 : 0.09);
+  const decayShift = 1 + drift * 0.12;
+  const noiseMix = kind === "slap" ? 0.58 + variant * 0.055 : 0.12 + variant * 0.018;
+  let low = 0;
+  for (let i = 0; i < total; i++) {
+    const t = i / sr;
+    const n = Math.random() * 2 - 1;
+    low += (0.07 + variant * 0.006) * (n - low);
+    const high = n - low;
+    const pitch =
+      kind === "bass"
+        ? 72 - 26 * Math.min(1, t / 0.09)
+        : kind === "tone"
+        ? 180 - 34 * Math.min(1, t / 0.06)
+        : 310;
+    const wobble = 1 + 0.012 * Math.sin(2 * Math.PI * (5.2 + variant) * t);
+    const drumHead = Math.sin(2 * Math.PI * pitch * pitchShift * wobble * t);
+    const env =
+      kind === "bass"
+        ? Math.exp(-t * 10 * decayShift)
+        : kind === "tone"
+        ? Math.exp(-t * 18 * decayShift)
+        : Math.exp(-t * 48 * decayShift);
+    const slapClick = Math.exp(-t * 95) * high;
+    d[i] =
+      env *
+      (kind === "bass"
+        ? drumHead * 0.9 + low * 0.38
+        : kind === "tone"
+        ? drumHead * (0.62 - noiseMix * 0.22) + high * noiseMix
+        : slapClick * noiseMix + drumHead * (0.24 - variant * 0.012));
+  }
+  normalize(d, 1);
+  synth.bufferCache.set(key, buffer);
+  return buffer;
+}
+
 // How many round-robin string variants the guitar cycles through. Each is a
 // distinct cached buffer (different excitation + pluck point); a note picks one
 // at random so consecutive strikes of the same pitch differ subtly, the way a
 // real player never plucks a string exactly the same way twice.
 const GUITAR_ROUND_ROBIN = 4;
+const HAND_DRUM_ROUND_ROBIN = 6;
 
 const SUSTAINED: Partial<Record<InstrumentId, boolean>> = {
   saxophone: true,
@@ -753,6 +812,51 @@ function pluckNote(
   } else {
     gain.connect(voice.in);
   }
+  src.start(time);
+  src.stop(end);
+  return end;
+}
+
+function scheduleHandDrum(
+  synth: Synth,
+  kind: HandDrumKind,
+  time: number,
+  velocity: number,
+  pan: number
+): number {
+  const ctx = synth.ctx;
+  time = humanizeTime(time);
+  const src = ctx.createBufferSource();
+  const variant = Math.floor(Math.random() * HAND_DRUM_ROUND_ROBIN);
+  src.buffer = handDrumBuffer(synth, kind, variant);
+  const rateSpread = kind === "bass" ? 0.08 : kind === "tone" ? 0.12 : 0.18;
+  src.playbackRate.value = 1 - rateSpread / 2 + Math.random() * rateSpread;
+
+  const gain = ctx.createGain();
+  const attack = kind === "bass" ? 0.003 : 0.0015;
+  const release =
+    (kind === "bass" ? 0.34 : kind === "tone" ? 0.2 : 0.08) *
+    (0.88 + Math.random() * 0.24);
+  const end = time + attack + release + 0.04;
+  gain.gain.setValueAtTime(0.0001, time);
+  gain.gain.linearRampToValueAtTime(velocity, time + attack);
+  gain.gain.setTargetAtTime(0.0001, time + attack, release * 0.35);
+
+  const tone = ctx.createBiquadFilter();
+  tone.type = kind === "bass" ? "lowpass" : "bandpass";
+  const filterBase = kind === "bass" ? 320 : kind === "tone" ? 760 : 2800;
+  tone.frequency.value = filterBase * (0.86 + Math.random() * 0.28);
+  tone.Q.value =
+    (kind === "bass" ? 0.55 : kind === "tone" ? 0.9 : 1.35) *
+    (0.85 + Math.random() * 0.3);
+
+  const panner = ctx.createStereoPanner();
+  panner.pan.value = pan + (Math.random() - 0.5) * 0.08;
+
+  src.connect(gain);
+  gain.connect(tone);
+  tone.connect(panner);
+  panner.connect(synth.master);
   src.start(time);
   src.stop(end);
   return end;
@@ -1128,13 +1232,93 @@ function guitarImproTiming(
   return { beat, phraseEnd, fragmentBeats, advance: phraseEnd + breath, phase };
 }
 
+function scheduleGuitarImproRhythm(
+  synth: Synth,
+  rhythmOriginTime: number,
+  windowStart: number,
+  windowEnd: number,
+  beat: number,
+  phase: number,
+  volume: number
+): number {
+  if (volume <= 0) return windowStart;
+  const drive = 0.92 + 0.18 * Math.sin(Math.PI * Math.min(1, phase));
+  const returning = phase >= 0.84;
+  const firstBeat = Math.max(
+    0,
+    Math.floor((windowStart - rhythmOriginTime) / beat - 1.0001)
+  );
+  const lastBeat = Math.max(
+    firstBeat,
+    Math.floor((windowEnd - rhythmOriginTime) / beat + 0.0001)
+  );
+  let end = windowStart;
+  const mark = (t: number) => {
+    if (t > end) end = t;
+  };
+  const inWindow = (t: number) =>
+    t >= windowStart - beat * 0.05 && t < windowEnd - beat * 0.05;
+
+  for (let b = firstBeat; b <= lastBeat; b++) {
+    const t = rhythmOriginTime + b * beat;
+    const barPos = b % 4;
+    const downbeat = barPos === 0;
+    const lift = downbeat ? 1.18 : barPos === 2 ? 0.92 : 0.78;
+    const base = 0.56 * lift * drive * (returning ? 0.94 : 1) * volume;
+
+    if ((downbeat || barPos === 2) && inWindow(t)) {
+      mark(
+        scheduleHandDrum(
+          synth,
+          "bass",
+          t,
+          base * (downbeat ? 1.65 : 1.05),
+          -0.18
+        )
+      );
+    }
+
+    const toneTime = t + beat * 0.48;
+    if ((barPos === 1 || barPos === 3) && inWindow(toneTime)) {
+      mark(
+        scheduleHandDrum(
+          synth,
+          "tone",
+          toneTime,
+          base * 1.05,
+          0.1
+        )
+      );
+    }
+
+    const slapTime = t + beat * 0.72;
+    if (b % 2 === 0 && inWindow(slapTime)) {
+      mark(
+        scheduleHandDrum(
+          synth,
+          "slap",
+          slapTime,
+          base * 0.82,
+          0.2
+        )
+      );
+    }
+  }
+
+  return end;
+}
+
 function scheduleGuitarImproWord(
   synth: Synth,
   notes: TseroufNote[],
   idx: number,
   startTime: number,
   stepSeconds: number,
-  options: { wrapsToStart?: boolean } = {}
+  options: {
+    wrapsToStart?: boolean;
+    rhythmOriginTime?: number;
+    rhythmVolume?: number;
+  } = {}
 ): { advance: number; end: number } {
   const note = notes[idx];
   const letters = Array.from(note.word);
@@ -1149,7 +1333,8 @@ function scheduleGuitarImproWord(
   const center = synth.center;
   const bassRoot = TSEROUF_ROOT_MIDI - 12; // open A, one octave below the melody root.
   const density = Math.sin(Math.PI * Math.min(1, phase));
-  const finalReturn = phase >= 0.84 || options.wrapsToStart;
+  const loopAdvance = options.wrapsToStart ? phraseEnd : advance;
+  const finalReturn = phase >= 0.84 && !options.wrapsToStart;
   let end = startTime;
   const mark = (t: number) => {
     if (t > end) end = t;
@@ -1157,6 +1342,17 @@ function scheduleGuitarImproWord(
 
   // Continuous/semi-continuous open-string ground: A and E, with rare D colour.
   mark(pluckNote(synth, center, midiToFreq(bassRoot), startTime, 0.2 + 0.11 * density, beat * 5.2, 0.035));
+  mark(
+    scheduleGuitarImproRhythm(
+      synth,
+      options.rhythmOriginTime ?? startTime,
+      startTime,
+      startTime + loopAdvance,
+      beat,
+      phase,
+      options.rhythmVolume ?? 1
+    )
+  );
   if (idx % 2 === 0 || phase < 0.2) {
     mark(
       pluckNote(
@@ -1246,7 +1442,7 @@ function scheduleGuitarImproWord(
     mark(pluckNote(synth, center, midiToFreq(bassRoot), cadenceTime + beat * 0.95, 0.42, beat * 4.6, 0.04));
   }
 
-  return { advance, end };
+  return { advance: loopAdvance, end };
 }
 
 function guitarImproUiEvents(
@@ -1282,12 +1478,14 @@ export class TseroufPlayer {
   private loop = false;
   private instrument: InstrumentId = "guitar";
   private playbackStyle: TseroufPlaybackStyle = "strict";
+  private rhythmVolume = 1;
   private onStep?: (wordIndex: number, letterIndex?: number) => void;
   private onEnd?: () => void;
 
   private wordIdx = 0;
   private loopStartIndex = 0;
   private nextWordTime = 0;
+  private rhythmOriginTime = 0;
   private lastVoiceEnd = 0;
   private finishedScheduling = false;
   private hasLoopedToStart = false;
@@ -1316,6 +1514,7 @@ export class TseroufPlayer {
     this.loop = options.loop ?? false;
     if (options.instrument) this.instrument = options.instrument;
     this.playbackStyle = options.playbackStyle ?? "strict";
+    this.rhythmVolume = options.rhythmVolume ?? 1;
     this.synth!.instrument = this.instrument;
     this.onStep = options.onStep;
     this.onEnd = options.onEnd;
@@ -1323,6 +1522,7 @@ export class TseroufPlayer {
     this.wordIdx = clampStartIndex(options.startIndex, notes.length);
     this.loopStartIndex = clampStartIndex(options.loopStartIndex, notes.length);
     this.nextWordTime = ctx.currentTime + 0.12;
+    this.rhythmOriginTime = this.nextWordTime;
     this.lastVoiceEnd = this.nextWordTime;
     this.finishedScheduling = false;
     this.hasLoopedToStart = false;
@@ -1363,6 +1563,11 @@ export class TseroufPlayer {
   // words, so it can be adjusted live during playback.
   setStepSeconds(stepSeconds: number): void {
     this.stepSeconds = stepSeconds;
+  }
+
+  // Changes the rhythm accompaniment mix for subsequently scheduled words.
+  setRhythmVolume(volume: number): void {
+    this.rhythmVolume = volume;
   }
 
   // Toggles looping for the current playback and future starts.
@@ -1434,7 +1639,11 @@ export class TseroufPlayer {
               this.wordIdx,
               this.nextWordTime,
               this.stepSeconds,
-              { wrapsToStart }
+              {
+                wrapsToStart,
+                rhythmOriginTime: this.rhythmOriginTime,
+                rhythmVolume: this.rhythmVolume,
+              }
             )
           : scheduleWord(
               synth,
@@ -1501,18 +1710,35 @@ export async function renderTseroufWav(
 ): Promise<Blob> {
   const stepSeconds = options.stepSeconds ?? 0.18;
   const playbackStyle = options.playbackStyle ?? "strict";
+  const rhythmVolume = options.rhythmVolume ?? 1;
+  const loopCount = Math.max(1, Math.floor(options.loopCount ?? 1));
+  const loopStartIndex = clampStartIndex(options.loopStartIndex, notes.length);
   const maxSeconds = options.maxSeconds ?? 75;
   const sampleRate = 44100;
 
+  const plan: { idx: number; wrapsToStart: boolean; previousWord?: string }[] = [];
   const lead = 0.1;
   let cursor = lead;
-  let count = 0;
-  for (let i = 0; i < notes.length; i++) {
-    cursor +=
-      playbackStyle === "guitar-impro"
-        ? guitarImproTiming(notes, i, stepSeconds).advance
-        : wordTiming(notes, i, stepSeconds).advance;
-    count++;
+  for (let pass = 0; pass < loopCount; pass++) {
+    const startIndex = pass === 0 ? 0 : loopStartIndex;
+    for (let i = startIndex; i < notes.length; i++) {
+      const wrapsToStart = pass < loopCount - 1 && i === notes.length - 1;
+      const advance =
+        playbackStyle === "guitar-impro"
+          ? (() => {
+              const timing = guitarImproTiming(notes, i, stepSeconds);
+              return wrapsToStart ? timing.phraseEnd : timing.advance;
+            })()
+          : wordTiming(notes, i, stepSeconds).advance;
+      plan.push({
+        idx: i,
+        wrapsToStart,
+        previousWord:
+          pass > 0 && i === startIndex ? notes[notes.length - 1]?.word : undefined,
+      });
+      cursor += advance;
+      if (cursor >= maxSeconds) break;
+    }
     if (cursor >= maxSeconds) break;
   }
 
@@ -1529,11 +1755,18 @@ export async function renderTseroufWav(
   synth.instrument = options.instrument ?? "guitar";
 
   let startTime = lead;
-  for (let i = 0; i < count; i++) {
+  for (const item of plan) {
     const { advance } =
       playbackStyle === "guitar-impro"
-        ? scheduleGuitarImproWord(synth, notes, i, startTime, stepSeconds)
-        : scheduleWord(synth, notes, i, startTime, stepSeconds);
+        ? scheduleGuitarImproWord(synth, notes, item.idx, startTime, stepSeconds, {
+            rhythmOriginTime: lead,
+            rhythmVolume,
+            wrapsToStart: item.wrapsToStart,
+          })
+        : scheduleWord(synth, notes, item.idx, startTime, stepSeconds, {
+            previousWord: item.previousWord,
+            wrapsToStart: item.wrapsToStart,
+          });
     startTime += advance;
   }
 

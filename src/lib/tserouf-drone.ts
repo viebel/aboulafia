@@ -791,15 +791,19 @@ export async function renderTseroufDroneWav(
   options: TseroufRenderOptions & { noteSeconds?: number } = {}
 ): Promise<Blob> {
   const noteSeconds = options.noteSeconds ?? DEFAULT_NOTE_SECONDS;
+  const loopCount = Math.max(1, Math.floor(options.loopCount ?? 1));
   const maxSeconds = options.maxSeconds ?? 150;
   const sampleRate = 44100;
 
+  const plan: number[] = [];
   const lead = 0.15;
   let cursor = lead;
-  let count = 0;
-  for (let i = 0; i < notes.length; i++) {
-    cursor += chantTiming(notes, i, noteSeconds).advance;
-    count++;
+  for (let pass = 0; pass < loopCount; pass++) {
+    for (let i = 0; i < notes.length; i++) {
+      plan.push(i);
+      cursor += chantTiming(notes, i, noteSeconds).advance;
+      if (cursor >= maxSeconds) break;
+    }
     if (cursor >= maxSeconds) break;
   }
 
@@ -815,7 +819,7 @@ export async function renderTseroufDroneWav(
   const synth = buildChantSynth(offline, noteSeconds, lead);
 
   let startTime = lead;
-  for (let i = 0; i < count; i++) {
+  for (const i of plan) {
     const { advance } = scheduleChant(synth, notes, i, startTime);
     startTime += advance;
   }
