@@ -1285,6 +1285,7 @@ function ImproPathTile({
   const isHebrew = alphabet === "hebrew";
   const hebrewLetters = useHebrewLetters();
   const playingFocus = useContext(PlayingFocusContext);
+  const letters = Array.from(step.word);
 
   return (
     <button
@@ -1294,7 +1295,7 @@ function ImproPathTile({
       onClick={onClick}
       title={`${index + 1}. ${step.role} · ${tonePreviewTitle(step.word, kind)}`}
       style={style}
-      className={`mx-2 inline-flex flex-col items-stretch rounded-md border px-1.5 py-1 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background ${parityClassName(
+      className={`mx-2 flex min-w-0 flex-col items-stretch rounded-md border px-1.5 py-1 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background ${parityClassName(
         step.word
       )} ${
         active
@@ -1314,22 +1315,80 @@ function ImproPathTile({
         <span dir="ltr">{index + 1}</span>
         <span dir="ltr">{step.duration}</span>
       </span>
-      <span className="inline-flex justify-center">
-        {Array.from(step.word).map((letter, letterIndex) => (
+      <span
+        className="grid w-full"
+        style={{
+          gridTemplateColumns: `repeat(${letters.length}, minmax(0, 1fr))`,
+        }}
+      >
+        {letters.map((letter, letterIndex) => (
           <span
             key={letterIndex}
-            className={letterClassName(
+            className={`${letterClassName(
               stable,
               letterIndex,
               active && playingFocus?.letterIndex === letterIndex
-            )}
+            )} justify-self-center`}
           >
             {displayLetter(letter, alphabet, hebrewLetters)}
           </span>
         ))}
       </span>
-      <TonalPreview word={step.word} kind={kind} />
+      <AlignedTonalPreview word={step.word} kind={kind} />
     </button>
+  );
+}
+
+function AlignedTonalPreview({
+  word,
+  kind,
+}: {
+  word: string;
+  kind: SoundKind;
+}) {
+  const tones = tonePreviewTones(word, kind);
+  if (tones.length === 0) return null;
+
+  const width = 100;
+  const height = 30;
+  const xFor = (index: number) => ((index + 0.5) * width) / tones.length;
+  const points = tones.map((tone, index) => `${xFor(index)},${tone.y}`).join(" ");
+
+  return (
+    <span
+      dir="ltr"
+      aria-hidden
+      className="relative mt-0.5 block w-full overflow-hidden rounded-sm bg-background/35"
+      style={{ height } as CSSProperties}
+    >
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="absolute inset-0 h-full w-full overflow-visible"
+        preserveAspectRatio="none"
+      >
+        <polyline
+          points={points}
+          fill="none"
+          stroke="currentColor"
+          strokeOpacity="0.45"
+          strokeWidth="1.4"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        {tones.map((tone, index) => (
+          <circle
+            key={`${tone.label}-${index}`}
+            cx={xFor(index)}
+            cy={tone.y}
+            r={1.7}
+            fill="currentColor"
+            opacity={0.55}
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
+      </svg>
+    </span>
   );
 }
 
@@ -2020,17 +2079,25 @@ function WordTile({
 function TonalPreview({
   word,
   kind,
+  stretch = false,
+  alignToLetters = false,
 }: {
   word: string;
   kind: SoundKind;
+  stretch?: boolean;
+  alignToLetters?: boolean;
 }) {
   const tones = tonePreviewTones(word, kind);
   if (tones.length === 0) return null;
 
-  const width = Math.max(42, tones.length * 13);
+  const width = stretch ? 100 : Math.max(42, tones.length * 13);
   const height = 30;
   const xFor = (index: number) =>
-    tones.length === 1 ? width / 2 : 5 + (index * (width - 10)) / (tones.length - 1);
+    alignToLetters
+      ? ((index + 0.5) * width) / tones.length
+      : tones.length === 1
+      ? width / 2
+      : 5 + (index * (width - 10)) / (tones.length - 1);
   const points = tones.map((tone, index) => `${xFor(index)},${tone.y}`).join(" ");
 
   return (
@@ -2040,7 +2107,7 @@ function TonalPreview({
       className="relative mx-auto mt-0.5 block overflow-hidden rounded-sm bg-background/35"
       style={
         {
-          width,
+          width: stretch ? "100%" : width,
           height,
         } as CSSProperties
       }

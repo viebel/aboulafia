@@ -1102,6 +1102,7 @@ function wordUiEvents(
 interface GuitarImproTiming {
   beat: number;
   phraseEnd: number;
+  fragmentBeats: number;
   advance: number;
   phase: number;
 }
@@ -1115,13 +1116,16 @@ function guitarImproTiming(
   const last = Math.max(1, notes.length - 1);
   const phase = idx / last;
   const ratio = notes[idx]?.durationRatio ?? 1;
-  const beat = stepSeconds * ratio;
+  // The tempo sets the underlying pulse. The ratio controls the cell's total
+  // span on that pulse grid, not the per-letter tempo; otherwise high BPM still
+  // feels slow whenever a cell has a long duration mark.
+  const beat = stepSeconds;
+  const phraseEnd = len * beat * ratio;
   const hasRepeat = ratio >= 1.5 && len >= 3;
-  const fragmentBeats = hasRepeat ? (ratio >= 2 ? 2 : 1) * beat * 0.5 : 0;
-  const phraseEnd = len * beat + fragmentBeats;
+  const fragmentBeats = hasRepeat ? Math.min(beat * 1.2, phraseEnd * 0.22) : 0;
   const breath =
-    ratio >= 2 ? beat * 0.5 : ratio <= 0.5 ? 0 : idx % 3 === 0 ? beat * 0.25 : 0;
-  return { beat, phraseEnd, advance: phraseEnd + breath, phase };
+    ratio >= 2 ? beat * 0.35 : ratio <= 0.5 ? 0 : idx % 3 === 0 ? beat * 0.18 : 0;
+  return { beat, phraseEnd, fragmentBeats, advance: phraseEnd + breath, phase };
 }
 
 function scheduleGuitarImproWord(
@@ -1135,7 +1139,7 @@ function scheduleGuitarImproWord(
   const note = notes[idx];
   const letters = Array.from(note.word);
   const len = Math.max(1, letters.length);
-  const { beat, phraseEnd, advance, phase } = guitarImproTiming(
+  const { beat, phraseEnd, fragmentBeats, advance, phase } = guitarImproTiming(
     notes,
     idx,
     stepSeconds
@@ -1182,13 +1186,15 @@ function scheduleGuitarImproWord(
 
   const baseVelocity =
     phase < 0.18 ? 0.34 : phase < 0.55 ? 0.5 : phase < 0.84 ? 0.64 : 0.42;
+  const melodicSpan = Math.max(beat * 0.75, phraseEnd - fragmentBeats);
+  const letterStep = len <= 1 ? melodicSpan : melodicSpan / len;
   letters.forEach((letter, i) => {
     const pos = len <= 1 ? 0 : i / (len - 1);
-    const t = startTime + i * beat;
+    const t = startTime + i * letterStep;
     const swell = 0.92 + 0.16 * Math.sin(Math.PI * pos);
     const velocity = Math.min(0.88, baseVelocity * swell * (0.94 + Math.random() * 0.1));
     const ring =
-      beat *
+      letterStep *
       (phase < 0.18 ? 3.3 : phase < 0.55 ? 2.15 : phase < 0.84 ? 1.55 : 2.45);
     mark(
       pluckNote(
@@ -1206,20 +1212,20 @@ function scheduleGuitarImproWord(
     const next = letters[i + 1];
     // Guitaristic comments on the cell, kept inside A C D E, with rare G colour.
     if (letter === "b" && (next === "c" || phase > 0.55)) {
-      mark(pluckNote(synth, voice, letterToFreq("c"), t + beat * 0.42, velocity * 0.42, beat * 0.9, 0.018));
+      mark(pluckNote(synth, voice, letterToFreq("c"), t + letterStep * 0.42, velocity * 0.42, letterStep * 0.9, 0.018));
     }
     if (letter === "d" && (next === "c" || phase > 0.5)) {
-      mark(pluckNote(synth, voice, letterToFreq("c"), t + beat * 0.36, velocity * 0.36, beat * 0.75, 0.015));
+      mark(pluckNote(synth, voice, letterToFreq("c"), t + letterStep * 0.36, velocity * 0.36, letterStep * 0.75, 0.015));
     }
     if (phase > 0.58 && phase < 0.78 && i === 1 && idx % 4 === 1) {
-      mark(pluckNote(synth, voice, letterToFreq("e"), t + beat * 0.55, velocity * 0.26, beat * 1.2, 0.02));
+      mark(pluckNote(synth, voice, letterToFreq("e"), t + letterStep * 0.55, velocity * 0.26, letterStep * 1.2, 0.02));
     }
   });
 
   if (phase >= 0.55 && phase < 0.84 && len >= 3) {
     const fragment = idx % 2 === 0 ? letters.slice(-2) : letters.slice(0, 2);
     fragment.forEach((letter, j) => {
-      const t = startTime + len * beat + j * beat * 0.78;
+      const t = startTime + melodicSpan + j * Math.min(beat * 0.6, fragmentBeats / Math.max(1, fragment.length));
       mark(
         pluckNote(
           synth,
@@ -1252,8 +1258,11 @@ function guitarImproUiEvents(
   const word = notes[idx]?.word ?? "";
   const letters = Array.from(word);
   const { beat } = guitarImproTiming(notes, idx, stepSeconds);
+  const ratio = notes[idx]?.durationRatio ?? 1;
+  const cellSpan = letters.length * beat * ratio;
+  const letterStep = letters.length <= 1 ? cellSpan : cellSpan / letters.length;
   return letters.map((_, letterIndex) => ({
-    time: startTime + letterIndex * beat,
+    time: startTime + letterIndex * letterStep,
     wordIndex: idx,
     letterIndex,
   }));
