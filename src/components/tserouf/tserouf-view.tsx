@@ -32,6 +32,7 @@ import {
   TseroufDronePlayer,
 } from "@/lib/tserouf-drone";
 import { readEnumParam, readIntParam, writeUrlParams } from "@/lib/url-state";
+import { formatUiNumber } from "@/lib/utils";
 import { toPng } from "html-to-image";
 import {
   Download,
@@ -56,7 +57,6 @@ import {
   useState,
 } from "react";
 
-const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 const N_OPTIONS = [2, 3, 4, 5, 6, 7] as const;
 const WORDS_PER_LINE = 6;
 const HEBREW_LETTERS = ["א", "ב", "ג", "ד", "ה", "ו", "ז"] as const;
@@ -401,7 +401,7 @@ export function TseroufView() {
           }))
         );
         setStatus(
-          `${NUMBER_FORMAT.format(cycle.path.length)} permutations generated.`
+          `${formatUiNumber(cycle.path.length)} permutations generated.`
         );
       } catch (e) {
         if (signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
@@ -793,7 +793,7 @@ export function TseroufView() {
               <SelectContent>
                 {N_OPTIONS.map((option) => (
                   <SelectItem key={option} value={String(option)}>
-                    n = {option} — {NUMBER_FORMAT.format(factorial(option))} permutations
+                    n = {option} — {formatUiNumber(factorial(option))} permutations
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -2613,7 +2613,7 @@ function Stat({
         {value === undefined
           ? "-"
           : typeof value === "number"
-            ? NUMBER_FORMAT.format(value)
+            ? formatUiNumber(value)
             : value}
       </dd>
     </div>

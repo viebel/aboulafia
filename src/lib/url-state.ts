@@ -49,6 +49,24 @@ export function readNonNegIntParam(
 }
 
 /**
+ * Read a finite number, optionally clamped to a range. Useful for view state
+ * like zoom/pan, where values can be fractional or negative.
+ */
+export function readNumberParam(
+  params: URLSearchParams | null | undefined,
+  key: string,
+  fallback: number,
+  min = -Infinity,
+  max = Infinity
+): number {
+  const value = params?.get(key);
+  if (value === null || value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+/**
  * Replace the current URL's query string with `entries`, omitting any entry
  * whose value is `null`, `undefined`, or empty. A no-op on the server.
  */

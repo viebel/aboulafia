@@ -428,9 +428,10 @@ export function quotientDepthOptions(n: number, preset: GraphPreset): number[] {
  * depth: blocks group permutations sharing their first `depth` symbols.
  *
  * Pancake presets deliberately use the FULL suffix-reversal set r₂…rₙ here,
- * even though `buildPancakeGraph` only materializes rₙ for n > 6: the shorter
- * reversals are precisely the intra-block edges that reveal the recursion, and
- * the quotient only needs per-block counts, so it never stores n! edges.
+ * even when `buildPancakeGraph` materializes a sparse large-n subset: the
+ * shorter reversals are precisely the intra-block edges that reveal the
+ * recursion, and the quotient only needs per-block counts, so it never stores
+ * n! edges.
  */
 export async function buildQuotientGraph(
   graph: PancakeGraph,
@@ -665,6 +666,12 @@ export async function buildPancakeGraph(
           (done, total) => onProgress?.("cycle", done, total),
           signal
         )
+      : preset === "star"
+      ? await ehrlichStarOrder(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
       : preset === "sierpinski"
       ? await sierpinskiHamiltonianOrder(
           n,
@@ -880,7 +887,7 @@ export interface ZaksFundamentalEdge {
 }
 
 function pancakeGeneratorIds(n: number): number[] {
-  // Mirrors graphGenerators("pancake-*"): only rₙ is materialized past n = 6.
+  // Zaks symmetry payloads mirror the sparse Zaks graph: only rₙ past n = 6.
   const first = n > 6 ? n : 2;
   const ids: number[] = [];
   for (let k = first; k <= n; k++) ids.push(k);
@@ -1444,11 +1451,16 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
     preset === "pancake-zaks-recursive" ||
     preset === "pancake-williams"
   ) {
-    const generatorCount = n > 6 ? 1 : n - 1;
+    const generatorCount = materializedPancakeGeneratorIds(n, preset).length;
     return (generatorCount * factorial(n)) / 2;
   }
   if (preset === "cyclic-adjacent") return (n * factorial(n)) / 2;
   return ((n - 1) * factorial(n)) / 2;
+}
+
+export function graphEdgesPerVertex(n: number, preset: GraphPreset): number | null {
+  if (preset === "sliding-puzzle" || preset === "sierpinski") return null;
+  return (2 * graphEdgeCount(n, preset)) / graphVertexCount(n, preset);
 }
 
 export function graphMaxN(preset: GraphPreset): number {
@@ -1504,14 +1516,27 @@ function graphKind(preset: GraphPreset): GraphKind {
   return "pancake";
 }
 
+function materializedPancakeGeneratorIds(
+  n: number,
+  preset: GraphPreset
+): number[] {
+  if (preset === "pancake-williams") {
+    const ids: number[] = [];
+    for (let k = 2; k <= n; k++) ids.push(k);
+    return ids;
+  }
+  const first = n > 6 ? n : 2;
+  const ids: number[] = [];
+  for (let k = first; k <= n; k++) ids.push(k);
+  return ids;
+}
+
 function graphGenerators(n: number, preset: GraphPreset): Generator[] {
   if (preset.startsWith("pancake")) {
-    const generators: Generator[] = [];
-    const firstGenerator = n > 6 ? n : 2;
-    for (let k = firstGenerator; k <= n; k++) {
-      generators.push({ id: k, apply: (p) => flip(p, k) });
-    }
-    return generators;
+    return materializedPancakeGeneratorIds(n, preset).map((k) => ({
+      id: k,
+      apply: (p) => flip(p, k),
+    }));
   }
   if (preset === "star") {
     const generators: Generator[] = [];
@@ -1866,6 +1891,75 @@ async function completeOrder(
   }
   onProgress?.(total, total);
   return { path, flips: [] };
+}
+
+async function ehrlichStarOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 50_000
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const total = factorial(n);
+  const p = new Uint8Array(n);
+  const c = new Uint32Array(n);
+  const b = new Uint32Array(n);
+  for (let i = 0; i < n; i++) {
+    p[i] = i + 1;
+    b[i] = i;
+  }
+
+  const path: Perm[] = [new Uint8Array(p)];
+  const flips: number[] = [];
+
+  while (path.length < total) {
+    let k = 1;
+    while (k < n && c[k] >= k) {
+      c[k] = 0;
+      k++;
+    }
+    if (k >= n) break;
+    c[k]++;
+
+    const swapIndex = b[k];
+    const t = p[0];
+    p[0] = p[swapIndex];
+    p[swapIndex] = t;
+    flips.push(swapIndex + 1);
+
+    for (let left = 1, right = k - 1; left < right; left++, right--) {
+      const u = b[left];
+      b[left] = b[right];
+      b[right] = u;
+    }
+
+    path.push(new Uint8Array(p));
+    if (path.length % chunk === 0) {
+      onProgress?.(path.length, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+
+  const closing = starSwapIdBetween(path[path.length - 1], path[0]);
+  if (closing !== null) flips.push(closing);
+
+  onProgress?.(total, total);
+  return { path, flips };
+}
+
+function starSwapIdBetween(a: Perm, b: Perm): number | null {
+  let changed = 0;
+  let other = -1;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) {
+      changed++;
+      if (i !== 0) other = i;
+    }
+  }
+  return changed === 2 && other > 0 && a[0] === b[other] && a[other] === b[0]
+    ? other + 1
+    : null;
 }
 
 /**

@@ -99,6 +99,10 @@ export interface RenderSettings {
   yankelovichTone?: YankelovichTone;
   /** Yankelovich color ramp (defaults to "gray"). */
   yankelovichColormap?: YankelovichColormap;
+  /** Number of random Zaks vertices sampled by the Yankelovich renderer. */
+  yankelovichSampleCount?: number;
+  /** Seed for random Yankelovich sampling; 0 keeps the exact renderer when possible. */
+  yankelovichSampleSeed?: number;
   /** Generator ids whose edges should be skipped at render time. */
   hiddenGenerators: number[];
   /** Symmetry-renderer color scheme (defaults to "parity"). */
@@ -2423,15 +2427,19 @@ export function drawZaksSymmetryToCanvas(
  * changes.
  */
 export interface YankelovichFieldCache {
-  /** Identity of the float field: `${n}|${field}|${hidden}`. */
+  /** Identity of the float field, including sampling and viewport choices. */
   key: string;
   field: number;
+  /** Region of the full Zaks disk covered by this matrix. */
+  viewport: YankelovichFieldViewport;
   /** Symmetrized per-pixel chord density, length field·field. */
   out: Float32Array;
   /** Normalization value (high percentile of the density). */
   norm: number;
   /** Number of representative chords deposited into the accumulator. */
   matrixEdges: number;
+  /** Number of angular-sector vertices/chords contributing to this viewport. */
+  visibleVertices: number;
   /** Distribution of the per-cell density values across the whole matrix. */
   histogram: YankelovichHistogram;
   /** Cached per-cell tone in [0,1] for {@link toneKey}; reused across gamma/
@@ -2443,6 +2451,14 @@ export interface YankelovichFieldCache {
   paintKey: string;
   /** Grayscale field×field image ready to blit onto the display canvas. */
   bitmap: HTMLCanvasElement;
+}
+
+export interface YankelovichFieldViewport {
+  /** Center in normalized full-disk square coordinates, where the full view is 0. */
+  centerX: number;
+  centerY: number;
+  /** Half side length in normalized full-disk square coordinates. */
+  scale: number;
 }
 
 /** Histogram of the density values stored in the N×N matrix. */
@@ -2473,6 +2489,7 @@ interface YankelovichCanvasOpts {
   panX?: number;
   panY?: number;
   topInset?: number;
+  fieldViewport?: YankelovichFieldViewport | null;
   palette?: Palette;
   cache?: { current: YankelovichFieldCache | null };
   onFieldTimings?: (timings: YankelovichFieldTimings) => void;
@@ -2482,6 +2499,8 @@ export interface YankelovichFieldTimings {
   matrixMs: number;
   symmetryMs: number;
   matrixEdges: number;
+  viewportMs: number;
+  visibleVertices: number;
 }
 
 /**
@@ -2490,16 +2509,201 @@ export interface YankelovichFieldTimings {
  * exact n = 11; n ≥ 12 samples).
  */
 const YANKELOVICH_ENUM_LIMIT = 4_000_000;
+const YANKELOVICH_VISIBLE_SAMPLE_MAX_ATTEMPT_FACTOR = 20;
+const YANKELOVICH_VISIBLE_SAMPLE_MAX_ATTEMPTS = 1_000_000;
 
 /** Default accumulator grid size (memory: 2 × Float32 × field² during compute). */
 const YANKELOVICH_DEFAULT_FIELD_SIZE = 1200;
 /** Base sampled-chord budget at resolution = 1. */
 const YANKELOVICH_SAMPLE_BUDGET = 2_500_000;
+const YANKELOVICH_DEFAULT_SAMPLE_COUNT = 100_000;
 
 /** Accumulator resolution. Kept fixed so quality is comparable across n. */
 function yankelovichFieldSize(settings: RenderSettings): number {
   const size = settings.yankelovichFieldSize ?? YANKELOVICH_DEFAULT_FIELD_SIZE;
   return Math.max(100, Math.round(size / 100) * 100);
+}
+
+function yankelovichDihedralSectorVertexCount(n: number): number {
+  return Math.max(1, Math.floor(factorial(n - 1) / 2));
+}
+
+function yankelovichSampleCount(settings: RenderSettings, n: number): number {
+  const fallback = Math.max(1, Math.round(YANKELOVICH_SAMPLE_BUDGET / (2 * n)));
+  const count = settings.yankelovichSampleCount ?? YANKELOVICH_DEFAULT_SAMPLE_COUNT;
+  const sectorVertices = yankelovichDihedralSectorVertexCount(n);
+  return Math.max(
+    1,
+    Math.min(
+      sectorVertices,
+      Math.round(Number.isFinite(count) ? count : fallback)
+    )
+  );
+}
+
+function yankelovichSampleSeed(settings: RenderSettings): number {
+  const seed = settings.yankelovichSampleSeed ?? 0;
+  return seed > 0 ? seed : 1;
+}
+
+function yankelovichUsesSampling(n: number, settings: RenderSettings): boolean {
+  return (
+    (settings.yankelovichSampleSeed ?? 0) > 0 ||
+    factorial(n - 1) > YANKELOVICH_ENUM_LIMIT
+  );
+}
+
+function makeYankelovichRng(seed: number): () => number {
+  let s = seed >>> 0 || 1;
+  return () => {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return (s >>> 0) / 0x100000000;
+  };
+}
+
+function defaultYankelovichViewport(): YankelovichFieldViewport {
+  return { centerX: 0, centerY: 0, scale: 1 };
+}
+
+function normalizeYankelovichViewport(
+  viewport?: YankelovichFieldViewport | null
+): YankelovichFieldViewport {
+  if (!viewport) return defaultYankelovichViewport();
+  const centerX = Number.isFinite(viewport.centerX) ? viewport.centerX : 0;
+  const centerY = Number.isFinite(viewport.centerY) ? viewport.centerY : 0;
+  const scale =
+    Number.isFinite(viewport.scale) && viewport.scale > 0 ? viewport.scale : 1;
+  return {
+    centerX,
+    centerY,
+    scale: Math.min(1, scale),
+  };
+}
+
+function yankelovichViewportCoordKey(value: number): string {
+  return value === 0 ? "0" : value.toPrecision(12);
+}
+
+function yankelovichViewportKey(viewport: YankelovichFieldViewport): string {
+  return `${yankelovichViewportCoordKey(viewport.centerX)},${yankelovichViewportCoordKey(viewport.centerY)},${yankelovichViewportCoordKey(viewport.scale)}`;
+}
+
+function isFullYankelovichViewport(viewport: YankelovichFieldViewport): boolean {
+  return (
+    Math.abs(viewport.centerX) < 1e-9 &&
+    Math.abs(viewport.centerY) < 1e-9 &&
+    Math.abs(viewport.scale - 1) < 1e-9
+  );
+}
+
+function mapYankelovichUnitToField(
+  field: number,
+  viewport: YankelovichFieldViewport,
+  ux: number,
+  uy: number
+): { x: number; y: number } {
+  const cf = field / 2;
+  const rf = field / 2 - 1.5;
+  const zoom = 1 / viewport.scale;
+  return {
+    x: cf + rf * (ux - viewport.centerX) * zoom,
+    y: cf + rf * (uy - viewport.centerY) * zoom,
+  };
+}
+
+function fieldToYankelovichUnit(
+  field: number,
+  viewport: YankelovichFieldViewport,
+  x: number,
+  y: number
+): { ux: number; uy: number } {
+  const cf = field / 2;
+  const rf = field / 2 - 1.5;
+  return {
+    ux: viewport.centerX + ((x - cf) * viewport.scale) / rf,
+    uy: viewport.centerY + ((y - cf) * viewport.scale) / rf,
+  };
+}
+
+function segmentIntersectsYankelovichViewport(
+  viewport: YankelovichFieldViewport,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number
+): boolean {
+  const minX = viewport.centerX - viewport.scale;
+  const maxX = viewport.centerX + viewport.scale;
+  const minY = viewport.centerY - viewport.scale;
+  const maxY = viewport.centerY + viewport.scale;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) {
+      if (t > t1) return false;
+      if (t > t0) t0 = t;
+    } else {
+      if (t < t0) return false;
+      if (t < t1) t1 = t;
+    }
+    return true;
+  };
+  return (
+    clip(-dx, x1 - minX) &&
+    clip(dx, maxX - x1) &&
+    clip(-dy, y1 - minY) &&
+    clip(dy, maxY - y1) &&
+    t1 >= t0
+  );
+}
+
+function chordIntersectsYankelovichViewport(
+  viewport: YankelovichFieldViewport,
+  total: number,
+  i: number,
+  j: number
+): boolean {
+  const ai = (2 * Math.PI * i) / total;
+  const aj = (2 * Math.PI * j) / total;
+  return segmentIntersectsYankelovichViewport(
+    viewport,
+    Math.cos(ai),
+    Math.sin(ai),
+    Math.cos(aj),
+    Math.sin(aj)
+  );
+}
+
+function dihedralChordIntersectsYankelovichViewport(
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  block: number,
+  i: number,
+  j: number
+): boolean {
+  for (let k = 0; k < n; k++) {
+    const a = (i + k * block) % total;
+    const b = (j + k * block) % total;
+    if (chordIntersectsYankelovichViewport(viewport, total, a, b)) return true;
+    if (
+      chordIntersectsYankelovichViewport(
+        viewport,
+        total,
+        total - 1 - a,
+        total - 1 - b
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -2511,14 +2715,11 @@ function yankelovichFieldSize(settings: RenderSettings): number {
  * to white, so the chord *envelopes* (caustics) emerge — structure the plain
  * alpha-blended disk hides once it saturates to black.
  *
- * It exploits the exact Dₙ symmetry of the Zaks layout to stay cheap: a 360/n
- * rotation == shifting every index by B = (n-1)!, and the reflection
- * ω: i ↦ (n!−1)−i mirrors the layout. The exact path rasterizes only one
- * representative per dihedral orbit (about (n-1)!/2 chords), then sums the n
- * rotations and their mirrored copies. Antipodal "diameter" chords have a
- * half-size rotation orbit, so they are deposited at weight 1/2; mirror-invariant
- * orbits are also deposited at weight 1/2 because the final Dₙ sum visits them
- * twice.
+ * It exploits the exact Dₙ symmetry of the Zaks layout to stay cheap: the
+ * fundamental angular sector has (n-1)!/2 vertices, then its n rotations and
+ * mirrored copies cover the disk. Antipodal "diameter" chords have a half-size
+ * rotation orbit, so they are deposited at weight 1/2; mirror-invariant orbits
+ * are also deposited at weight 1/2 because the final Dₙ sum visits them twice.
  */
 export function drawYankelovichToCanvas(
   ctx: CanvasRenderingContext2D,
@@ -2578,13 +2779,17 @@ export function drawYankelovichToCanvas(
   const dy = inset + (availableH - size) / 2;
   const cx = w / 2;
   const cy = inset + availableH / 2;
+  const viewport = entry.viewport;
+  const viewportSize = size * viewport.scale;
+  const viewportX = dx + size * ((viewport.centerX - viewport.scale + 1) / 2);
+  const viewportY = dy + size * ((viewport.centerY - viewport.scale + 1) / 2);
 
   ctx.save();
   ctx.translate(cx + panX * dpr, cy + panY * dpr);
   ctx.scale(zoom, zoom);
   ctx.translate(-cx, -cy);
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(entry.bitmap, dx, dy, size, size);
+  ctx.drawImage(entry.bitmap, viewportX, viewportY, viewportSize, viewportSize);
   ctx.restore();
 }
 
@@ -2609,8 +2814,9 @@ export function ensureYankelovichField(
   const entry = buildYankelovichField(
     n,
     field,
-    settings.hiddenGenerators,
+    settings,
     fieldKey,
+    normalizeYankelovichViewport(opts.fieldViewport),
     opts.onFieldTimings
   );
   if (cache) cache.current = entry;
@@ -2625,10 +2831,17 @@ export function ensureYankelovichField(
 export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
   const { n, settings } = opts;
   const field = yankelovichFieldSize(settings);
+  const sampled = yankelovichUsesSampling(n, settings);
   const hiddenKey = [...new Set(settings.hiddenGenerators)]
     .sort((a, b) => a - b)
     .join(",");
-  return `${n}|${field}|${hiddenKey}`;
+  const sampleKey = sampled
+    ? `${yankelovichSampleCount(settings, n)}|${yankelovichSampleSeed(settings)}`
+    : "exact";
+  const viewportKey = yankelovichViewportKey(
+    normalizeYankelovichViewport(opts.fieldViewport)
+  );
+  return `${n}|${field}|${hiddenKey}|${sampleKey}|${viewportKey}`;
 }
 
 /**
@@ -2640,19 +2853,36 @@ export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
 function buildYankelovichField(
   n: number,
   field: number,
-  hiddenGenerators: number[],
+  settings: RenderSettings,
   key: string,
+  viewport: YankelovichFieldViewport,
   onFieldTimings?: (timings: YankelovichFieldTimings) => void
 ): YankelovichFieldCache {
   const timings: YankelovichFieldTimings = {
     matrixMs: 0,
     symmetryMs: 0,
     matrixEdges: 0,
+    viewportMs: 0,
+    visibleVertices: 0,
   };
   const out =
-    factorial(n - 1) <= YANKELOVICH_ENUM_LIMIT
-      ? yankelovichFieldExact(n, field, hiddenGenerators, timings)
-      : yankelovichFieldSampled(n, field, hiddenGenerators, timings);
+    yankelovichUsesSampling(n, settings)
+      ? yankelovichFieldSampled(
+          n,
+          field,
+          settings.hiddenGenerators,
+          yankelovichSampleCount(settings, n),
+          yankelovichSampleSeed(settings),
+          viewport,
+          timings
+        )
+      : yankelovichFieldExact(
+          n,
+          field,
+          settings.hiddenGenerators,
+          viewport,
+          timings
+        );
   onFieldTimings?.(timings);
 
   let maxv = 0;
@@ -2660,7 +2890,13 @@ function buildYankelovichField(
   // Normalize on a high percentile, not the raw max, so a single bright
   // intersection pixel does not wash the whole field out.
   const norm = percentile(out, maxv, 0.999);
-  const histogram = buildYankelovichHistogram(out, maxv, Math.max(norm, 1e-9), field);
+  const histogram = buildYankelovichHistogram(
+    out,
+    maxv,
+    Math.max(norm, 1e-9),
+    field,
+    viewport
+  );
 
   const bitmap =
     typeof document !== "undefined"
@@ -2670,9 +2906,11 @@ function buildYankelovichField(
   return {
     key,
     field,
+    viewport,
     out,
     norm: Math.max(norm, 1e-9),
     matrixEdges: timings.matrixEdges,
+    visibleVertices: timings.visibleVertices,
     histogram,
     paintKey: "",
     bitmap,
@@ -2683,8 +2921,7 @@ function buildYankelovichField(
 function depositChord(
   buf: Float32Array,
   field: number,
-  cf: number,
-  rf: number,
+  viewport: YankelovichFieldViewport,
   total: number,
   i: number,
   j: number,
@@ -2692,14 +2929,58 @@ function depositChord(
 ): void {
   const ai = (2 * Math.PI * i) / total;
   const aj = (2 * Math.PI * j) / total;
-  const x1 = cf + rf * Math.cos(ai);
-  const y1 = cf + rf * Math.sin(ai);
-  const x2 = cf + rf * Math.cos(aj);
-  const y2 = cf + rf * Math.sin(aj);
+  let { x: x1, y: y1 } = mapYankelovichUnitToField(
+    field,
+    viewport,
+    Math.cos(ai),
+    Math.sin(ai)
+  );
+  let { x: x2, y: y2 } = mapYankelovichUnitToField(
+    field,
+    viewport,
+    Math.cos(aj),
+    Math.sin(aj)
+  );
   const dx = x2 - x1;
   const dy = y2 - y1;
   const len = Math.hypot(dx, dy);
   if (len <= 0) return;
+
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) {
+      if (t > t1) return false;
+      if (t > t0) t0 = t;
+    } else {
+      if (t < t0) return false;
+      if (t < t1) t1 = t;
+    }
+    return true;
+  };
+  const maxCell = field - 1e-6;
+  if (
+    !clip(-dx, x1) ||
+    !clip(dx, maxCell - x1) ||
+    !clip(-dy, y1) ||
+    !clip(dy, maxCell - y1)
+  ) {
+    return;
+  }
+  if (t1 <= t0) return;
+  const clippedX1 = x1 + dx * t0;
+  const clippedY1 = y1 + dy * t0;
+  const clippedX2 = x1 + dx * t1;
+  const clippedY2 = y1 + dy * t1;
+  const clippedLen = len * (t1 - t0);
+  x1 = clippedX1;
+  y1 = clippedY1;
+  x2 = clippedX2;
+  y2 = clippedY2;
+  const cdx = x2 - x1;
+  const cdy = y2 - y1;
 
   // Exact grid traversal: each crossed cell receives the chord length inside it.
   // This avoids the blur/energy spread caused by point-sampling plus bilinear splats.
@@ -2707,20 +2988,20 @@ function depositChord(
   let y = Math.floor(y1);
   const endX = Math.floor(x2);
   const endY = Math.floor(y2);
-  const stepX = dx > 0 ? 1 : dx < 0 ? -1 : 0;
-  const stepY = dy > 0 ? 1 : dy < 0 ? -1 : 0;
-  const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / dx);
-  const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / dy);
+  const stepX = cdx > 0 ? 1 : cdx < 0 ? -1 : 0;
+  const stepY = cdy > 0 ? 1 : cdy < 0 ? -1 : 0;
+  const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / cdx);
+  const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / cdy);
   let tMaxX =
-    stepX === 0 ? Infinity : ((stepX > 0 ? x + 1 : x) - x1) / dx;
+    stepX === 0 ? Infinity : ((stepX > 0 ? x + 1 : x) - x1) / cdx;
   let tMaxY =
-    stepY === 0 ? Infinity : ((stepY > 0 ? y + 1 : y) - y1) / dy;
+    stepY === 0 ? Infinity : ((stepY > 0 ? y + 1 : y) - y1) / cdy;
   let t = 0;
 
   while (true) {
     const nextT = Math.min(1, tMaxX, tMaxY);
     if (x >= 0 && y >= 0 && x < field && y < field && nextT > t) {
-      buf[y * field + x] += wgt * len * (nextT - t);
+      buf[y * field + x] += wgt * clippedLen * (nextT - t);
     }
     if (nextT >= 1 || (x === endX && y === endY)) break;
 
@@ -2743,12 +3024,12 @@ function symmetrizeYankelovichAccumulator(
   total: number,
   field: number,
   acc: Float32Array,
+  viewport: YankelovichFieldViewport,
   timings?: YankelovichFieldTimings
 ): Float32Array {
   // Symmetrize: out(p) = Σₖ acc(R₋ₖ p) + acc(ω R₋ₖ p). The reflection
   // ω: i ↦ (n!−1)−i maps angle θ to -θ - 2π/total.
   const symmetryT0 = performance.now();
-  const cf = field / 2;
   const out = new Float32Array(field * field);
   const cos = new Float64Array(n);
   const sin = new Float64Array(n);
@@ -2760,7 +3041,8 @@ function symmetrizeYankelovichAccumulator(
   const delta = (2 * Math.PI) / total;
   const mirrorCos = Math.cos(delta);
   const mirrorSin = Math.sin(delta);
-  const sampleAcc = (x: number, y: number): number => {
+  const sampleAcc = (ux: number, uy: number): number => {
+    const { x, y } = mapYankelovichUnitToField(field, viewport, ux, uy);
     if (x < 0 || y < 0 || x >= field - 1 || y >= field - 1) return 0;
     const x0 = Math.floor(x);
     const y0 = Math.floor(y);
@@ -2776,17 +3058,21 @@ function symmetrizeYankelovichAccumulator(
   };
 
   for (let oy = 0; oy < field; oy++) {
-    const ry = oy + 0.5 - cf;
     for (let ox = 0; ox < field; ox++) {
-      const rx = ox + 0.5 - cf;
+      const { ux: rx, uy: ry } = fieldToYankelovichUnit(
+        field,
+        viewport,
+        ox + 0.5,
+        oy + 0.5
+      );
       let v = 0;
       for (let k = 0; k < n; k++) {
         const ux = rx * cos[k] + ry * sin[k];
         const uy = -rx * sin[k] + ry * cos[k];
-        v += sampleAcc(cf + ux, cf + uy);
+        v += sampleAcc(ux, uy);
         v += sampleAcc(
-          cf + ux * mirrorCos - uy * mirrorSin,
-          cf - ux * mirrorSin - uy * mirrorCos
+          ux * mirrorCos - uy * mirrorSin,
+          -ux * mirrorSin - uy * mirrorCos
         );
       }
       out[oy * field + ox] = v;
@@ -2794,6 +3080,31 @@ function symmetrizeYankelovichAccumulator(
   }
   if (timings) timings.symmetryMs = performance.now() - symmetryT0;
   return out;
+}
+
+function depositDihedralChordCopies(
+  buf: Float32Array,
+  field: number,
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  block: number,
+  i: number,
+  j: number,
+  weight: number
+): void {
+  for (let k = 0; k < n; k++) {
+    const a = (i + k * block) % total;
+    const b = (j + k * block) % total;
+    depositChord(buf, field, viewport, total, a, b, weight);
+    depositChord(buf, field, viewport, total, total - 1 - a, total - 1 - b, weight);
+  }
+}
+
+interface YankelovichChordCandidate {
+  i: number;
+  j: number;
+  weight: number;
 }
 
 /**
@@ -2804,22 +3115,27 @@ function yankelovichFieldExact(
   n: number,
   field: number,
   hiddenGenerators: number[],
+  viewport: YankelovichFieldViewport,
   timings?: YankelovichFieldTimings
 ): Float32Array {
   const total = factorial(n);
   const B = factorial(n - 1);
-  const cf = field / 2;
-  const rf = field / 2 - 1.5;
+  const sectorVertices = yankelovichDihedralSectorVertexCount(n);
   const acc = new Float32Array(field * field);
+  const direct = !isFullYankelovichViewport(viewport);
   const hidden = hiddenGeneratorSet(hiddenGenerators);
+  const candidates: YankelovichChordCandidate[] = [];
+  const seenDihedral = new Set<number>();
 
-  const matrixT0 = performance.now();
+  const findT0 = performance.now();
   let matrixEdges = 0;
   forEachZaksFundamentalEdge(n, (e) => {
     if (hidden && hidden.has(e.gen)) return;
+    if (e.i >= sectorVertices) return;
     const cCode = canonicalOrbitCode(e.i, e.j, n, total, B);
     const dCode = canonicalDihedralCode(e.i, e.j, n, total, B);
-    if (cCode !== dCode) return;
+    if (seenDihedral.has(dCode)) return;
+    seenDihedral.add(dCode);
     // Generic orbits (size n) deposit at weight 1; antipodal "diameter" chords
     // map to themselves after n/2 rotations, so the n-fold composite would visit
     // them twice. If the Cₙ orbit is also its own mirror, the Dₙ composite visits
@@ -2827,67 +3143,160 @@ function yankelovichFieldExact(
     const mirrorInvariant =
       cCode === canonicalOrbitCode(total - 1 - e.i, total - 1 - e.j, n, total, B);
     const weight = (e.half ? 0.5 : 1) * (mirrorInvariant ? 0.5 : 1);
-    depositChord(acc, field, cf, rf, total, e.i, e.j, weight);
+    if (direct) {
+      if (
+        !dihedralChordIntersectsYankelovichViewport(
+          viewport,
+          n,
+          total,
+          B,
+          e.i,
+          e.j
+        )
+      ) {
+        return;
+      }
+      candidates.push({ i: e.i, j: e.j, weight });
+    } else {
+      depositChord(acc, field, viewport, total, e.i, e.j, weight);
+    }
     matrixEdges++;
   });
   if (timings) {
-    timings.matrixMs = performance.now() - matrixT0;
+    timings.viewportMs = direct ? performance.now() - findT0 : 0;
+    timings.visibleVertices = direct ? candidates.length : sectorVertices;
+  }
+
+  const matrixT0 = performance.now();
+  if (direct) {
+    for (const candidate of candidates) {
+      depositDihedralChordCopies(
+        acc,
+        field,
+        viewport,
+        n,
+        total,
+        B,
+        candidate.i,
+        candidate.j,
+        candidate.weight
+      );
+    }
+  }
+  if (timings) {
+    timings.matrixMs = direct
+      ? performance.now() - matrixT0
+      : performance.now() - findT0;
     timings.matrixEdges = matrixEdges;
   }
 
-  return symmetrizeYankelovichAccumulator(n, total, field, acc, timings);
+  if (direct) return acc;
+  return symmetrizeYankelovichAccumulator(n, total, field, acc, viewport, timings);
 }
 
 /**
  * Monte-Carlo density field for large n, where neither the n! cycle nor the
- * (n-1)! fundamental sector can be enumerated. We sample only the first half of
- * the block-0 fundamental sector, rasterize those chords into an unsymmetrized
- * accumulator, then apply the full Dₙ symmetry in the field-composite step.
+ * (n-1)! fundamental sector can be enumerated. We sample the dihedral angular
+ * sector, rasterize those chords into an unsymmetrized accumulator, then apply
+ * the full Dₙ symmetry in the field-composite step. Zoomed viewports use
+ * rejection sampling so accepted random vertices all contribute visible edges.
  */
 function yankelovichFieldSampled(
   n: number,
   field: number,
   hiddenGenerators: number[],
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
   timings?: YankelovichFieldTimings
 ): Float32Array {
-  const matrixT0 = performance.now();
   const acc = new Float32Array(field * field);
+  const direct = !isFullYankelovichViewport(viewport);
   const hidden = hiddenGeneratorSet(hiddenGenerators);
   if (hidden && hidden.has(n)) {
     if (timings) {
-      timings.matrixMs = performance.now() - matrixT0;
+      timings.matrixMs = 0;
       timings.matrixEdges = 0;
+      timings.viewportMs = 0;
+      timings.visibleVertices = 0;
     }
     return acc;
   } // rₙ hidden ⇒ nothing to draw
 
   const total = factorial(n);
   const B = factorial(n - 1);
-  const cf = field / 2;
-  const rf = field / 2 - 1.5;
+  const sectorVertices = yankelovichDihedralSectorVertexCount(n);
 
-  // Each random draw is expanded into 2n dihedral images during the symmetry
-  // composite, so divide the effective chord budget by 2n.
-  const TARGET_CHORDS = YANKELOVICH_SAMPLE_BUDGET;
-  const samples = Math.max(1, Math.round(TARGET_CHORDS / (2 * n)));
-  const fundamentalHalf = Math.max(1, Math.floor(B / 2));
+  const rng = makeYankelovichRng(sampleSeed);
+  const samples = Math.max(1, Math.round(sampleCount));
+  const candidates: YankelovichChordCandidate[] = [];
 
+  const findT0 = performance.now();
   let matrixEdges = 0;
-  for (let s = 0; s < samples; s++) {
-    const i = Math.floor(Math.random() * fundamentalHalf);
+  const maxAttempts = direct
+    ? Math.min(
+        YANKELOVICH_VISIBLE_SAMPLE_MAX_ATTEMPTS,
+        Math.max(samples, samples * YANKELOVICH_VISIBLE_SAMPLE_MAX_ATTEMPT_FACTOR)
+      )
+    : samples;
+  let attempts = 0;
+  while ((!direct && attempts < samples) || (direct && candidates.length < samples)) {
+    if (attempts >= maxAttempts) break;
+    attempts++;
+    const i = Math.floor(rng() * sectorVertices);
     const p = zaksUnrank(n, i);
     // rₙ neighbor = full reversal of p.
     const q = new Uint8Array(n);
     for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
     const j = zaksRank(n, q as typeof p);
-    depositChord(acc, field, cf, rf, total, i, j, 1);
+    if (direct) {
+      if (
+        !dihedralChordIntersectsYankelovichViewport(
+          viewport,
+          n,
+          total,
+          B,
+          i,
+          j
+        )
+      ) {
+        continue;
+      }
+      candidates.push({ i, j, weight: 1 });
+    } else {
+      depositChord(acc, field, viewport, total, i, j, 1);
+    }
     matrixEdges++;
   }
   if (timings) {
-    timings.matrixMs = performance.now() - matrixT0;
+    timings.viewportMs = direct ? performance.now() - findT0 : 0;
+    timings.visibleVertices = direct ? candidates.length : sectorVertices;
+  }
+
+  const matrixT0 = performance.now();
+  if (direct) {
+    for (const candidate of candidates) {
+      depositDihedralChordCopies(
+        acc,
+        field,
+        viewport,
+        n,
+        total,
+        B,
+        candidate.i,
+        candidate.j,
+        candidate.weight
+      );
+    }
+  }
+  if (timings) {
+    timings.matrixMs = direct
+      ? performance.now() - matrixT0
+      : performance.now() - findT0;
     timings.matrixEdges = matrixEdges;
   }
-  return symmetrizeYankelovichAccumulator(n, total, field, acc, timings);
+  if (direct) return acc;
+  return symmetrizeYankelovichAccumulator(n, total, field, acc, viewport, timings);
 }
 
 /**
@@ -2899,20 +3308,22 @@ function buildYankelovichHistogram(
   data: Float32Array,
   max: number,
   norm: number,
-  field: number
+  field: number,
+  viewport: YankelovichFieldViewport
 ): YankelovichHistogram {
   const BINS = 40;
   const bins = new Array<number>(BINS).fill(0);
-  const cf = field / 2;
-  const rf = field / 2 - 1.5;
-  const r2 = rf * rf;
   let nonZero = 0;
   let diskCells = 0;
   for (let y = 0; y < field; y++) {
-    const dy = y + 0.5 - cf;
     for (let x = 0; x < field; x++) {
-      const dx = x + 0.5 - cf;
-      if (dx * dx + dy * dy > r2) continue; // outside the inscribed disk
+      const { ux, uy } = fieldToYankelovichUnit(
+        field,
+        viewport,
+        x + 0.5,
+        y + 0.5
+      );
+      if (ux * ux + uy * uy > 1) continue; // outside the inscribed disk
       diskCells++;
       const v = data[y * field + x];
       if (v <= 0) continue;
