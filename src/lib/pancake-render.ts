@@ -160,6 +160,8 @@ export interface RenderSettings {
   orbitEdgeB?: number;
 }
 
+export const VERTEX_LABEL_MAX_N = 6;
+
 export interface Palette {
   background: string;
   vertexFill: string;
@@ -289,6 +291,26 @@ function constantsFor(n: number, scale: number): SizingConstants {
     (n <= 4 ? 10 : n === 5 ? 4.4 : n === 6 ? 1.7 : n === 7 ? 0.9 : n === 8 ? 0.5 : n === 9 ? 0.35 : 0.2) *
     scale;
   return { cycleWidth, vertexRadius };
+}
+
+export function supportsVertexLabels(
+  graph: Pick<PancakeGraph, "kind" | "n">
+): boolean {
+  return (
+    graph.n <= VERTEX_LABEL_MAX_N &&
+    graph.kind !== "sliding-puzzle" &&
+    graph.kind !== "sierpinski"
+  );
+}
+
+function vertexLabel(p: ArrayLike<number>): string {
+  let s = "";
+  for (let i = 0; i < p.length; i++) s += String(p[i]);
+  return s;
+}
+
+function vertexLabelFontSize(total: number): number {
+  return total <= 24 ? 12 : total <= 120 ? 6 : 4;
 }
 
 function point(i: number, total: number, c: number, r: number): [number, number] {
@@ -1235,6 +1257,20 @@ function makeZaksWordOf(n: number): (idx: number) => string {
   };
 }
 
+function makeZaksLabelOf(n: number): (idx: number) => string {
+  const B = factorial(n - 1);
+  const block0 = zaksBlock0(n);
+  return (idx) => {
+    const b = Math.floor(idx / B);
+    const o = idx % B;
+    const p = new Uint8Array(block0[o]);
+    for (let t = 0; t < b; t++) {
+      for (let s = 0; s < p.length; s++) p[s] = (p[s] % n) + 1;
+    }
+    return vertexLabel(p);
+  };
+}
+
 // Above this many at-play vertices the index+word labels would overlap into
 // noise, so they are suppressed (use "long edges only" to thin them out).
 const VERTEX_ORBIT_LABEL_LIMIT = 80;
@@ -2045,9 +2081,10 @@ export function drawToCanvas(
     }
   }
 
+  const labelMode = settings.showLabels && supportsVertexLabels(graph);
+
   if (settings.showVertices) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
-    const labelMode = settings.showLabels && n <= 5;
     if (coloring === "blocks") {
       // Band the dots into n arcs by leading symbol (one ρ-block per arc).
       const B = total / graph.n;
@@ -2078,15 +2115,14 @@ export function drawToCanvas(
     }
   }
 
-  if (settings.showLabels && n <= 5) {
-    // Index labels: the position i on the Zaks ring (what ρ and ω act on).
+  if (labelMode) {
     ctx.fillStyle = palette.labelFill;
-    ctx.font = `${(total <= 24 ? 12 : 6) * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.font = `${vertexLabelFontSize(total) * dpr}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     for (let i = 0; i < total; i++) {
       const [x, y] = posXY(i);
-      ctx.fillText(String(i), x, y);
+      ctx.fillText(vertexLabel(path[i]), x, y);
     }
   }
 
@@ -2311,10 +2347,11 @@ export function drawZaksSymmetryToCanvas(
     }
   }
 
+  const labelMode = settings.showLabels && n <= VERTEX_LABEL_MAX_N;
+
   if (settings.showVertices && sectors.vertices.length > 0) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
     const verts = sectors.vertices;
-    const labelMode = settings.showLabels && n <= 5;
     // Banded dots (blocks mode) need to read at any edge alpha, so they get a
     // boosted opacity floor; plain dots stay at the edge alpha.
     const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
@@ -2361,15 +2398,15 @@ export function drawZaksSymmetryToCanvas(
       );
   }
 
-  if (settings.showLabels && n <= 5) {
-    // Index labels: the position i on the Zaks ring (what ρ and ω act on).
+  if (labelMode) {
+    const labelOf = makeZaksLabelOf(n);
     ctx.fillStyle = palette.labelFill;
-    ctx.font = `${(total <= 24 ? 12 : 6) * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.font = `${vertexLabelFontSize(total) * dpr}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     for (let i = 0; i < total; i++) {
       const [x, y] = pointXY(i, total, c, cy, r);
-      ctx.fillText(String(i), x, y);
+      ctx.fillText(labelOf(i), x, y);
     }
   }
 
@@ -3574,9 +3611,10 @@ export function toSVG(opts: SvgOpts): string {
     }
   }
 
+  const labelMode = settings.showLabels && supportsVertexLabels(graph);
+
   if (settings.showVertices) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
-    const labelMode = settings.showLabels && n <= 5;
     const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
     const B = total / graph.n;
     for (let i = 0; i < total; i++) {
@@ -3594,12 +3632,12 @@ export function toSVG(opts: SvgOpts): string {
         )}" fill="${fill}" fill-opacity="${fillOpacity}"/>`
       );
     }
-    if (settings.showLabels && n <= 5) {
-      const fs = total <= 24 ? 12 : 6;
+    if (labelMode) {
+      const fs = vertexLabelFontSize(total);
       for (let i = 0; i < total; i++) {
         const [x, y] = pos(i);
         parts.push(
-          `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
+          `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${vertexLabel(path[i])}</text>`
         );
       }
     }
@@ -3798,6 +3836,8 @@ export function toSymmetrySVG(opts: SvgOpts): string {
     }
   }
 
+  const labelMode = settings.showLabels && supportsVertexLabels(graph);
+
   // Vertices: block-0 dots reused via rotation, same as the edges.
   if (settings.showVertices) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
@@ -3811,7 +3851,6 @@ export function toSymmetrySVG(opts: SvgOpts): string {
     if (dots.length > 0) {
       const id = `s${fragId++}`;
       defs.push(`<g id="${id}">${dots}</g>`);
-      const labelMode = settings.showLabels && n <= 5;
       if (coloring === "blocks") {
         const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
         for (let s = 0; s < n; s++) {
@@ -3859,13 +3898,14 @@ export function toSymmetrySVG(opts: SvgOpts): string {
       );
   }
 
-  // Index labels (only legible for tiny n): the position i on the Zaks ring.
-  if (settings.showLabels && n <= 5) {
-    const fs = total <= 24 ? 12 : 6;
+  if (labelMode) {
+    const fs = vertexLabelFontSize(total);
+    const labelOf =
+      graph.path.length > 0 ? (i: number) => vertexLabel(graph.path[i]) : makeZaksLabelOf(n);
     for (let i = 0; i < total; i++) {
       const [x, y] = point(i, total, c, r);
       parts.push(
-        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
+        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${labelOf(i)}</text>`
       );
     }
   }
@@ -4008,6 +4048,8 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     }
   }
 
+  const labelMode = settings.showLabels && n <= VERTEX_LABEL_MAX_N;
+
   if (settings.showVertices) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
     let dots = "";
@@ -4020,7 +4062,6 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     if (dots.length > 0) {
       const id = `s${fragId++}`;
       defs.push(`<g id="${id}">${dots}</g>`);
-      const labelMode = settings.showLabels && n <= 5;
       if (coloring === "blocks") {
         // Band the dots: rotation s carries the ρ-block's hue.
         const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
@@ -4069,14 +4110,13 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
       );
   }
 
-  // Index labels (only emitted for tiny n): the position i on the Zaks ring,
-  // i.e. the value the generators ρ and ω act on.
-  if (settings.showLabels && n <= 5) {
-    const fs = total <= 24 ? 12 : 6;
+  if (labelMode) {
+    const fs = vertexLabelFontSize(total);
+    const labelOf = makeZaksLabelOf(n);
     for (let i = 0; i < total; i++) {
       const [x, y] = point(i, total, c, r);
       parts.push(
-        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${i}</text>`
+        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${labelOf(i)}</text>`
       );
     }
   }

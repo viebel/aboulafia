@@ -67,6 +67,8 @@ import {
   type ParityMode,
   type RenderSettings,
   type SymmetryColoring,
+  supportsVertexLabels,
+  VERTEX_LABEL_MAX_N,
 } from "@/lib/pancake-render";
 import {
   readEnumParam,
@@ -1561,6 +1563,14 @@ export function PancakeGraphView() {
 
   const domainPieceCount = n;
   const vertexCount = factorial(n);
+  const canShowVertexLabels =
+    activeRenderer !== "quotient" &&
+    !yankelovich &&
+    (graph
+      ? supportsVertexLabels(graph)
+      : n <= VERTEX_LABEL_MAX_N &&
+        preset !== "sliding-puzzle" &&
+        preset !== "sierpinski");
   // Dihedral recursion level for the vertex-orbit overlay, clamped to [3, n].
   const orbitLevel = Math.min(Math.max(settings.vertexOrbitLevel ?? n, 3), n);
   const stackLevels = Array.from(
@@ -2609,7 +2619,7 @@ export function PancakeGraphView() {
               ) : null}
             </div>
 
-            {n <= 5 ? (
+            {canShowVertexLabels ? (
               <div className="space-y-1">
                 <label className="flex cursor-pointer items-center gap-2 text-xs">
                   <input
@@ -2618,12 +2628,8 @@ export function PancakeGraphView() {
                     checked={settings.showLabels}
                     onChange={(e) => setS("showLabels", e.target.checked)}
                   />
-                  <span>Index labels</span>
+                  <span>Vertex labels</span>
                 </label>
-                <p className="text-[11px] leading-snug text-muted-foreground">
-                  Number each vertex by its position i on the ring (0…n!−1) —
-                  the value ρ and ω act on. Only for n ≤ 5.
-                </p>
               </div>
             ) : null}
 
