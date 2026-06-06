@@ -194,9 +194,18 @@ function supportsYankelovich(preset: GraphPreset): boolean {
 /**
  * The Yankelovich renderer never enumerates the n! cycle (it samples chords via
  * the analytic Zaks rank/unrank), so it can go well past the other renderers'
- * ceiling. 15! ≈ 1.3·10¹² vertices is still fine to sample.
+ * ceiling. 20! ≈ 2.4·10¹⁸ vertices is still fine to sample.
  */
-const YANKELOVICH_MAX_N = 15;
+const YANKELOVICH_MAX_N = 20;
+const YANKELOVICH_FIELD_SIZE_OPTIONS: readonly number[] = Array.from(
+  { length: 27 },
+  (_, i) => 600 + i * 100
+);
+const YANKELOVICH_DEFAULT_FIELD_SIZE = 1200;
+const YANKELOVICH_NOISE_FLOOR_OPTIONS: readonly number[] = Array.from(
+  { length: 20 },
+  (_, i) => i * 5
+);
 
 const YANKELOVICH_TONES: readonly YankelovichTone[] = [
   "log",
@@ -346,6 +355,9 @@ interface GraphState {
   alpha: number;
   width: number;
   yankelovichGamma: number;
+  yankelovichFieldSize: number;
+  yankelovichNoiseFloor: number;
+  yankelovichBinary: boolean;
   yankelovichInvert: boolean;
   yankelovichTone: YankelovichTone;
   yankelovichColormap: YankelovichColormap;
@@ -362,7 +374,7 @@ function readGraphState(params: URLSearchParams | null): GraphState {
   if (renderer === "yankelovich" && !supportsYankelovich(preset)) renderer = "svg";
 
   // The n ceiling depends on the renderer: Yankelovich samples chords, so it
-  // reaches n = 15 where the other renderers top out at graphMaxN(preset).
+  // reaches n = 20 where the other renderers top out at graphMaxN(preset).
   const allowedN = N_OPTIONS.filter(
     (opt) => opt <= maxNForRenderer(preset, renderer)
   );
@@ -393,6 +405,19 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     alpha: readIntParam(params, "alpha", SLIDER_RANGE, rec.alpha),
     width: readIntParam(params, "width", SLIDER_RANGE, rec.width),
     yankelovichGamma: readIntParam(params, "yg", SLIDER_RANGE, 50),
+    yankelovichFieldSize: readIntParam(
+      params,
+      "yfs",
+      YANKELOVICH_FIELD_SIZE_OPTIONS,
+      YANKELOVICH_DEFAULT_FIELD_SIZE
+    ),
+    yankelovichNoiseFloor: readIntParam(
+      params,
+      "ynf",
+      YANKELOVICH_NOISE_FLOOR_OPTIONS,
+      0
+    ),
+    yankelovichBinary: readEnumParam(params, "yb", ["0", "1"], "0") === "1",
     yankelovichInvert: readEnumParam(params, "yi", ["0", "1"], "0") === "1",
     yankelovichTone: readEnumParam(params, "yt", YANKELOVICH_TONES, "log"),
     yankelovichColormap: readEnumParam(
@@ -434,6 +459,8 @@ export function PancakeGraphView() {
     useState<YankelovichHistogram | null>(null);
   const [yankelovichTimings, setYankelovichTimings] = useState<PhaseTiming[]>([]);
   const [yankelovichField, setYankelovichField] = useState<number | null>(null);
+  const [yankelovichMatrixEdges, setYankelovichMatrixEdges] =
+    useState<number | null>(null);
   const [yankelovichStage, setYankelovichStage] = useState<string | null>(null);
   const [yankelovichTotalMs, setYankelovichTotalMs] = useState<number | null>(null);
 
@@ -460,6 +487,9 @@ export function PancakeGraphView() {
     orbitEdgeA: initial.orbitEdgeA,
     orbitEdgeB: initial.orbitEdgeB,
     yankelovichGamma: initial.yankelovichGamma,
+    yankelovichFieldSize: initial.yankelovichFieldSize,
+    yankelovichNoiseFloor: initial.yankelovichNoiseFloor,
+    yankelovichBinary: initial.yankelovichBinary,
     yankelovichInvert: initial.yankelovichInvert,
     yankelovichTone: initial.yankelovichTone,
     yankelovichColormap: initial.yankelovichColormap,
@@ -577,6 +607,16 @@ export function PancakeGraphView() {
         (settings.yankelovichGamma ?? 50) !== 50
           ? String(settings.yankelovichGamma)
           : null,
+      yfs:
+        (settings.yankelovichFieldSize ?? YANKELOVICH_DEFAULT_FIELD_SIZE) !==
+        YANKELOVICH_DEFAULT_FIELD_SIZE
+          ? String(settings.yankelovichFieldSize)
+          : null,
+      ynf:
+        (settings.yankelovichNoiseFloor ?? 0) !== 0
+          ? String(settings.yankelovichNoiseFloor)
+          : null,
+      yb: settings.yankelovichBinary ? "1" : null,
       yi: settings.yankelovichInvert ? "1" : null,
       yt:
         (settings.yankelovichTone ?? "log") !== "log"
@@ -611,6 +651,9 @@ export function PancakeGraphView() {
     settings.alpha,
     settings.width,
     settings.yankelovichGamma,
+    settings.yankelovichFieldSize,
+    settings.yankelovichNoiseFloor,
+    settings.yankelovichBinary,
     settings.yankelovichInvert,
     settings.yankelovichTone,
     settings.yankelovichColormap,
@@ -660,9 +703,8 @@ export function PancakeGraphView() {
       };
       try {
         if (liteBuild) {
-          // Built from the recursive fundamental sector only — O((n-1)!), no
-          // path/edge arrays. It is synchronous (no chunking needed even at the
-          // n = 11 ceiling), so yield one frame first: otherwise setRunning(true)
+          // Built from the recursive sector or the O(n²) sampling payload, with
+          // no path/edge arrays. Yield one frame first: otherwise setRunning(true)
           // and the blocking build run in the same task and the browser never
           // paints the loading spinner until everything is already done.
           const graphStatus = `Computing ${graphPresetLabel(preset)} symmetry for n = ${n}…`;
@@ -1058,6 +1100,7 @@ export function PancakeGraphView() {
       const entry = yankelovichCacheRef.current;
       setYankelovichHistogram(entry?.histogram ?? null);
       setYankelovichField(entry?.field ?? null);
+      setYankelovichMatrixEdges(entry?.matrixEdges ?? null);
     };
 
     // Cache hits (zoom/pan/gamma/invert) redraw inline; any rebuild (cache miss)
@@ -1104,6 +1147,7 @@ export function PancakeGraphView() {
         const fieldTimings: YankelovichFieldTimings = {
           matrixMs: 0,
           symmetryMs: 0,
+          matrixEdges: 0,
         };
         ensureYankelovichField({
           n,
@@ -1115,6 +1159,7 @@ export function PancakeGraphView() {
           onFieldTimings: (timings) => {
             fieldTimings.matrixMs = timings.matrixMs;
             fieldTimings.symmetryMs = timings.symmetryMs;
+            fieldTimings.matrixEdges = timings.matrixEdges;
           },
         });
         flushSync(() => {
@@ -1776,6 +1821,13 @@ export function PancakeGraphView() {
               <Stat label="Odd edges" value={metrics?.oddEdges} />
               {yankelovich ? (
                 <Stat
+                  label="Matrix edges"
+                  value={yankelovichMatrixEdges ?? undefined}
+                  full
+                />
+              ) : null}
+              {yankelovich ? (
+                <Stat
                   label="Matrix size"
                   value={
                     yankelovichField
@@ -1918,8 +1970,9 @@ export function PancakeGraphView() {
                   envelopes (caustics) instead of saturating to a black disk. Up
                   to n = 11 it rasterizes the 360/n fundamental sector exactly;
                   beyond that it samples chords via analytic Zaks rank/unrank, so
-                  it reaches n = 15 ({NUMBER_FORMAT.format(factorial(15))}{" "}
-                  vertices) without ever enumerating the cycle.
+                  it reaches n = {YANKELOVICH_MAX_N} (
+                  {NUMBER_FORMAT.format(factorial(YANKELOVICH_MAX_N))} vertices)
+                  without ever enumerating the cycle.
                 </p>
               ) : null}
             </div>
@@ -2313,6 +2366,61 @@ export function PancakeGraphView() {
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+            ) : null}
+
+            {yankelovich ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Matrix size
+                  </Label>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {settings.yankelovichFieldSize ?? YANKELOVICH_DEFAULT_FIELD_SIZE}
+                  </span>
+                </div>
+                <Slider
+                  value={[
+                    settings.yankelovichFieldSize ?? YANKELOVICH_DEFAULT_FIELD_SIZE,
+                  ]}
+                  min={YANKELOVICH_FIELD_SIZE_OPTIONS[0]}
+                  max={
+                    YANKELOVICH_FIELD_SIZE_OPTIONS[
+                      YANKELOVICH_FIELD_SIZE_OPTIONS.length - 1
+                    ]
+                  }
+                  step={100}
+                  onValueChange={([v]) => setS("yankelovichFieldSize", v)}
+                />
+              </div>
+            ) : null}
+
+            {yankelovich ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Noise floor
+                  </Label>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {settings.yankelovichNoiseFloor ?? 0}%
+                  </span>
+                </div>
+                <Slider
+                  value={[settings.yankelovichNoiseFloor ?? 0]}
+                  min={0}
+                  max={95}
+                  step={5}
+                  onValueChange={([v]) => setS("yankelovichNoiseFloor", v)}
+                />
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-primary"
+                    checked={settings.yankelovichBinary ?? false}
+                    onChange={(e) => setS("yankelovichBinary", e.target.checked)}
+                  />
+                  <span>Binary mask</span>
+                </label>
               </div>
             ) : null}
 

@@ -225,12 +225,13 @@ The hard-won rules (each fixes a specific artifact heard during development):
   resolution (falling fifth `Mi → La`).
 - `bcda`'s first note would be `Do` — the same `Do` that just ended `adcb` — so
   it is **tied** (not replayed); the melody continues with `Ré`, `Mi`, `La`.
-- **Then** comes the breath (~0.47 s), after the arrival.
+- The line continues from the arrival on the same beat grid.
 
 ## 7. Playback & export
 
-- **Play / Pause / Reset**, with seamless **looping** (the closing breath is
-  preserved at the loop seam).
+- **Play / Pause / Reset**, with seamless **looping**: the last word of the last
+  line transitions to the first word of the first line like any other line
+  boundary.
 - The currently sounding permutation is **highlighted** in sync (ring colour
   matches the speaking voice: sky for even, rose for odd).
 - **Click any word to start from there.** Each word tile is a play button:
@@ -260,8 +261,7 @@ The hard-won rules (each fixes a specific artifact heard during development):
   assists.
 - **Cadence only on the deepest flip** (line boundaries), as a falling-fifth
   **bass** motion, never a struck chord.
-- **Resolution on the line's first beat; breath after it; V→I never split by
-  silence.**
+- **Resolution on the line's first beat; V→I never split by silence.**
 - **Tie the repeated note** at every line boundary.
 - **Articulate, not washed out** — short rings + dry reverb so the dialog and
   the cadences stay legible.

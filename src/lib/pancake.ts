@@ -101,7 +101,8 @@ export type GraphPreset =
   | "sliding-puzzle"
   | "simplex"
   | "complete"
-  | "cayley-complete";
+  | "cayley-complete"
+  | "sierpinski";
 export type GraphKind =
   | "pancake"
   | "star"
@@ -116,7 +117,11 @@ export type GraphKind =
   | "sliding-puzzle"
   | "simplex"
   | "complete"
-  | "cayley-complete";
+  | "cayley-complete"
+  | "sierpinski";
+
+/** Number of symbols of the Sierpiński graph S(n, k); 3 = the triangle gasket. */
+const SIERPINSKI_K = 3;
 
 export interface PancakeCycle {
   order: PancakeOrder;
@@ -333,6 +338,14 @@ export interface PancakeGraph {
   oddEdgeCount: number;
   /** Per-generator metadata, sorted by id. */
   generators: GeneratorInfo[];
+  /**
+   * Optional explicit 2-D vertex positions, one [x, y] pair per vertex in
+   * `path` order, normalized so the layout fits inside the unit disk (|p| ≤ 1).
+   * When present the renderers place vertex i at this point instead of on the
+   * circle — used by the Sierpiński graph to draw the recognizable triangle
+   * gasket. Absent (undefined) for the default circular layouts.
+   */
+  coords?: Float64Array;
 }
 
 /**
@@ -652,6 +665,12 @@ export async function buildPancakeGraph(
           (done, total) => onProgress?.("cycle", done, total),
           signal
         )
+      : preset === "sierpinski"
+      ? await sierpinskiHamiltonianOrder(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
       : order === undefined
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
@@ -680,7 +699,10 @@ export async function buildPancakeGraph(
 
   const generators = graphGenerators(n, preset);
   const generatorInfos = computeGeneratorInfos(n, preset, generators);
-  const edgeCount = (generators.length * total) / 2;
+  // Upper bound on undirected edges. Round up: for non-regular graphs whose
+  // generators have fixed points (e.g. the Sierpiński graph) generators × total
+  // can be odd, and the tail is trimmed below anyway.
+  const edgeCount = Math.ceil((generators.length * total) / 2);
   const edges = new Uint32Array(edgeCount * 3);
   let edgeWriteIdx = 0;
   let evenEdgeCount = 0;
@@ -763,6 +785,9 @@ export async function buildPancakeGraph(
   const trimmedEdges =
     edgeWriteIdx === edges.length ? edges : edges.slice(0, edgeWriteIdx);
 
+  const coords =
+    preset === "sierpinski" ? sierpinskiGasketCoords(path, n) : undefined;
+
   return {
     n,
     preset,
@@ -776,7 +801,62 @@ export async function buildPancakeGraph(
     evenEdgeCount,
     oddEdgeCount,
     generators: generatorInfos,
+    coords,
   };
+}
+
+/**
+ * 2-D positions of the Sierpiński gasket: the word d₁…dₙ maps to the IFS
+ * address Σₖ 2⁻ᵏ·V(dₖ) over the three triangle corners V(0), V(1), V(2), so the
+ * three constant words land near the corners and each leading symbol selects a
+ * sub-triangle. Re-centered and scaled to fill the unit disk.
+ */
+function sierpinskiGasketCoords(path: Perm[], n: number): Float64Array {
+  // Equilateral triangle, apex up (screen y grows downward).
+  const V: ReadonlyArray<readonly [number, number]> = [
+    [0, -1],
+    [-0.8660254037844386, 0.5],
+    [0.8660254037844386, 0.5],
+  ];
+  const total = path.length;
+  const xs = new Float64Array(total);
+  const ys = new Float64Array(total);
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < total; i++) {
+    const w = path[i];
+    let x = 0;
+    let y = 0;
+    let s = 1;
+    for (let kk = 0; kk < n; kk++) {
+      s *= 0.5;
+      const v = V[w[kk]];
+      x += s * v[0];
+      y += s * v[1];
+    }
+    xs[i] = x;
+    ys[i] = y;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  let maxDist = 1e-9;
+  for (let i = 0; i < total; i++) {
+    const d = Math.hypot(xs[i] - cx, ys[i] - cy);
+    if (d > maxDist) maxDist = d;
+  }
+  const scale = 0.98 / maxDist;
+  const out = new Float64Array(total * 2);
+  for (let i = 0; i < total; i++) {
+    out[2 * i] = (xs[i] - cx) * scale;
+    out[2 * i + 1] = (ys[i] - cy) * scale;
+  }
+  return out;
 }
 
 /* ----------------------- zaks rotational symmetry ----------------------- */
@@ -993,6 +1073,103 @@ export function buildZaksSymmetryGraph(n: number): PancakeGraph {
   };
 }
 
+/**
+ * The permutation at global position `i` (0 ≤ i < n!) of the greedy Zaks
+ * suffix-reversal Hamiltonian cycle, computed analytically in O(n²) without
+ * building the cycle.
+ *
+ * It uses the layout's defining invariant (see forEachZaksFundamentalEdge):
+ * shifting the cycle index by B = (n-1)! equals applying φ: s ↦ (s mod n)+1 to
+ * every symbol, and block 0 (leading symbol 1) is an isomorphic copy of the
+ * (n-1)-symbol Zaks cycle on the suffix. Hence
+ *   perm[i] = φ^⌊i/B⌋( [1] ++ (zaksUnrank(n-1, i mod B) + 1) ).
+ * Verified to match `suffixReversalCycle(n, "zaks")` exactly for n ≤ 8.
+ *
+ * This is what lets the density-field renderer reach n far beyond what the n!
+ * cycle could ever be enumerated: it can rank/unrank single positions on demand.
+ */
+export function zaksUnrank(n: number, i: number): Perm {
+  const out = new Uint8Array(n) as Perm;
+  fillZaksUnrank(n, i, out);
+  return out;
+}
+
+function fillZaksUnrank(m: number, i: number, out: Uint8Array): void {
+  if (m === 1) {
+    out[0] = 1;
+    return;
+  }
+  const B = factorial(m - 1);
+  const b = Math.floor(i / B);
+  const o = i - b * B;
+  // Fill out[0..m-2] with the suffix's Zaks permutation of {1..m-1}.
+  fillZaksUnrank(m - 1, o, out);
+  // Make room for the fixed leading symbol 1 and lift the suffix into {2..m}.
+  for (let t = m - 1; t >= 1; t--) out[t] = out[t - 1] + 1;
+  out[0] = 1;
+  // Rotate every symbol by b under φ: s ↦ ((s-1+b) mod m)+1.
+  for (let t = 0; t < m; t++) out[t] = ((out[t] - 1 + b) % m) + 1;
+}
+
+/**
+ * Inverse of {@link zaksUnrank}: the global cycle position (0 ≤ i < n!) of a
+ * permutation `q` of {1..n} in the greedy Zaks order, in O(n²).
+ */
+export function zaksRank(n: number, q: Perm): number {
+  return computeZaksRank(n, q);
+}
+
+function computeZaksRank(m: number, q: ArrayLike<number>): number {
+  if (m === 1) return 0;
+  const B = factorial(m - 1);
+  // q = φ^b(u) with u[0] = 1, so q[0] = (b mod m)+1 ⇒ b = q[0]-1.
+  const b = q[0] - 1;
+  // Undo φ^b and drop the leading symbol: the suffix maps to a permutation of
+  // {1..m-1} via s ↦ ((s-1-b) mod m) (the leading 1 maps to 0 and is removed).
+  const inner = new Uint8Array(m - 1);
+  for (let t = 1; t < m; t++) {
+    inner[t - 1] = (((q[t] - 1 - b) % m) + m) % m;
+  }
+  return b * B + computeZaksRank(m - 1, inner);
+}
+
+/**
+ * A lightweight pancake-zaks payload for the density-field renderer at large n,
+ * where neither the n! cycle nor the (n-1)! fundamental sector can be
+ * enumerated. It carries only generator metadata and analytic edge tallies; the
+ * renderer samples chords via {@link zaksUnrank}/{@link zaksRank} instead of any
+ * stored array. Time and memory are O(n²).
+ *
+ * For n > 6 the only generator is the full reversal rₙ, which connects p with
+ * its reverse; that reversal has fixed parity (⌊n/2⌋ transpositions), so every
+ * edge falls in a single parity class — counted here without a scan.
+ */
+export function buildZaksSamplingGraph(n: number): PancakeGraph {
+  const preset: GraphPreset = "pancake-zaks";
+  const generators = graphGenerators(n, preset);
+  const generatorInfos = computeGeneratorInfos(n, preset, generators);
+  const totalEdges = factorial(n) / 2;
+  // Parity of the full reversal of n symbols = ⌊n/2⌋ transpositions.
+  const reversalParity = Math.floor(n / 2) % 2;
+  const evenEdgeCount = reversalParity === 0 ? totalEdges : 0;
+  const oddEdgeCount = reversalParity === 0 ? 0 : totalEdges;
+  const empty = new Uint32Array(0);
+  return {
+    n,
+    preset,
+    kind: "pancake",
+    order: "zaks",
+    path: [],
+    flips: [],
+    edges: empty,
+    rn: empty,
+    vertexParity: new Uint8Array(0),
+    evenEdgeCount,
+    oddEdgeCount,
+    generators: generatorInfos,
+  };
+}
+
 function computeGeneratorInfos(
   n: number,
   preset: GraphPreset,
@@ -1007,6 +1184,21 @@ function computeGeneratorInfos(
       parity: 1 as 0 | 1,
       label: generatorLabel(gen.id, preset, n),
     }));
+    infos.sort((a, b) => a.id - b.id);
+    return infos;
+  }
+
+  if (preset === "sierpinski") {
+    // Vertices are words over {0,1,2}, not the permutation identity, so build a
+    // representative vertex on which each generator is active and read its
+    // inversion-parity delta. The graph is non-bipartite, so this parity is a
+    // per-generator approximation used only for the chip coloring.
+    const infos = generators.map((gen) => {
+      const base = new Uint8Array(n);
+      if (gen.id <= n - 1) base[gen.id - 1] = 1;
+      const parity = (permParity(base) ^ permParity(gen.apply(base))) as 0 | 1;
+      return { id: gen.id, parity, label: generatorLabel(gen.id, preset, n) };
+    });
     infos.sort((a, b) => a.id - b.id);
     return infos;
   }
@@ -1080,6 +1272,10 @@ function generatorLabel(
     const i = Math.floor(id / 100);
     const j = id % 100;
     return `${i}–${j}`;
+  }
+  if (preset === "sierpinski") {
+    // ids 1..n-1 are the bridge levels h; ids n..n+k-2 the last-symbol clique.
+    return id <= n - 1 ? `h${id}` : `+${id - (n - 1)}`;
   }
   return String(id);
 }
@@ -1165,6 +1361,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Complete graph Kₙ";
     case "cayley-complete":
       return "Complete Cayley graph of Sₙ";
+    case "sierpinski":
+      return "Sierpiński graph S(n, 3)";
   }
 }
 
@@ -1202,6 +1400,8 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Complete graph Kₙ — n vertices on a regular n-gon with every pair joined";
     case "cayley-complete":
       return "Cayley graph of Sₙ with every non-identity permutation as a generator — the complete graph K_{n!}";
+    case "sierpinski":
+      return "The triangle gasket on words over {0,1,2}, laid out on a Hamiltonian cycle";
   }
 }
 
@@ -1209,6 +1409,7 @@ export function graphVertexCount(n: number, preset: GraphPreset): number {
   if (preset === "sliding-puzzle") return factorial(SLIDING_PUZZLE_ROWS * n);
   if (preset === "simplex") return n + 1;
   if (preset === "complete") return n;
+  if (preset === "sierpinski") return SIERPINSKI_K ** n;
   return preset === "hypercube" ? 2 ** n : factorial(n);
 }
 
@@ -1220,6 +1421,11 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
     return (v * (v - 1)) / 2;
   }
   if (preset === "hypercube") return n * 2 ** (n - 1);
+  // S(n, k) has k(kⁿ − 1)/2 edges (each of levels 1..n contributes kʰ(k−1)/2).
+  if (preset === "sierpinski") {
+    const k = SIERPINSKI_K;
+    return (k * (k ** n - 1)) / 2;
+  }
   if (preset === "sliding-puzzle") {
     // One state-graph edge per grid adjacency per blank placement on it:
     // (grid edges) × (N - 1)!, with N = 2n cells and 3n - 2 grid edges.
@@ -1261,6 +1467,8 @@ export function graphMaxN(preset: GraphPreset): number {
   // The symmetric Hamilton-cycle layout is built for small orders only (the
   // quotient search is meant for n ≤ 8); beyond that the cycle is not computed.
   if (preset === "asymmetric-tree") return 8;
+  // S(n, 3) has 3ⁿ vertices: 3¹⁰ ≈ 59k stays comfortable, 3¹¹ ≈ 177k is heavy.
+  if (preset === "sierpinski") return 10;
   if (
     preset === "pancake-zaks" ||
     preset === "pancake-zaks-recursive" ||
@@ -1288,7 +1496,8 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "sliding-puzzle" ||
     preset === "simplex" ||
     preset === "complete" ||
-    preset === "cayley-complete"
+    preset === "cayley-complete" ||
+    preset === "sierpinski"
   ) {
     return preset;
   }
@@ -1481,6 +1690,48 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
     }
     return generators;
   }
+  if (preset === "sierpinski") {
+    // Sierpiński graph S(n, 3): words over {0, 1, 2}. Two edge families.
+    //
+    // Deepest level (the K₃ clique on the last symbol): right-rotate the last
+    // symbol by d. The set {+1, +2} is closed under inverse, so the i < j dedup
+    // in buildPancakeGraph is exact and there are no fixed points.
+    //
+    // Bridge level h (1 ≤ h ≤ n-1, array index hi = h-1): u and v differ at
+    // position hi and agree on a constant suffix, u = (w b a^m), v = (w a b^m).
+    // This is an involution but only defined when the suffix after hi is
+    // constant and differs from u[hi]; otherwise it is a fixed point (skipped).
+    const k = SIERPINSKI_K;
+    const generators: Generator[] = [];
+    for (let hi = 0; hi < n - 1; hi++) {
+      generators.push({
+        id: hi + 1,
+        apply: (p) => {
+          const a = p[n - 1];
+          for (let t = hi + 1; t < n - 1; t++) {
+            if (p[t] !== a) return p;
+          }
+          const b = p[hi];
+          if (b === a) return p;
+          const q = new Uint8Array(p);
+          q[hi] = a;
+          for (let t = hi + 1; t < n; t++) q[t] = b;
+          return q;
+        },
+      });
+    }
+    for (let d = 1; d < k; d++) {
+      generators.push({
+        id: n - 1 + d,
+        apply: (p) => {
+          const q = new Uint8Array(p);
+          q[n - 1] = (p[n - 1] + d) % k;
+          return q;
+        },
+      });
+    }
+    return generators;
+  }
 
   return [];
 }
@@ -1615,6 +1866,86 @@ async function completeOrder(
   }
   onProgress?.(total, total);
   return { path, flips: [] };
+}
+
+/**
+ * Hamiltonian-cycle ordering of the Sierpiński graph S(n, 3) — the triangle
+ * gasket. Vertices are length-n words over {0, 1, 2}; placing them on the
+ * circle in this order traces a Hamiltonian cycle, so the cycle appears as the
+ * perimeter of the drawing (exactly like the pancake presets).
+ *
+ * Construction (Klavžar–Milutinović). S(n,3) is three copies of S(n-1,3)
+ * grouped by their leading symbol, joined by a single edge between each pair of
+ * copies: (i j^{n-1}) — (j i^{n-1}). The three "extreme" vertices are the
+ * constant words 0^n, 1^n, 2^n — the corners shared between the copies. A
+ * Hamiltonian path between any two corners is built recursively:
+ *
+ *   ham(m, a, b) = a·ham(m-1, a, c) ++ c·ham(m-1, a, b) ++ b·ham(m-1, c, b)
+ *
+ * (c the third symbol), so each crossing between sub-copies lands exactly on a
+ * connecting edge. The full cycle stitches three such corner-to-corner paths
+ * around the three top-level connecting edges and closes on (1 0^{n-1}) —
+ * (0 1^{n-1}).
+ */
+async function sierpinskiHamiltonianOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const total = SIERPINSKI_K ** n;
+  const path: Perm[] = [];
+
+  // third(a, b): the remaining symbol of {0, 1, 2}.
+  const third = (a: number, b: number) => 3 - a - b;
+
+  // Append the words of the Hamiltonian path of the S(m, 3) copy sitting under
+  // `prefix`, walking from corner `a` to corner `b` (over the m-symbol suffix).
+  const append = (prefix: number[], m: number, a: number, b: number): void => {
+    if (m === 1) {
+      const c = third(a, b);
+      for (const last of [a, c, b]) {
+        const w = new Uint8Array(n);
+        for (let t = 0; t < prefix.length; t++) w[t] = prefix[t];
+        w[prefix.length] = last;
+        path.push(w);
+      }
+      return;
+    }
+    const c = third(a, b);
+    append([...prefix, a], m - 1, a, c);
+    append([...prefix, c], m - 1, a, b);
+    append([...prefix, b], m - 1, c, b);
+  };
+
+  if (n === 1) {
+    for (const v of [0, 1, 2]) path.push(Uint8Array.of(v));
+  } else {
+    append([0], n - 1, 1, 2);
+    append([2], n - 1, 0, 1);
+    append([1], n - 1, 2, 0);
+  }
+
+  // flips[s] = the differing level (1-based first-difference index) between the
+  // consecutive cycle vertices path[s] → path[s+1], with the final entry the
+  // closing edge. Only its length (the cycle length) feeds the UI's order-step
+  // count; the exact level is informational for this non-pancake graph.
+  const flips: number[] = [];
+  for (let s = 0; s < total; s++) {
+    const a = path[s];
+    const b = path[(s + 1) % total];
+    let level = n;
+    for (let t = 0; t < n; t++) {
+      if (a[t] !== b[t]) {
+        level = t + 1;
+        break;
+      }
+    }
+    flips.push(level);
+  }
+
+  onProgress?.(total, total);
+  return { path, flips };
 }
 
 /**

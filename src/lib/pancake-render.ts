@@ -83,6 +83,12 @@ export interface RenderSettings {
    * chord envelopes; higher values keep only the brightest caustics.
    */
   yankelovichGamma?: number;
+  /** Accumulator grid size for Yankelovich, in cells per side. Defaults to 1200. */
+  yankelovichFieldSize?: number;
+  /** Drop low-density cells below this positive-value percentile before tone mapping. */
+  yankelovichNoiseFloor?: number;
+  /** Render post-floor density as a binary mask instead of a graded field. */
+  yankelovichBinary?: boolean;
   /**
    * Invert the Yankelovich grayscale: default is bright chords on a black field
    * (additive "long exposure"); when true it draws dark chords on white (an ink
@@ -2387,13 +2393,15 @@ export interface YankelovichFieldCache {
   out: Float32Array;
   /** Normalization value (high percentile of the density). */
   norm: number;
+  /** Number of representative chords deposited into the accumulator. */
+  matrixEdges: number;
   /** Distribution of the per-cell density values across the whole matrix. */
   histogram: YankelovichHistogram;
   /** Cached per-cell tone in [0,1] for {@link toneKey}; reused across gamma/
    *  invert/colormap tweaks so only a tone-*mode* change recomputes it. */
   toneField?: Float32Array;
-  /** Tone mode baked into {@link toneField}. */
-  toneKey?: YankelovichTone;
+  /** Tone settings baked into {@link toneField}. */
+  toneKey?: string;
   /** Tone settings (mode+gamma+invert+colormap) baked into {@link bitmap}. */
   paintKey: string;
   /** Grayscale field×field image ready to blit onto the display canvas. */
@@ -2436,6 +2444,7 @@ interface YankelovichCanvasOpts {
 export interface YankelovichFieldTimings {
   matrixMs: number;
   symmetryMs: number;
+  matrixEdges: number;
 }
 
 /**
@@ -2445,14 +2454,15 @@ export interface YankelovichFieldTimings {
  */
 const YANKELOVICH_ENUM_LIMIT = 4_000_000;
 
-/** Fixed accumulator grid size (memory: 2 × Float32 × field² during compute). */
-const YANKELOVICH_FIELD_SIZE = 1200;
+/** Default accumulator grid size (memory: 2 × Float32 × field² during compute). */
+const YANKELOVICH_DEFAULT_FIELD_SIZE = 1200;
 /** Base sampled-chord budget at resolution = 1. */
 const YANKELOVICH_SAMPLE_BUDGET = 2_500_000;
 
 /** Accumulator resolution. Kept fixed so quality is comparable across n. */
-function yankelovichFieldSize(): number {
-  return YANKELOVICH_FIELD_SIZE;
+function yankelovichFieldSize(settings: RenderSettings): number {
+  const size = settings.yankelovichFieldSize ?? YANKELOVICH_DEFAULT_FIELD_SIZE;
+  return Math.max(100, Math.round(size / 100) * 100);
 }
 
 /**
@@ -2491,10 +2501,12 @@ export function drawYankelovichToCanvas(
   const w = Math.floor(cssWidth * dpr);
   const h = Math.floor(cssHeight * dpr);
   const gammaSlider = settings.yankelovichGamma ?? 50;
+  const noiseFloor = settings.yankelovichNoiseFloor ?? 0;
+  const binary = settings.yankelovichBinary ?? false;
   const invert = settings.yankelovichInvert ?? false;
   const tone = settings.yankelovichTone ?? "log";
   const colormap = settings.yankelovichColormap ?? "gray";
-  const paintKey = `${tone}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
+  const paintKey = `${tone}|${noiseFloor}|${binary ? 1 : 0}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
 
   // The expensive density field is built (or cache-reused) here; callers that
   // want to surface a separate "computing" phase can prime it via
@@ -2503,7 +2515,15 @@ export function drawYankelovichToCanvas(
   if (!entry) return;
 
   if (!entry.bitmap.width || entry.paintKey !== paintKey) {
-    paintYankelovichBitmap(entry, gammaSlider, invert, tone, colormap);
+    paintYankelovichBitmap(
+      entry,
+      gammaSlider,
+      noiseFloor,
+      binary,
+      invert,
+      tone,
+      colormap
+    );
   }
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2544,7 +2564,7 @@ export function ensureYankelovichField(
   const w = Math.floor(cssWidth * dpr);
   const h = Math.floor(cssHeight * dpr);
   if (w <= 0 || h <= 0) return null;
-  const field = yankelovichFieldSize();
+  const field = yankelovichFieldSize(settings);
   const fieldKey = yankelovichFieldKey(opts);
   const existing =
     cache?.current && cache.current.key === fieldKey ? cache.current : null;
@@ -2567,7 +2587,7 @@ export function ensureYankelovichField(
  */
 export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
   const { n, settings } = opts;
-  const field = yankelovichFieldSize();
+  const field = yankelovichFieldSize(settings);
   const hiddenKey = [...new Set(settings.hiddenGenerators)]
     .sort((a, b) => a - b)
     .join(",");
@@ -2587,7 +2607,11 @@ function buildYankelovichField(
   key: string,
   onFieldTimings?: (timings: YankelovichFieldTimings) => void
 ): YankelovichFieldCache {
-  const timings: YankelovichFieldTimings = { matrixMs: 0, symmetryMs: 0 };
+  const timings: YankelovichFieldTimings = {
+    matrixMs: 0,
+    symmetryMs: 0,
+    matrixEdges: 0,
+  };
   const out =
     factorial(n - 1) <= YANKELOVICH_ENUM_LIMIT
       ? yankelovichFieldExact(n, field, hiddenGenerators, timings)
@@ -2611,6 +2635,7 @@ function buildYankelovichField(
     field,
     out,
     norm: Math.max(norm, 1e-9),
+    matrixEdges: timings.matrixEdges,
     histogram,
     paintKey: "",
     bitmap,
@@ -2676,43 +2701,17 @@ function depositChord(
   }
 }
 
-/**
- * Exact density field for small n: rasterize one representative per Dₙ orbit
- * into an accumulator, then composite rotations and axial reflections.
- */
-function yankelovichFieldExact(
+function symmetrizeYankelovichAccumulator(
   n: number,
+  total: number,
   field: number,
-  hiddenGenerators: number[],
+  acc: Float32Array,
   timings?: YankelovichFieldTimings
 ): Float32Array {
-  const total = factorial(n);
-  const B = factorial(n - 1);
-  const cf = field / 2;
-  const rf = field / 2 - 1.5;
-  const acc = new Float32Array(field * field);
-  const hidden = hiddenGeneratorSet(hiddenGenerators);
-
-  const matrixT0 = performance.now();
-  forEachZaksFundamentalEdge(n, (e) => {
-    if (hidden && hidden.has(e.gen)) return;
-    const cCode = canonicalOrbitCode(e.i, e.j, n, total, B);
-    const dCode = canonicalDihedralCode(e.i, e.j, n, total, B);
-    if (cCode !== dCode) return;
-    // Generic orbits (size n) deposit at weight 1; antipodal "diameter" chords
-    // map to themselves after n/2 rotations, so the n-fold composite would visit
-    // them twice. If the Cₙ orbit is also its own mirror, the Dₙ composite visits
-    // it twice too. Each symmetry stabilizer halves the representative's weight.
-    const mirrorInvariant =
-      cCode === canonicalOrbitCode(total - 1 - e.i, total - 1 - e.j, n, total, B);
-    const weight = (e.half ? 0.5 : 1) * (mirrorInvariant ? 0.5 : 1);
-    depositChord(acc, field, cf, rf, total, e.i, e.j, weight);
-  });
-  if (timings) timings.matrixMs = performance.now() - matrixT0;
-
   // Symmetrize: out(p) = Σₖ acc(R₋ₖ p) + acc(ω R₋ₖ p). The reflection
   // ω: i ↦ (n!−1)−i maps angle θ to -θ - 2π/total.
   const symmetryT0 = performance.now();
+  const cf = field / 2;
   const out = new Float32Array(field * field);
   const cos = new Float64Array(n);
   const sin = new Float64Array(n);
@@ -2761,17 +2760,52 @@ function yankelovichFieldExact(
 }
 
 /**
+ * Exact density field for small n: rasterize one representative per Dₙ orbit
+ * into an accumulator, then composite rotations and axial reflections.
+ */
+function yankelovichFieldExact(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const cf = field / 2;
+  const rf = field / 2 - 1.5;
+  const acc = new Float32Array(field * field);
+  const hidden = hiddenGeneratorSet(hiddenGenerators);
+
+  const matrixT0 = performance.now();
+  let matrixEdges = 0;
+  forEachZaksFundamentalEdge(n, (e) => {
+    if (hidden && hidden.has(e.gen)) return;
+    const cCode = canonicalOrbitCode(e.i, e.j, n, total, B);
+    const dCode = canonicalDihedralCode(e.i, e.j, n, total, B);
+    if (cCode !== dCode) return;
+    // Generic orbits (size n) deposit at weight 1; antipodal "diameter" chords
+    // map to themselves after n/2 rotations, so the n-fold composite would visit
+    // them twice. If the Cₙ orbit is also its own mirror, the Dₙ composite visits
+    // it twice too. Each symmetry stabilizer halves the representative's weight.
+    const mirrorInvariant =
+      cCode === canonicalOrbitCode(total - 1 - e.i, total - 1 - e.j, n, total, B);
+    const weight = (e.half ? 0.5 : 1) * (mirrorInvariant ? 0.5 : 1);
+    depositChord(acc, field, cf, rf, total, e.i, e.j, weight);
+    matrixEdges++;
+  });
+  if (timings) {
+    timings.matrixMs = performance.now() - matrixT0;
+    timings.matrixEdges = matrixEdges;
+  }
+
+  return symmetrizeYankelovichAccumulator(n, total, field, acc, timings);
+}
+
+/**
  * Monte-Carlo density field for large n, where neither the n! cycle nor the
- * (n-1)! fundamental sector can be enumerated. We draw random cycle positions i,
- * unrank to the permutation, take its full-reversal rₙ neighbor, rank that back
- * to a position j, and rasterize the chord — together with its whole dihedral
- * Dₙ orbit. The Zaks layout has the full Dₙ symmetry: the n rotations
- * ρᵏ: i ↦ i+kB (B = (n-1)!) and the reflection ω: i ↦ (n!-1)-i are all graph
- * automorphisms, so each draw expands into 2n exact edges {ρᵏ(i), ρᵏ(j)} and
- * {ρᵏ(ω(i)), ρᵏ(ω(j))}. Depositing the orbit deterministically makes the field
- * exactly Dₙ-symmetric (mirror axes included) and cuts the variance, instead of
- * waiting for random draws to fill the symmetric images. For n > 6 rₙ is the
- * only generator, so this captures the whole displayed skeleton.
+ * (n-1)! fundamental sector can be enumerated. We sample only the first half of
+ * the block-0 fundamental sector, rasterize those chords into an unsymmetrized
+ * accumulator, then apply the full Dₙ symmetry in the field-composite step.
  */
 function yankelovichFieldSampled(
   n: number,
@@ -2780,11 +2814,14 @@ function yankelovichFieldSampled(
   timings?: YankelovichFieldTimings
 ): Float32Array {
   const matrixT0 = performance.now();
-  const out = new Float32Array(field * field);
+  const acc = new Float32Array(field * field);
   const hidden = hiddenGeneratorSet(hiddenGenerators);
   if (hidden && hidden.has(n)) {
-    if (timings) timings.matrixMs = performance.now() - matrixT0;
-    return out;
+    if (timings) {
+      timings.matrixMs = performance.now() - matrixT0;
+      timings.matrixEdges = 0;
+    }
+    return acc;
   } // rₙ hidden ⇒ nothing to draw
 
   const total = factorial(n);
@@ -2792,29 +2829,28 @@ function yankelovichFieldSampled(
   const cf = field / 2;
   const rf = field / 2 - 1.5;
 
-  // Each random draw expands into 2n dihedral images (n rotations × the ω
-  // reflection), so divide by 2n.
+  // Each random draw is expanded into 2n dihedral images during the symmetry
+  // composite, so divide the effective chord budget by 2n.
   const TARGET_CHORDS = YANKELOVICH_SAMPLE_BUDGET;
   const samples = Math.max(1, Math.round(TARGET_CHORDS / (2 * n)));
+  const fundamentalHalf = Math.max(1, Math.floor(B / 2));
 
+  let matrixEdges = 0;
   for (let s = 0; s < samples; s++) {
-    const i = Math.floor(Math.random() * total);
+    const i = Math.floor(Math.random() * fundamentalHalf);
     const p = zaksUnrank(n, i);
     // rₙ neighbor = full reversal of p.
     const q = new Uint8Array(n);
     for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
     const j = zaksRank(n, q as typeof p);
-    // ω reflection of the chord endpoints (also an edge, by Dₙ symmetry).
-    const wi = total - 1 - i;
-    const wj = total - 1 - j;
-    for (let k = 0; k < n; k++) {
-      const kb = k * B;
-      depositChord(out, field, cf, rf, total, (i + kb) % total, (j + kb) % total, 1);
-      depositChord(out, field, cf, rf, total, (wi + kb) % total, (wj + kb) % total, 1);
-    }
+    depositChord(acc, field, cf, rf, total, i, j, 1);
+    matrixEdges++;
   }
-  if (timings) timings.matrixMs = performance.now() - matrixT0;
-  return out;
+  if (timings) {
+    timings.matrixMs = performance.now() - matrixT0;
+    timings.matrixEdges = matrixEdges;
+  }
+  return symmetrizeYankelovichAccumulator(n, total, field, acc, timings);
 }
 
 /**
@@ -2881,6 +2917,8 @@ function percentile(data: Float32Array, max: number, q: number): number {
 function paintYankelovichBitmap(
   entry: YankelovichFieldCache,
   gammaSlider: number,
+  noiseFloor: number,
+  binary: boolean,
   invert: boolean,
   tone: YankelovichTone,
   colormap: YankelovichColormap
@@ -2896,9 +2934,18 @@ function paintYankelovichBitmap(
 
   // The tone field (log/equalize/clahe) is the costly part; cache it by mode so
   // gamma/invert/colormap tweaks only redo the cheap final mapping below.
-  if (entry.toneKey !== tone || !entry.toneField) {
-    entry.toneField = yankelovichToneField(out, field, tone, histogram.max, norm);
-    entry.toneKey = tone;
+  const toneKey = `${tone}|${noiseFloor}|${binary ? 1 : 0}`;
+  if (entry.toneKey !== toneKey || !entry.toneField) {
+    entry.toneField = yankelovichToneField(
+      out,
+      field,
+      tone,
+      histogram.max,
+      norm,
+      noiseFloor,
+      binary
+    );
+    entry.toneKey = toneKey;
   }
   const t = entry.toneField;
   const gamma = sliderToYankelovichGamma(gammaSlider);
@@ -2913,7 +2960,7 @@ function paintYankelovichBitmap(
     data[p + 3] = 255;
   }
   bctx.putImageData(img, 0, 0);
-  entry.paintKey = `${tone}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
+  entry.paintKey = `${tone}|${noiseFloor}|${binary ? 1 : 0}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
 }
 
 /** Per-cell normalized tone in [0,1] for the chosen tone-mapping mode. */
@@ -2922,13 +2969,24 @@ function yankelovichToneField(
   field: number,
   tone: YankelovichTone,
   max: number,
-  norm: number
+  norm: number,
+  noiseFloor: number,
+  binary: boolean
 ): Float32Array {
   const t = new Float32Array(out.length);
+  const floor =
+    noiseFloor > 0 ? percentile(out, max, Math.min(0.95, noiseFloor / 100)) : 0;
+  if (binary) {
+    for (let i = 0; i < out.length; i++) t[i] = out[i] > floor ? 1 : 0;
+    return t;
+  }
+  const adjustedMax = Math.max(0, max - floor);
+  const adjustedNorm = Math.max(1e-9, norm - floor);
   if (tone === "log") {
-    const denom = Math.log1p(norm);
+    const denom = Math.log1p(adjustedNorm);
     for (let i = 0; i < out.length; i++) {
-      const x = denom > 0 ? Math.log1p(out[i]) / denom : 0;
+      const v = Math.max(0, out[i] - floor);
+      const x = denom > 0 ? Math.log1p(v) / denom : 0;
       t[i] = x > 1 ? 1 : x < 0 ? 0 : x;
     }
     return t;
@@ -2937,11 +2995,11 @@ function yankelovichToneField(
     const B = 4096;
     const hist = new Float64Array(B);
     let c = 0;
-    if (max > 0) {
+    if (adjustedMax > 0) {
       for (let i = 0; i < out.length; i++) {
-        const v = out[i];
+        const v = Math.max(0, out[i] - floor);
         if (v <= 0) continue;
-        hist[Math.min(B - 1, Math.floor((v / max) * B))]++;
+        hist[Math.min(B - 1, Math.floor((v / adjustedMax) * B))]++;
         c++;
       }
     }
@@ -2951,13 +3009,22 @@ function yankelovichToneField(
       hist[b] = c > 0 ? cum / c : 0;
     }
     for (let i = 0; i < out.length; i++) {
-      const v = out[i];
-      t[i] = v > 0 ? hist[Math.min(B - 1, Math.floor((v / max) * B))] : 0;
+      const v = Math.max(0, out[i] - floor);
+      t[i] =
+        v > 0 && adjustedMax > 0
+          ? hist[Math.min(B - 1, Math.floor((v / adjustedMax) * B))]
+          : 0;
     }
     return t;
   }
   // clahe
-  claheToneField(out, field, max, t);
+  if (floor <= 0) {
+    claheToneField(out, field, max, t);
+  } else {
+    const adjusted = new Float32Array(out.length);
+    for (let i = 0; i < out.length; i++) adjusted[i] = Math.max(0, out[i] - floor);
+    claheToneField(adjusted, field, adjustedMax, t);
+  }
   return t;
 }
 
