@@ -4671,7 +4671,11 @@ export function toSampledLinesSVG(opts: SampledLinesSvgOpts): SampledLinesResult
     let emitted = 0;
     const seen = new Set<number>();
     for (let attempts = 0; attempts < maxAttempts && accepted < targetReps; attempts++) {
-      const i = Math.floor(rng() * sectorVertices);
+      const i = enumerateAll ? attempts : Math.floor(rng() * sectorVertices);
+      if (!enumerateAll) {
+        if (seen.has(i)) continue; // without replacement: skip repeats
+        seen.add(i);
+      }
       const p = zaksUnrank(n, i);
       for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
       const j = zaksRank(n, q as typeof p);
@@ -4703,12 +4707,13 @@ export function toSampledLinesSVG(opts: SampledLinesSvgOpts): SampledLinesResult
         d += repDraw;
         emitted += repCopies;
         accepted++;
-        seen.add(i);
       }
     }
     lines = emitted;
+    // Indices are unique (without replacement / enumeration), so every accepted
+    // representative is distinct.
     representatives = accepted;
-    distinctRepresentatives = seen.size;
+    distinctRepresentatives = accepted;
     // Constant-exposure normalization: past a reference line count, fade the
     // stroke so the *total* ink stays roughly constant. Adding lines then
     // reveals more structure instead of saturating the disk to solid gray

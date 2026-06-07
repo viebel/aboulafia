@@ -176,9 +176,9 @@ function recommendedEdgeSliders(
   };
 }
 
-// Values above 10 only apply to graphs that opt into them via graphMaxN
-// (currently the simplex, whose K_{n+1} stays tiny even at n = 40);
-// availableNOptions filters this list per preset.
+// Values above 10 only apply to graphs/renderers that opt into them
+// (simplex/complete stay tiny, while Yankelovich samples analytically);
+// availableNOptions filters this list per preset + renderer.
 const N_OPTIONS: readonly number[] = Array.from(
   { length: 38 },
   (_, i) => i + 3
@@ -247,9 +247,9 @@ function supportsSampledLines(preset: GraphPreset): boolean {
 /**
  * The Yankelovich renderer never enumerates the n! cycle (it samples chords via
  * the analytic Zaks rank/unrank), so it can go well past the other renderers'
- * ceiling. 25! ≈ 1.6·10²⁵ vertices is still fine to sample.
+ * ceiling. 40! is still sampled without materializing the graph.
  */
-const YANKELOVICH_MAX_N = 25;
+const YANKELOVICH_MAX_N = 40;
 const YANKELOVICH_FIELD_SIZE_OPTIONS: readonly number[] = Array.from(
   { length: 27 },
   (_, i) => 600 + i * 100
@@ -503,13 +503,18 @@ function readGraphState(params: URLSearchParams | null): GraphState {
   if (renderer === "sampled" && !supportsSampledLines(preset)) renderer = "svg";
 
   // The n ceiling depends on the renderer: Yankelovich samples chords, so it
-  // reaches n = 25 where the other renderers top out at graphMaxN(preset).
+  // reaches n = 40 where the other renderers top out at graphMaxN(preset).
   const allowedN = N_OPTIONS.filter(
     (opt) => opt <= maxNForRenderer(preset, renderer)
   );
   const n = readIntParam(params, "n", allowedN, defaultNFor(preset)) as NValue;
 
-  const rec = recommendedEdgeSliders(n, preset);
+  // Sampled lines wants bold, thick strokes by default (its accumulation +
+  // tone-map expects them); other renderers use a density-appropriate guess.
+  const rec =
+    renderer === "sampled" && supportsSampledLines(preset)
+      ? { alpha: 100, width: 50 }
+      : recommendedEdgeSliders(n, preset);
 
   return {
     n,
@@ -1788,8 +1793,13 @@ export function PancakeGraphView() {
     setYankelovichFieldViewport(null);
 
     // Edge density changes too, so move the strength/width sliders to a
-    // density-appropriate recommendation for the new graph.
-    const rec = recommendedEdgeSliders(nextN, nextPreset);
+    // density-appropriate recommendation for the new graph. The sampled-lines
+    // renderer instead wants bold, thick strokes (its accumulation + tone-map
+    // expects them), so it keeps its own strong defaults.
+    const rec =
+      renderer === "sampled" && supportsSampledLines(nextPreset)
+        ? { alpha: 100, width: 50 }
+        : recommendedEdgeSliders(nextN, nextPreset);
     setSettings((s) => ({
       ...s,
       alpha: rec.alpha,
