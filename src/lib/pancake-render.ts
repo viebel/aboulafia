@@ -16,6 +16,7 @@ import {
   forEachZaksFundamentalEdge,
   zaksBlock0,
   zaksRank,
+  zaksSigma,
   zaksUnrank,
   type PancakeGraph,
   type QuotientGraph,
@@ -103,6 +104,23 @@ export interface RenderSettings {
   yankelovichSampleCount?: number;
   /** Seed for random Yankelovich sampling; 0 keeps the exact renderer when possible. */
   yankelovichSampleSeed?: number;
+  /**
+   * Number of representatives the sampled-lines renderer accepts — exactly like
+   * the Yankelovich "Random vertices" count. Each representative is drawn with
+   * its n rotations and ω mirrors, so the number of *lines* is up to 2n× this
+   * (fewer when a zoom window culls some copies). Far smaller than the
+   * Yankelovich density sample count: alpha-blended lines saturate the disk once
+   * a pixel is crossed by too many of them.
+   */
+  sampledRepCount?: number;
+  /**
+   * Tone-mapping contrast for the sampled-lines renderer (0..100, 0 = off).
+   * Drives an SVG `<feComponentTransfer>` gamma on the line layer's *alpha*
+   * (coverage) channel: it crushes the sparse background and keeps the dense
+   * overlaps, so the caustic envelopes pop out of an otherwise uniform wash —
+   * the vector-line analogue of the Yankelovich density tone-map.
+   */
+  sampledContrast?: number;
   /** Generator ids whose edges should be skipped at render time. */
   hiddenGenerators: number[];
   /** Symmetry-renderer color scheme (defaults to "parity"). */
@@ -3244,11 +3262,8 @@ function yankelovichFieldSampled(
     if (attempts >= maxAttempts) break;
     attempts++;
     const i = Math.floor(rng() * sectorVertices);
-    const p = zaksUnrank(n, i);
-    // rₙ neighbor = full reversal of p.
-    const q = new Uint8Array(n);
-    for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
-    const j = zaksRank(n, q as typeof p);
+    // rₙ neighbor = σₙ(i) = rank ∘ reverse ∘ unrank.
+    const j = zaksSigma(n, i);
     if (direct) {
       if (
         !dihedralChordIntersectsYankelovichViewport(
@@ -4534,4 +4549,201 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
 
   parts.push("</svg>");
   return parts.join("");
+}
+
+/* ------------------------------ sampled lines ----------------------------- */
+
+export interface SampledLinesResult {
+  svg: string;
+  /** Number of line segments actually drawn (after any viewport culling). */
+  lines: number;
+  /** Number of accepted representative draws (with replacement, may repeat). */
+  representatives: number;
+  /** Number of *distinct* representatives obtained (deduplicated). */
+  distinctRepresentatives: number;
+  /** True when a zoom window filtered the sample (rejection sampling). */
+  culled: boolean;
+}
+
+export interface SampledLinesSvgOpts {
+  n: number;
+  settings: RenderSettings;
+  size: number;
+  palette?: Palette;
+  /**
+   * Captured zoom/pan window (unit-disk coords), exactly like the Yankelovich
+   * field viewport. When set to a non-full window, sampling is rejection-based:
+   * only chords whose dihedral copies fall inside the window are drawn, so the
+   * line budget concentrates on the visible region instead of magnifying a
+   * sparse global sample.
+   */
+  viewport?: YankelovichFieldViewport | null;
+}
+
+/**
+ * Line-drawing counterpart of the Yankelovich density field: instead of
+ * accumulating chord density into a grid, it draws the rₙ matching as actual
+ * line segments, crisp at any zoom (vector output).
+ *
+ * It uses the exact same scheme as the Yankelovich sampler so the picture has
+ * the same Dₙ-symmetric coverage and structure: it samples representatives from
+ * the fundamental angular sector ([0, (n-1)!/2), the precision-safe index range)
+ * and draws each sampled chord together with its n rotations and their ω
+ * mirrors — so the rotational symmetry stays crisp even though, past n ≈ 18, the
+ * factorial constants exceed 2⁵³ and the per-chord endpoints carry some
+ * floating-point noise (the same limit the density field lives with).
+ *
+ * `yankelovichSampleCount` is interpreted as the target number of *drawn* lines;
+ * representatives = count / (2n). The whole sample is one `<path>` (a single DOM
+ * node), so even large counts stay light and scale through the viewBox.
+ */
+export function toSampledLinesSVG(opts: SampledLinesSvgOpts): SampledLinesResult {
+  const { n, settings, size, palette = DEFAULT_PALETTE } = opts;
+  const total = factorial(n);
+  const c = size / 2;
+  const r = size * 0.405;
+  const scale = size / 1000;
+  const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
+  const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
+
+  const parts: string[] = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">`
+  );
+  parts.push(`<rect width="100%" height="100%" fill="${palette.background}"/>`);
+  if (settings.showCycle) {
+    parts.push(
+      `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${scale.toFixed(2)}" stroke-opacity="${edgeAlpha}"/>`
+    );
+  }
+
+  const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+  let lines = 0;
+  let representatives = 0;
+  let distinctRepresentatives = 0;
+  let culled = false;
+  // The full reversal rₙ is the only generator drawn by the sample; if the user
+  // hid it there are no chords to render.
+  if (!(hidden && hidden.has(n))) {
+    const sectorVertices = Math.max(1, Math.floor(factorial(n - 1) / 2));
+    const targetReps = Math.max(
+      1,
+      Math.min(sectorVertices, Math.round(settings.sampledRepCount ?? 1000))
+    );
+    const vp = normalizeYankelovichViewport(opts.viewport);
+    const full = isFullYankelovichViewport(vp);
+    culled = !full;
+    // Sampling is WITHOUT replacement (a Set rejects repeats), so the requested
+    // number of *distinct* representatives is actually reached — with replacement
+    // and only `targetReps` draws, the coupon-collector effect leaves ~1−1/e ≈
+    // 63% distinct. When the target reaches the whole sector we enumerate it
+    // deterministically (every representative, stable across redraws).
+    const enumerateAll = targetReps >= sectorVertices;
+    // When culling to a zoom window, some representatives have no visible copy,
+    // so allow extra attempts to reach the target count (capped).
+    const maxAttempts = enumerateAll
+      ? sectorVertices
+      : full
+        ? Math.min(2_000_000, Math.max(targetReps, targetReps * 20))
+        : Math.min(2_000_000, Math.max(targetReps, sectorVertices, targetReps * 200));
+    const seed = (settings.yankelovichSampleSeed ?? 0) || 1;
+    const rng = makeYankelovichRng(seed);
+    const q = new Uint8Array(n);
+    const delta = (2 * Math.PI) / total;
+    const isVisible = (a: number, b: number): boolean =>
+      full ||
+      segmentIntersectsYankelovichViewport(
+        vp,
+        Math.cos(a),
+        Math.sin(a),
+        Math.cos(b),
+        Math.sin(b)
+      );
+    // Each chord is a SEPARATE <line> element (not one merged <path>): a single
+    // path strokes its union once at a flat opacity, so overlaps would NOT
+    // accumulate and the disk would read as a uniform wash. Separate elements
+    // composite over one another, so dense overlaps darken — that accumulation
+    // is the density the caustics live in.
+    const seg = (a: number, b: number): string =>
+      `<line x1="${(c + r * Math.cos(a)).toFixed(2)}" y1="${(c + r * Math.sin(a)).toFixed(2)}" x2="${(c + r * Math.cos(b)).toFixed(2)}" y2="${(c + r * Math.sin(b)).toFixed(2)}"/>`;
+    let d = "";
+    let accepted = 0;
+    let emitted = 0;
+    const seen = new Set<number>();
+    for (let attempts = 0; attempts < maxAttempts && accepted < targetReps; attempts++) {
+      const i = Math.floor(rng() * sectorVertices);
+      const p = zaksUnrank(n, i);
+      for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
+      const j = zaksRank(n, q as typeof p);
+      const ai = (2 * Math.PI * i) / total;
+      const aj = (2 * Math.PI * j) / total;
+      // The reflection ω: idx ↦ (n!-1)-idx maps an angle θ to -θ-δ.
+      const mi = -ai - delta;
+      const mj = -aj - delta;
+      // Collect this representative's visible copies (its n rotations and their
+      // ω mirrors); accept the representative only if at least one copy shows.
+      let repDraw = "";
+      let repCopies = 0;
+      for (let k = 0; k < n; k++) {
+        const rot = (2 * Math.PI * k) / n;
+        const a0 = ai + rot;
+        const b0 = aj + rot;
+        if (isVisible(a0, b0)) {
+          repDraw += seg(a0, b0);
+          repCopies++;
+        }
+        const a1 = mi + rot;
+        const b1 = mj + rot;
+        if (isVisible(a1, b1)) {
+          repDraw += seg(a1, b1);
+          repCopies++;
+        }
+      }
+      if (repCopies > 0) {
+        d += repDraw;
+        emitted += repCopies;
+        accepted++;
+        seen.add(i);
+      }
+    }
+    lines = emitted;
+    representatives = accepted;
+    distinctRepresentatives = seen.size;
+    // Constant-exposure normalization: past a reference line count, fade the
+    // stroke so the *total* ink stays roughly constant. Adding lines then
+    // reveals more structure instead of saturating the disk to solid gray
+    // (the Edge-strength slider still sets the overall level via edgeAlpha).
+    const REF_LINES = 6000;
+    const strokeOpacity =
+      emitted > REF_LINES
+        ? Math.max(0.004, edgeAlpha * (REF_LINES / emitted))
+        : edgeAlpha;
+    // Tone-map the coverage with an SVG alpha-gamma filter: exponent > 1 crushes
+    // the faint, sparse background and keeps the dense overlaps, amplifying the
+    // caustic contrast the way the Yankelovich density tone-map does — but on
+    // the crisp vector layer, on the GPU, resolution-independently.
+    const contrast = Math.max(0, Math.min(100, settings.sampledContrast ?? 0));
+    const gammaA = 1 + (contrast / 100) * 6; // 1 (off) … 7
+    const useTone = gammaA > 1.001;
+    if (useTone) {
+      parts.push(
+        `<defs><filter id="scTone" x="-2%" y="-2%" width="104%" height="104%" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncA type="gamma" amplitude="1" exponent="${gammaA.toFixed(3)}" offset="0"/></feComponentTransfer></filter></defs>`
+      );
+    }
+    // One <g> carries the shared stroke style; each child <line> composites
+    // separately so overlaps accumulate into a density, then the alpha-gamma
+    // filter tone-maps that density to bring out the caustics.
+    parts.push(
+      `<g fill="none" stroke="${palette.cayleyStroke}" stroke-width="${edgeWidth}" stroke-opacity="${strokeOpacity.toFixed(4)}" stroke-linecap="round"${useTone ? ' filter="url(#scTone)"' : ""}>${d}</g>`
+    );
+  }
+
+  parts.push("</svg>");
+  return {
+    svg: parts.join(""),
+    lines,
+    representatives,
+    distinctRepresentatives,
+    culled,
+  };
 }

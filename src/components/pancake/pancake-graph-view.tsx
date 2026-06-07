@@ -59,6 +59,7 @@ import {
   edgeWidthToSlider,
   type EdgeRenderMode,
   supportsSymmetry,
+  toSampledLinesSVG,
   toSVG,
   toSymmetrySVG,
   toZaksSymmetrySVG,
@@ -226,10 +227,20 @@ type Renderer =
   | "density"
   | "quotient"
   | "symmetry"
-  | "yankelovich";
+  | "yankelovich"
+  | "sampled";
 
 /** The Yankelovich density-field renderer relies on the exact Zaks layout. */
 function supportsYankelovich(preset: GraphPreset): boolean {
+  return preset === "pancake-zaks";
+}
+
+/**
+ * The sampled-lines renderer draws a random subset of the rₙ matching as vector
+ * lines; it shares the Yankelovich analytic sampling, so it is offered on the
+ * same Zaks layout.
+ */
+function supportsSampledLines(preset: GraphPreset): boolean {
   return preset === "pancake-zaks";
 }
 
@@ -250,6 +261,28 @@ const YANKELOVICH_NOISE_FLOOR_OPTIONS: readonly number[] = Array.from(
 );
 const YANKELOVICH_DEFAULT_SAMPLE_COUNT = 100_000;
 const YANKELOVICH_SAMPLE_COUNT_STEP = 50_000;
+
+// Like Yankelovich's "Random vertices", the sampled-lines count is the number
+// of representatives accepted; each is drawn with its 2n symmetric copies, so
+// the line count is up to 2n× this. Kept modest because alpha-blended lines
+// saturate the disk past a few thousand, hiding the envelope structure.
+const SAMPLED_REPS_DEFAULT = 500;
+const SAMPLED_REPS_STEP = 100;
+const SAMPLED_REPS_MAX = 200_000;
+const SAMPLED_CONTRAST_RANGE: readonly number[] = Array.from(
+  { length: 101 },
+  (_, i) => i
+);
+
+function clampSampledRepCount(count: number, n: number): number {
+  // Cap at the number of distinct representatives that actually exist in the
+  // fundamental sector ((n-1)!/2): at small n there simply aren't more.
+  const sectorMax = yankelovichDihedralSectorVertexCount(n);
+  const hi = Math.min(SAMPLED_REPS_MAX, sectorMax);
+  const lo = Math.min(SAMPLED_REPS_STEP, hi);
+  const parsed = Number.isFinite(count) ? Math.round(count) : SAMPLED_REPS_DEFAULT;
+  return Math.max(lo, Math.min(hi, parsed));
+}
 
 const YANKELOVICH_TONES: readonly YankelovichTone[] = [
   "log",
@@ -277,6 +310,9 @@ const YANKELOVICH_COLORMAP_LABELS: Record<YankelovichColormap, string> = {
 /** Highest n offered for a given preset + renderer combination. */
 function maxNForRenderer(preset: GraphPreset, renderer: Renderer): number {
   if (renderer === "yankelovich" && supportsYankelovich(preset)) {
+    return YANKELOVICH_MAX_N;
+  }
+  if (renderer === "sampled" && supportsSampledLines(preset)) {
     return YANKELOVICH_MAX_N;
   }
   return graphMaxN(preset);
@@ -315,19 +351,40 @@ function hasCustomView(zoom: number, pan: { x: number; y: number }): boolean {
   );
 }
 
+function yankelovichStageSize(stageSize: {
+  width: number;
+  height: number;
+}): number {
+  const { width, height } = stageSize;
+  const inset = Math.max(0, Math.min(height - 1, STAGE_INFO_BAR_CLEARANCE));
+  const availableH = Math.max(1, height - inset);
+  return Math.max(1, Math.min(width, availableH));
+}
+
 function yankelovichViewportForView(
   stageSize: { width: number; height: number },
   zoom: number,
   pan: { x: number; y: number }
 ): YankelovichFieldViewport {
-  const { width, height } = stageSize;
-  const inset = Math.max(0, Math.min(height - 1, STAGE_INFO_BAR_CLEARANCE));
-  const availableH = Math.max(1, height - inset);
-  const size = Math.max(1, Math.min(width, availableH));
+  const size = yankelovichStageSize(stageSize);
   return {
     centerX: (-2 * pan.x) / (zoom * size),
     centerY: (-2 * pan.y) / (zoom * size),
     scale: 1 / zoom,
+  };
+}
+
+/** Inverse of {@link yankelovichViewportForView}: place the given map-space
+ * center (in the [-1, 1] full-graph frame) at the middle of the stage. */
+function panForYankelovichCenter(
+  stageSize: { width: number; height: number },
+  zoom: number,
+  center: { x: number; y: number }
+): { x: number; y: number } {
+  const size = yankelovichStageSize(stageSize);
+  return {
+    x: (-center.x * zoom * size) / 2,
+    y: (-center.y * zoom * size) / 2,
   };
 }
 
@@ -363,6 +420,7 @@ const RENDERERS: readonly Renderer[] = [
   "quotient",
   "symmetry",
   "yankelovich",
+  "sampled",
 ];
 
 const SYMMETRY_COLORING_LABELS: Record<SymmetryColoring, string> = {
@@ -429,6 +487,8 @@ interface GraphState {
   yankelovichColormap: YankelovichColormap;
   yankelovichSampleCount: number;
   yankelovichSampleSeed: number;
+  sampledRepCount: number;
+  sampledContrast: number;
   quotientDepth: number;
 }
 
@@ -440,6 +500,7 @@ function readGraphState(params: URLSearchParams | null): GraphState {
   if (renderer === "quotient" && !supportsQuotient(preset)) renderer = "svg";
   if (renderer === "symmetry" && !supportsSymmetry({ preset })) renderer = "svg";
   if (renderer === "yankelovich" && !supportsYankelovich(preset)) renderer = "svg";
+  if (renderer === "sampled" && !supportsSampledLines(preset)) renderer = "svg";
 
   // The n ceiling depends on the renderer: Yankelovich samples chords, so it
   // reaches n = 25 where the other renderers top out at graphMaxN(preset).
@@ -501,6 +562,11 @@ function readGraphState(params: URLSearchParams | null): GraphState {
       n
     ),
     yankelovichSampleSeed: readNonNegIntParam(params, "yseed", 0),
+    sampledRepCount: clampSampledRepCount(
+      readNonNegIntParam(params, "srp", SAMPLED_REPS_DEFAULT),
+      n
+    ),
+    sampledContrast: readIntParam(params, "sct", SAMPLED_CONTRAST_RANGE, 50),
     quotientDepth: readIntParam(
       params,
       "depth",
@@ -537,6 +603,12 @@ export function PancakeGraphView() {
   const [yankelovichMatrixEdges, setYankelovichMatrixEdges] =
     useState<number | null>(null);
   const [yankelovichStage, setYankelovichStage] = useState<string | null>(null);
+  const [sampledStats, setSampledStats] = useState<{
+    lines: number;
+    representatives: number;
+    distinctRepresentatives: number;
+    culled: boolean;
+  } | null>(null);
   const [yankelovichTotalMs, setYankelovichTotalMs] = useState<number | null>(null);
 
   const [settings, setSettings] = useState<RenderSettings>({
@@ -570,6 +642,8 @@ export function PancakeGraphView() {
     yankelovichColormap: initial.yankelovichColormap,
     yankelovichSampleCount: initial.yankelovichSampleCount,
     yankelovichSampleSeed: initial.yankelovichSampleSeed,
+    sampledRepCount: initial.sampledRepCount,
+    sampledContrast: initial.sampledContrast,
     hiddenGenerators: [],
   });
   const [yankelovichSampleDraftCount, setYankelovichSampleDraftCount] =
@@ -648,7 +722,10 @@ export function PancakeGraphView() {
   // The Yankelovich density field is built straight from the Zaks recursion too,
   // so it shares the lightweight O((n-1)!) build path (no full n! graph).
   const yankelovich = supportsYankelovich(preset) && renderer === "yankelovich";
-  const liteBuild = symmetryLite || yankelovich;
+  // The sampled-lines renderer also draws straight from the Zaks recursion (it
+  // samples chords analytically), so it uses the same lightweight build path.
+  const sampledLines = supportsSampledLines(preset) && renderer === "sampled";
+  const liteBuild = symmetryLite || yankelovich || sampledLines;
   // Vector renders above this many segments are slow enough to be worth a
   // visible "Rendering…" phase; smaller ones draw synchronously to keep slider
   // tweaks snappy and flicker-free. Symmetry only emits a 1/n sector.
@@ -666,6 +743,10 @@ export function PancakeGraphView() {
   );
   const yankelovichSampleCount = clampYankelovichSampleCount(
     yankelovichSampleDraftCount,
+    n
+  );
+  const sampledRepCount = clampSampledRepCount(
+    settings.sampledRepCount ?? SAMPLED_REPS_DEFAULT,
     n
   );
 
@@ -742,6 +823,15 @@ export function PancakeGraphView() {
         (settings.yankelovichSampleSeed ?? 0) > 0
           ? String(settings.yankelovichSampleSeed)
           : null,
+      srp:
+        (settings.sampledRepCount ?? SAMPLED_REPS_DEFAULT) !==
+        SAMPLED_REPS_DEFAULT
+          ? String(settings.sampledRepCount)
+          : null,
+      sct:
+        (settings.sampledContrast ?? 50) !== 50
+          ? String(settings.sampledContrast)
+          : null,
       depth: String(quotientDepth),
     });
   }, [
@@ -777,6 +867,8 @@ export function PancakeGraphView() {
     settings.yankelovichColormap,
     settings.yankelovichSampleCount,
     settings.yankelovichSampleSeed,
+    settings.sampledRepCount,
+    settings.sampledContrast,
     quotientDepth,
   ]);
 
@@ -845,7 +937,7 @@ export function PancakeGraphView() {
           // sector is too large to materialize; the Yankelovich renderer samples
           // chords analytically, so hand it the O(n²) sampling payload instead.
           const g =
-            yankelovich && factorial(n - 1) > 4_000_000
+            (yankelovich || sampledLines) && factorial(n - 1) > 4_000_000
               ? buildZaksSamplingGraph(n)
               : buildZaksSymmetryGraph(n);
           if (signal.aborted) return;
@@ -933,7 +1025,7 @@ export function PancakeGraphView() {
       ac.abort();
       clearTimeout(id);
     };
-  }, [n, preset, liteBuild, yankelovich]);
+  }, [n, preset, liteBuild, yankelovich, sampledLines]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -1110,6 +1202,81 @@ export function PancakeGraphView() {
       setIsRendering(false);
     };
   }, [symmetryLite, activeRenderer, graph, settings, showRenderProgress]);
+
+  // Sampled-lines renderer (pancake-zaks only): draws a random subset of the rₙ
+  // matching as a single vector <path> in the SVG host, so zoom/pan reuse the
+  // crisp viewBox path below. Like Yankelovich, the sample is bound to a
+  // captured zoom window (set on Redraw): live zoom/pan only re-aims the
+  // viewBox, while Redraw re-samples, concentrating lines on the visible region.
+  // Heavy samples are deferred a frame behind the "Rendering…" indicator.
+  useEffect(() => {
+    if (!sampledLines) return;
+    const host = svgHostRef.current;
+    if (!host || !graph) return;
+    if (initialYankelovichFieldViewportRef.current === undefined) {
+      initialYankelovichFieldViewportRef.current = yankelovichViewportForView(
+        stageSize,
+        zoom,
+        { x: pan.x, y: pan.y }
+      );
+    }
+    const activeFieldViewport =
+      yankelovichFieldViewport ?? initialYankelovichFieldViewportRef.current;
+    const draw = () => {
+      const res = toSampledLinesSVG({
+        n: graph.n,
+        settings,
+        size: SVG_VIEWBOX,
+        viewport: activeFieldViewport,
+      });
+      host.innerHTML = res.svg
+        .replace(`width="${SVG_VIEWBOX}"`, 'width="100%"')
+        .replace(`height="${SVG_VIEWBOX}"`, 'height="100%"');
+      return res;
+    };
+    const heavy = (settings.sampledRepCount ?? 0) * 2 * graph.n >= 80_000;
+    if (!heavy) {
+      const res = draw();
+      // Publish stats in a frame so it never cascades a synchronous re-render.
+      const id = requestAnimationFrame(() =>
+        setSampledStats({
+          lines: res.lines,
+          representatives: res.representatives,
+          distinctRepresentatives: res.distinctRepresentatives,
+          culled: res.culled,
+        })
+      );
+      return () => cancelAnimationFrame(id);
+    }
+    let cancelled = false;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      if (cancelled) return;
+      setIsRendering(true);
+      setStatus(`Rendering n = ${graph.n}…`);
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        const res = draw();
+        setSampledStats({
+          lines: res.lines,
+          representatives: res.representatives,
+          distinctRepresentatives: res.distinctRepresentatives,
+          culled: res.culled,
+        });
+        setIsRendering(false);
+        setStatus("Ready.");
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      setIsRendering(false);
+    };
+    // zoom/pan intentionally excluded: live view only re-aims the viewBox; the
+    // sample is rebound on Redraw (which sets yankelovichFieldViewport).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampledLines, graph, settings, yankelovichFieldViewport, stageSize]);
 
   // Canvas symmetry renderer for pancake-zaks: draws the fundamental sector and
   // composites n rotated copies, with pixel-bound memory instead of the SVG
@@ -1358,7 +1525,12 @@ export function PancakeGraphView() {
   // into a blur. This only mutates an attribute, so it is cheap enough to
   // run on every zoom/pan tick without regenerating the path data.
   useEffect(() => {
-    if (activeRenderer !== "svg" && activeRenderer !== "symmetry") return;
+    if (
+      activeRenderer !== "svg" &&
+      activeRenderer !== "symmetry" &&
+      activeRenderer !== "sampled"
+    )
+      return;
     const host = svgHostRef.current;
     const svgEl = host?.querySelector("svg");
     if (!svgEl) return;
@@ -1380,21 +1552,28 @@ export function PancakeGraphView() {
       try {
         const useSymmetry =
           activeRenderer === "symmetry" && supportsSymmetry(graph);
-        const render = !useSymmetry
-          ? toSVG
-          : graph.preset === "pancake-zaks"
-            ? toZaksSymmetrySVG
-            : toSymmetrySVG;
-        const svg = render({
-          graph,
-          settings,
-          size: svgExportSize,
-        });
+        const svg = sampledLines
+          ? toSampledLinesSVG({
+              n: graph.n,
+              settings,
+              size: svgExportSize,
+              viewport: yankelovichFieldViewport,
+            }).svg
+          : (!useSymmetry
+              ? toSVG
+              : graph.preset === "pancake-zaks"
+                ? toZaksSymmetrySVG
+                : toSymmetrySVG)({
+              graph,
+              settings,
+              size: svgExportSize,
+            });
         const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `${graph.preset}_n${graph.n}${useSymmetry ? "_sym" : ""}.svg`;
+        const suffix = sampledLines ? "_sampled" : useSymmetry ? "_sym" : "";
+        a.download = `${graph.preset}_n${graph.n}${suffix}.svg`;
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -1405,7 +1584,7 @@ export function PancakeGraphView() {
         setStatus(`SVG export error: ${msg}`);
       }
     }, 30);
-  }, [activeRenderer, graph, settings, svgExportSize]);
+  }, [activeRenderer, sampledLines, graph, settings, svgExportSize, yankelovichFieldViewport]);
 
   const downloadPNG = useCallback(() => {
     if (!graph) return;
@@ -1418,6 +1597,47 @@ export function PancakeGraphView() {
         const ctx = canvas.getContext("2d");
         if (!ctx) throw new Error("Could not create canvas context.");
 
+        if (sampledLines) {
+          // Rasterize the vector sample through an <img>, so the PNG matches
+          // the on-screen lines without a separate canvas line-drawing path.
+          const svg = toSampledLinesSVG({
+            n: graph.n,
+            settings,
+            size: svgExportSize,
+            viewport: yankelovichFieldViewport,
+          }).svg;
+          const blob = new Blob([svg], {
+            type: "image/svg+xml;charset=utf-8",
+          });
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => {
+            ctx.drawImage(img, 0, 0, svgExportSize, svgExportSize);
+            URL.revokeObjectURL(url);
+            canvas.toBlob((pngBlob) => {
+              if (!pngBlob) {
+                setStatus("PNG export error: could not encode image.");
+                return;
+              }
+              const pngUrl = URL.createObjectURL(pngBlob);
+              const a = document.createElement("a");
+              a.href = pngUrl;
+              a.download = `${graph.preset}_n${graph.n}_sampled.png`;
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              URL.revokeObjectURL(pngUrl);
+              setStatus(`n = ${graph.n} PNG downloaded.`);
+            }, "image/png");
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            setStatus("PNG export error: could not rasterize sample.");
+          };
+          img.src = url;
+          return;
+        }
+
         if (symmetryLite) {
           drawZaksSymmetryToCanvas(ctx, {
             n: graph.n,
@@ -1427,12 +1647,25 @@ export function PancakeGraphView() {
             dpr: 1,
           });
         } else if (yankelovich) {
+          // Match the on-screen view: the square export shows exactly the
+          // currently visible window of the graph (zoom/pan included), and
+          // reuses the field bound to that window for identical pixels.
+          const visible = yankelovichViewportForView(stageSize, zoom, pan);
+          const activeFieldViewport =
+            yankelovichFieldViewport ??
+            initialYankelovichFieldViewportRef.current ??
+            visible;
+          const exportZoom = 1 / visible.scale;
           drawYankelovichToCanvas(ctx, {
             n: graph.n,
             settings,
             cssWidth: svgExportSize,
             cssHeight: svgExportSize,
             dpr: 1,
+            zoom: exportZoom,
+            panX: (-visible.centerX * exportZoom * svgExportSize) / 2,
+            panY: (-visible.centerY * exportZoom * svgExportSize) / 2,
+            fieldViewport: activeFieldViewport,
           });
         } else if (activeRenderer === "quotient") {
           if (!quotient) throw new Error("Quotient is still building.");
@@ -1475,7 +1708,7 @@ export function PancakeGraphView() {
         setStatus(`PNG export error: ${msg}`);
       }
     }, 30);
-  }, [activeRenderer, symmetryLite, yankelovich, graph, quotient, settings, svgExportSize]);
+  }, [activeRenderer, symmetryLite, sampledLines, yankelovich, graph, quotient, settings, svgExportSize, stageSize, zoom, pan, yankelovichFieldViewport]);
 
   const svgDownloadDisabled = useMemo(() => {
     if (!graph) return true;
@@ -1488,6 +1721,9 @@ export function PancakeGraphView() {
     // The symmetry renderer emits an ~n× smaller file (one sector + rotations),
     // so it stays exportable exactly where the flat SVG would be too large.
     if (activeRenderer === "symmetry" && supportsSymmetry(graph)) return false;
+    // Sampled lines are a single <path> with a bounded number of segments, so
+    // the file size depends on the sample count, never on n.
+    if (activeRenderer === "sampled") return false;
     // Gate on vertex count rather than n: the sliding puzzle reaches millions
     // of states at a small n, where an SVG file would be unusably large.
     return (
@@ -1513,16 +1749,31 @@ export function PancakeGraphView() {
     );
   };
 
+  // The sampled-lines count applies live (re-rendering is cheap), unlike the
+  // Yankelovich count which is batched into Redraw with the field rebuild.
+  const setSampledRepStep = (delta: number) => {
+    setS("sampledRepCount", clampSampledRepCount(sampledRepCount + delta, n));
+  };
+
+  const newRandomSeed = () =>
+    (typeof crypto !== "undefined" && "getRandomValues" in crypto
+      ? crypto.getRandomValues(new Uint32Array(1))[0]
+      : fallbackYankelovichSeedRef.current++) || 1;
+
   const redrawYankelovichSample = () => {
-    const randomSeed =
-      typeof crypto !== "undefined" && "getRandomValues" in crypto
-        ? crypto.getRandomValues(new Uint32Array(1))[0]
-        : fallbackYankelovichSeedRef.current++;
+    if (sampledLines) {
+      // Like Yankelovich: bind the sample to the current zoom window and reseed,
+      // so lines concentrate on the visible region.
+      setS("yankelovichSampleSeed", newRandomSeed());
+      initialYankelovichFieldViewportRef.current = null;
+      setYankelovichFieldViewport(currentYankelovichViewport());
+      return;
+    }
     setSettings((s) => ({
       ...s,
       yankelovichFieldSize: yankelovichFieldDraftSize,
       yankelovichSampleCount,
-      yankelovichSampleSeed: randomSeed || 1,
+      yankelovichSampleSeed: newRandomSeed(),
     }));
     initialYankelovichFieldViewportRef.current = null;
     setYankelovichFieldViewport(currentYankelovichViewport());
@@ -1592,6 +1843,13 @@ export function PancakeGraphView() {
     setPan({ x: 0, y: 0 });
     initialYankelovichFieldViewportRef.current = null;
     setYankelovichFieldViewport(null);
+  };
+
+  // Pan the stage by clicking/dragging on the viewport minimap: the picked
+  // point (in the map's [-1, 1] frame) becomes the new center of the view.
+  const navigateToViewportCenter = (center: { x: number; y: number }) => {
+    if (zoom <= 1) return;
+    setPan(panForYankelovichCenter(stageSize, zoom, center));
   };
 
   const handlePanStart = (event: PointerEvent<HTMLDivElement>) => {
@@ -2015,6 +2273,35 @@ export function PancakeGraphView() {
                   full
                 />
               ) : null}
+              {sampledLines ? (
+                <Stat
+                  label="Lines drawn"
+                  value={sampledStats?.lines ?? undefined}
+                  full
+                />
+              ) : null}
+              {sampledLines ? (
+                <Stat
+                  label="Distinct reps"
+                  value={sampledStats?.distinctRepresentatives ?? undefined}
+                  full
+                />
+              ) : null}
+              {sampledLines && sampledStats?.culled ? (
+                <Stat
+                  label="Visible rate"
+                  value={
+                    sampledStats && sampledStats.representatives > 0
+                      ? `${(
+                          (sampledStats.lines /
+                            (sampledStats.representatives * 2 * n)) *
+                          100
+                        ).toFixed(1)}%`
+                      : undefined
+                  }
+                  full
+                />
+              ) : null}
               {yankelovich ? (
                 <Stat
                   label="Matrix size"
@@ -2073,6 +2360,7 @@ export function PancakeGraphView() {
                   if (v === "quotient" && !supportsQuotient(preset)) return;
                   if (v === "symmetry" && !supportsSymmetry({ preset })) return;
                   if (v === "yankelovich" && !supportsYankelovich(preset)) return;
+                  if (v === "sampled" && !supportsSampledLines(preset)) return;
                   const next = v as Renderer;
                   // Leaving Yankelovich for a renderer that enumerates the graph
                   // must drop n back under that renderer's ceiling.
@@ -2080,6 +2368,13 @@ export function PancakeGraphView() {
                   if (n > cap) {
                     setN(cap as NValue);
                     resetViewForGraph(cap, preset);
+                  }
+                  // The auto edge sliders target the full 10²⁰-edge density, so
+                  // they bottom out; a sparse line sample needs visibly stronger
+                  // but thin strokes so the chord envelopes read. Seed sensible
+                  // defaults on first entry to sampled.
+                  if (next === "sampled" && renderer !== "sampled") {
+                    setSettings((s) => ({ ...s, alpha: 100, width: 50 }));
                   }
                   setRenderer(next);
                 }}
@@ -2118,6 +2413,12 @@ export function PancakeGraphView() {
                   label="Yankelovich"
                   checked={activeRenderer === "yankelovich"}
                   disabled={!supportsYankelovich(preset)}
+                />
+                <RendererRadio
+                  value="sampled"
+                  label="Sampled lines"
+                  checked={activeRenderer === "sampled"}
+                  disabled={!supportsSampledLines(preset)}
                 />
               </RadioGroup>
             </div>
@@ -2514,14 +2815,16 @@ export function PancakeGraphView() {
               </div>
             ) : null}
 
-            {yankelovich ? (
+            {yankelovich || sampledLines ? (
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <Label className="text-xs uppercase tracking-wider text-muted-foreground">
                     Random vertices
                   </Label>
                   <span className="font-mono text-xs text-muted-foreground">
-                    {formatUiNumber(yankelovichSampleCount)}
+                    {formatUiNumber(
+                      sampledLines ? sampledRepCount : yankelovichSampleCount
+                    )}
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -2537,29 +2840,55 @@ export function PancakeGraphView() {
                     variant="outline"
                     size="sm"
                     onClick={() =>
-                      setYankelovichDraftStep(-YANKELOVICH_SAMPLE_COUNT_STEP)
+                      sampledLines
+                        ? setSampledRepStep(-SAMPLED_REPS_STEP)
+                        : setYankelovichDraftStep(-YANKELOVICH_SAMPLE_COUNT_STEP)
                     }
-                    disabled={yankelovichSampleCount <= 1}
-                    aria-label="Remove 50,000 random vertices"
+                    disabled={
+                      sampledLines
+                        ? sampledRepCount <=
+                          Math.min(
+                            SAMPLED_REPS_STEP,
+                            yankelovichDihedralSectorVertexCount(n)
+                          )
+                        : yankelovichSampleCount <= 1
+                    }
+                    aria-label="Fewer samples"
                   >
                     <Minus className="size-3.5" />
-                    50,000
+                    {formatUiNumber(
+                      sampledLines
+                        ? SAMPLED_REPS_STEP
+                        : YANKELOVICH_SAMPLE_COUNT_STEP
+                    )}
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
                     onClick={() =>
-                      setYankelovichDraftStep(YANKELOVICH_SAMPLE_COUNT_STEP)
+                      sampledLines
+                        ? setSampledRepStep(SAMPLED_REPS_STEP)
+                        : setYankelovichDraftStep(YANKELOVICH_SAMPLE_COUNT_STEP)
                     }
                     disabled={
-                      yankelovichSampleCount >=
-                      yankelovichDihedralSectorVertexCount(n)
+                      sampledLines
+                        ? sampledRepCount >=
+                          Math.min(
+                            SAMPLED_REPS_MAX,
+                            yankelovichDihedralSectorVertexCount(n)
+                          )
+                        : yankelovichSampleCount >=
+                          yankelovichDihedralSectorVertexCount(n)
                     }
-                    aria-label="Add 50,000 random vertices"
+                    aria-label="More samples"
                   >
                     <Plus className="size-3.5" />
-                    50,000
+                    {formatUiNumber(
+                      sampledLines
+                        ? SAMPLED_REPS_STEP
+                        : YANKELOVICH_SAMPLE_COUNT_STEP
+                    )}
                   </Button>
                 </div>
                 <Button
@@ -2573,6 +2902,29 @@ export function PancakeGraphView() {
                   <Shuffle className="size-3.5" />
                   Redraw
                 </Button>
+                {sampledLines ? (
+                  <div className="space-y-2 pt-1">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                        Caustic contrast
+                      </Label>
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {settings.sampledContrast ?? 50}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.sampledContrast ?? 50]}
+                      min={0}
+                      max={100}
+                      step={1}
+                      onValueChange={([v]) => setS("sampledContrast", v)}
+                    />
+                    <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
+                      <span>flat</span>
+                      <span>caustics</span>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : null}
 
@@ -3033,7 +3385,10 @@ export function PancakeGraphView() {
                 </Button>
               </div>
               {yankelovich ? (
-                <YankelovichViewportMap viewport={currentYankelovichViewport()} />
+                <YankelovichViewportMap
+                  viewport={currentYankelovichViewport()}
+                  onNavigate={navigateToViewportCenter}
+                />
               ) : null}
             </>
           )}
@@ -3047,23 +3402,64 @@ export function PancakeGraphView() {
 
 function YankelovichViewportMap({
   viewport,
+  onNavigate,
 }: {
   viewport: YankelovichFieldViewport;
+  onNavigate: (center: { x: number; y: number }) => void;
 }) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const draggingRef = useRef(false);
+
   const rectX = viewport.centerX - viewport.scale;
   const rectY = viewport.centerY - viewport.scale;
   const rectSize = viewport.scale * 2;
 
+  // Translate a pointer position into the map's [-1, 1] frame (the viewBox).
+  const navigateFromEvent = (event: PointerEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    onNavigate({
+      x: ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      y: ((event.clientY - rect.top) / rect.height) * 2 - 1,
+    });
+  };
+
+  const handlePointerDown = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.button !== 0) return;
+    draggingRef.current = true;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    navigateFromEvent(event);
+  };
+
+  const handlePointerMove = (event: PointerEvent<SVGSVGElement>) => {
+    if (!draggingRef.current) return;
+    navigateFromEvent(event);
+  };
+
+  const handlePointerUp = (event: PointerEvent<SVGSVGElement>) => {
+    draggingRef.current = false;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
   return (
     <div
-      className="pointer-events-none absolute right-3 top-14 rounded-md border bg-background/90 p-2 shadow-sm backdrop-blur"
+      className="absolute right-3 top-14 rounded-md border bg-background/90 p-2 shadow-sm backdrop-blur"
       aria-label="Zoom map"
     >
       <svg
+        ref={svgRef}
         viewBox="-1 -1 2 2"
-        className="h-24 w-24 overflow-visible"
+        className="h-24 w-24 cursor-pointer touch-none overflow-visible"
         role="img"
-        aria-label="Visible area in full graph"
+        aria-label="Visible area in full graph — click or drag to pan"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
       >
         <circle
           cx="0"
@@ -3372,26 +3768,20 @@ function FieldHistogram({
       </div>
     );
   }
-  const { bins, max, norm, nonZero, total } = histogram;
+  const { bins, max, norm } = histogram;
   const maxCount = bins.reduce((m, c) => Math.max(m, c), 0);
   const logMax = Math.log1p(maxCount);
   // Bin index where the tone-map white point (norm) falls.
   const normBin =
     max > 0 ? Math.min(bins.length - 1, Math.floor((norm / max) * bins.length)) : 0;
-  const filledPct = total > 0 ? (nonZero / total) * 100 : 0;
 
   return (
     <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <div>
-          <h3 className="text-xs font-medium">Matrix value histogram</h3>
-          <p className="text-[10px] text-muted-foreground">
-            density per cell · log count · {bins.length} bins
-          </p>
-        </div>
-        <span className="font-mono text-[10px] text-muted-foreground">
-          {filledPct.toFixed(1)}% of disk filled
-        </span>
+      <div>
+        <h3 className="text-xs font-medium">Matrix value histogram</h3>
+        <p className="text-[10px] text-muted-foreground">
+          density per cell · log count · {bins.length} bins
+        </p>
       </div>
 
       <div className="flex h-20 items-end gap-px">

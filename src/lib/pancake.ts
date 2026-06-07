@@ -1141,6 +1141,24 @@ function computeZaksRank(m: number, q: ArrayLike<number>): number {
 }
 
 /**
+ * σₙ = rank ∘ reverse ∘ unrank: the global cycle position (0 ≤ σ < n!) of the
+ * rₙ-neighbor of the permutation living at position `i` in the greedy Zaks
+ * order. Here "reverse" is the full pancake flip rₙ (whole-word reversal), so
+ * σₙ maps each vertex index to the index its long rₙ chord lands on.
+ *
+ * This is the map driving the `rₙ` caustics of the Zaks layout (see
+ * docs/pancake-aretes-longues.md): the chord joins angles 2π·i/n! and
+ * 2π·σₙ(i)/n!. Computed in O(n²) without ever materializing the n! cycle.
+ */
+export function zaksSigma(n: number, i: number): number {
+  const p = zaksUnrank(n, i);
+  // rₙ = full reversal of p.
+  const q = new Uint8Array(n) as Perm;
+  for (let t = 0; t < n; t++) q[t] = p[n - 1 - t];
+  return zaksRank(n, q);
+}
+
+/**
  * A lightweight pancake-zaks payload for the density-field renderer at large n,
  * where neither the n! cycle nor the (n-1)! fundamental sector can be
  * enumerated. It carries only generator metadata and analytic edge tallies; the

@@ -27,6 +27,18 @@ export function SiteHeader() {
           >
             Tserouf
           </Link>
+          <Link
+            href="/analysis"
+            className="transition-colors hover:text-foreground"
+          >
+            Analysis
+          </Link>
+          <Link
+            href="/dihedral"
+            className="transition-colors hover:text-foreground"
+          >
+            Dihedral
+          </Link>
         </nav>
       </div>
     </header>
