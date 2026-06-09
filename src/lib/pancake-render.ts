@@ -96,7 +96,7 @@ export interface RenderSettings {
    * / pen look that matches the app's light theme). Defaults to false.
    */
   yankelovichInvert?: boolean;
-  /** Yankelovich tone-mapping mode (defaults to "log"). */
+  /** Yankelovich tone-mapping mode (defaults to "clahe"). */
   yankelovichTone?: YankelovichTone;
   /** Yankelovich color ramp (defaults to "gray"). */
   yankelovichColormap?: YankelovichColormap;
@@ -1981,7 +1981,7 @@ export function drawToCanvas(
     coords
       ? [c + coords[2 * i] * r, cy + coords[2 * i + 1] * r]
       : pointXY(i, total, c, cy, r);
-  // Orbit/blocks coloring applies only to the Zaks layouts and only in line
+  // Orbit/blocks coloring applies only to Pancake Zaks and only in line
   // mode (the density binning has no per-edge identity to color).
   const coloring =
     settings.edgeMode === "density" ? null : dihedralColoring(graph, settings);
@@ -2499,6 +2499,7 @@ export interface YankelovichHistogram {
 
 interface YankelovichCanvasOpts {
   n: number;
+  graph?: PancakeGraph;
   settings: RenderSettings;
   cssWidth: number;
   cssHeight: number;
@@ -2725,7 +2726,7 @@ function dihedralChordIntersectsYankelovichViewport(
 }
 
 /**
- * Israel Yankelovich's density-field visualization of the Zaks pancake graph.
+ * Israel Yankelovich's density-field visualization of a circular graph drawing.
  *
  * Idea: inscribe the n! cycle vertices on a circle, then for every chord
  * accumulate +1 into each cell of an N×N grid the chord passes through, and
@@ -2733,11 +2734,9 @@ function dihedralChordIntersectsYankelovichViewport(
  * to white, so the chord *envelopes* (caustics) emerge — structure the plain
  * alpha-blended disk hides once it saturates to black.
  *
- * It exploits the exact Dₙ symmetry of the Zaks layout to stay cheap: the
- * fundamental angular sector has (n-1)!/2 vertices, then its n rotations and
- * mirrored copies cover the disk. Antipodal "diameter" chords have a half-size
- * rotation orbit, so they are deposited at weight 1/2; mirror-invariant orbits
- * are also deposited at weight 1/2 because the final Dₙ sum visits them twice.
+ * Analytic Dₙ presets exploit the fundamental angular sector: sample one sector,
+ * then composite its n rotations and mirrored copies over the disk. Other
+ * presets sample their materialized edge list directly.
  */
 export function drawYankelovichToCanvas(
   ctx: CanvasRenderingContext2D,
@@ -2760,7 +2759,7 @@ export function drawYankelovichToCanvas(
   const noiseFloor = settings.yankelovichNoiseFloor ?? 0;
   const binary = settings.yankelovichBinary ?? false;
   const invert = settings.yankelovichInvert ?? false;
-  const tone = settings.yankelovichTone ?? "log";
+  const tone = settings.yankelovichTone ?? "clahe";
   const colormap = settings.yankelovichColormap ?? "gray";
   const paintKey = `${tone}|${noiseFloor}|${binary ? 1 : 0}|${gammaSlider}|${invert ? 1 : 0}|${colormap}`;
 
@@ -2831,6 +2830,7 @@ export function ensureYankelovichField(
   if (existing) return existing;
   const entry = buildYankelovichField(
     n,
+    opts.graph,
     field,
     settings,
     fieldKey,
@@ -2847,19 +2847,32 @@ export function ensureYankelovichField(
  * recompute — n/hidden change) and show the right phase indicator.
  */
 export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
-  const { n, settings } = opts;
+  const { n, graph, settings } = opts;
   const field = yankelovichFieldSize(settings);
   const sampled = yankelovichUsesSampling(n, settings);
   const hiddenKey = [...new Set(settings.hiddenGenerators)]
     .sort((a, b) => a - b)
     .join(",");
-  const sampleKey = sampled
+  const analyticDn =
+    !graph ||
+    graph.preset === "pancake-zaks" ||
+    graph.preset === "random-dihedral" ||
+    graph.preset === "wedge-clipped-dihedral";
+  const genericSampleCount =
+    settings.yankelovichSampleCount ?? YANKELOVICH_DEFAULT_SAMPLE_COUNT;
+  const sampleKey = !analyticDn
+    ? `${genericSampleCount}|${yankelovichSampleSeed(settings)}`
+    : graph?.preset === "random-dihedral" ||
+        graph?.preset === "wedge-clipped-dihedral"
+    ? `${yankelovichSampleCount(settings, n)}|${yankelovichSampleSeed(settings)}`
+    : sampled
     ? `${yankelovichSampleCount(settings, n)}|${yankelovichSampleSeed(settings)}`
     : "exact";
   const viewportKey = yankelovichViewportKey(
     normalizeYankelovichViewport(opts.fieldViewport)
   );
-  return `${n}|${field}|${hiddenKey}|${sampleKey}|${viewportKey}`;
+  const graphKey = graph ? `${graph.preset}|${graph.edges.length}` : "zaks";
+  return `${graphKey}|${n}|${field}|${hiddenKey}|${sampleKey}|${viewportKey}`;
 }
 
 /**
@@ -2870,6 +2883,7 @@ export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
  */
 function buildYankelovichField(
   n: number,
+  graph: PancakeGraph | undefined,
   field: number,
   settings: RenderSettings,
   key: string,
@@ -2884,7 +2898,37 @@ function buildYankelovichField(
     visibleVertices: 0,
   };
   const out =
-    yankelovichUsesSampling(n, settings)
+    graph?.preset === "random-dihedral"
+      ? yankelovichFieldRandomDihedral(
+          n,
+          field,
+          settings.hiddenGenerators,
+          yankelovichSampleCount(settings, n),
+          yankelovichSampleSeed(settings),
+          viewport,
+          timings
+        )
+      : graph?.preset === "wedge-clipped-dihedral"
+        ? yankelovichFieldWedgeClippedDihedral(
+            n,
+            field,
+            settings.hiddenGenerators,
+            yankelovichSampleCount(settings, n),
+            yankelovichSampleSeed(settings),
+            viewport,
+            timings
+          )
+      : graph && graph.preset !== "pancake-zaks"
+      ? yankelovichFieldFromGraph(
+          graph,
+          field,
+          settings,
+          settings.yankelovichSampleCount ?? YANKELOVICH_DEFAULT_SAMPLE_COUNT,
+          yankelovichSampleSeed(settings),
+          viewport,
+          timings
+        )
+      : yankelovichUsesSampling(n, settings)
       ? yankelovichFieldSampled(
           n,
           field,
@@ -2935,30 +2979,112 @@ function buildYankelovichField(
   };
 }
 
-/** Rasterize the chord between cycle positions i and j (angles 2π·/total). */
-function depositChord(
+function graphYankelovichPoint(
+  graph: PancakeGraph,
+  i: number
+): { x: number; y: number } {
+  if (graph.coords) {
+    return { x: graph.coords[2 * i], y: graph.coords[2 * i + 1] };
+  }
+  const total = graph.path.length;
+  const a = (2 * Math.PI * i) / total;
+  return { x: Math.cos(a), y: Math.sin(a) };
+}
+
+function graphEdgeIntersectsYankelovichViewport(
+  graph: PancakeGraph,
+  viewport: YankelovichFieldViewport,
+  i: number,
+  j: number
+): boolean {
+  const a = graphYankelovichPoint(graph, i);
+  const b = graphYankelovichPoint(graph, j);
+  return segmentIntersectsYankelovichViewport(
+    viewport,
+    a.x,
+    a.y,
+    b.x,
+    b.y
+  );
+}
+
+/**
+ * Generic Yankelovich field: sample this graph's actual edge set directly.
+ * Unlike the Zaks pancake branch, this applies no Dₙ rotations or reflections.
+ */
+function yankelovichFieldFromGraph(
+  graph: PancakeGraph,
+  field: number,
+  settings: RenderSettings,
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const acc = new Float32Array(field * field);
+  const { edges } = graph;
+  const edgeCount = edges.length / 3;
+  if (edgeCount === 0) return acc;
+  const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+  const direct = !isFullYankelovichViewport(viewport);
+  const rng = makeYankelovichRng(sampleSeed);
+  const target = Math.max(1, Math.min(edgeCount, Math.round(sampleCount)));
+  const enumerate = target >= edgeCount;
+  const maxAttempts = enumerate ? edgeCount : Math.min(edgeCount * 4, target * 20);
+
+  const matrixT0 = performance.now();
+  let matrixEdges = 0;
+  let attempts = 0;
+  const drawEdge = (edgeIndex: number): boolean => {
+    const t = edgeIndex * 3;
+    if (hidden && hidden.has(edges[t + 2])) return false;
+    const i = edges[t];
+    const j = edges[t + 1];
+    if (direct && !graphEdgeIntersectsYankelovichViewport(graph, viewport, i, j)) {
+      return false;
+    }
+    const a = graphYankelovichPoint(graph, i);
+    const b = graphYankelovichPoint(graph, j);
+    depositUnitSegment(acc, field, viewport, a.x, a.y, b.x, b.y, 1);
+    matrixEdges++;
+    return true;
+  };
+
+  if (enumerate) {
+    for (let e = 0; e < edgeCount; e++) drawEdge(e);
+  } else {
+    while (matrixEdges < target && attempts < maxAttempts) {
+      attempts++;
+      drawEdge(Math.floor(rng() * edgeCount));
+    }
+  }
+
+  if (timings) {
+    timings.matrixMs = performance.now() - matrixT0;
+    timings.symmetryMs = 0;
+    timings.matrixEdges = matrixEdges;
+    timings.viewportMs = 0;
+    timings.visibleVertices = graph.path.length;
+  }
+  return acc;
+}
+
+function depositUnitSegment(
   buf: Float32Array,
   field: number,
   viewport: YankelovichFieldViewport,
-  total: number,
-  i: number,
-  j: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
   wgt: number
 ): void {
-  const ai = (2 * Math.PI * i) / total;
-  const aj = (2 * Math.PI * j) / total;
-  let { x: x1, y: y1 } = mapYankelovichUnitToField(
-    field,
-    viewport,
-    Math.cos(ai),
-    Math.sin(ai)
-  );
-  let { x: x2, y: y2 } = mapYankelovichUnitToField(
-    field,
-    viewport,
-    Math.cos(aj),
-    Math.sin(aj)
-  );
+  const p1 = mapYankelovichUnitToField(field, viewport, x1, y1);
+  const p2 = mapYankelovichUnitToField(field, viewport, x2, y2);
+  x1 = p1.x;
+  y1 = p1.y;
+  x2 = p2.x;
+  y2 = p2.y;
   const dx = x2 - x1;
   const dy = y2 - y1;
   const len = Math.hypot(dx, dy);
@@ -3035,6 +3161,30 @@ function depositChord(
     }
     t = nextT;
   }
+}
+
+/** Rasterize the chord between cycle positions i and j (angles 2π·/total). */
+function depositChord(
+  buf: Float32Array,
+  field: number,
+  viewport: YankelovichFieldViewport,
+  total: number,
+  i: number,
+  j: number,
+  wgt: number
+): void {
+  const ai = (2 * Math.PI * i) / total;
+  const aj = (2 * Math.PI * j) / total;
+  depositUnitSegment(
+    buf,
+    field,
+    viewport,
+    Math.cos(ai),
+    Math.sin(ai),
+    Math.cos(aj),
+    Math.sin(aj),
+    wgt
+  );
 }
 
 function symmetrizeYankelovichAccumulator(
@@ -3117,6 +3267,196 @@ function depositDihedralChordCopies(
     depositChord(buf, field, viewport, total, a, b, weight);
     depositChord(buf, field, viewport, total, total - 1 - a, total - 1 - b, weight);
   }
+}
+
+interface UnitSegment {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+function clipUnitSegmentToDihedralWedge(
+  n: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number
+): UnitSegment | null {
+  const wedge = Math.PI / n;
+  const sin = Math.sin(wedge);
+  const cos = Math.cos(wedge);
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let t0 = 0;
+  let t1 = 1;
+
+  const clip = (h0: number, dh: number): boolean => {
+    if (Math.abs(dh) < 1e-15) return h0 >= 0;
+    const t = -h0 / dh;
+    if (dh > 0) {
+      if (t > t0) t0 = t;
+    } else if (t < t1) {
+      t1 = t;
+    }
+    return t0 < t1;
+  };
+
+  if (!clip(y1, dy)) return null;
+  if (!clip(sin * x1 - cos * y1, sin * dx - cos * dy)) return null;
+
+  return {
+    x1: x1 + dx * t0,
+    y1: y1 + dy * t0,
+    x2: x1 + dx * t1,
+    y2: y1 + dy * t1,
+  };
+}
+
+function wedgeClippedChordSegment(
+  n: number,
+  total: number,
+  i: number,
+  j: number
+): UnitSegment | null {
+  const ai = (2 * Math.PI * i) / total;
+  const aj = (2 * Math.PI * j) / total;
+  return clipUnitSegmentToDihedralWedge(
+    n,
+    Math.cos(ai),
+    Math.sin(ai),
+    Math.cos(aj),
+    Math.sin(aj)
+  );
+}
+
+function depositWedgeClippedChord(
+  buf: Float32Array,
+  field: number,
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  i: number,
+  j: number,
+  weight: number
+): boolean {
+  const segment = wedgeClippedChordSegment(n, total, i, j);
+  if (!segment) return false;
+  depositUnitSegment(
+    buf,
+    field,
+    viewport,
+    segment.x1,
+    segment.y1,
+    segment.x2,
+    segment.y2,
+    weight
+  );
+  return true;
+}
+
+function transformDihedralPoint(
+  x: number,
+  y: number,
+  rotCos: number,
+  rotSin: number,
+  mirrorCos: number,
+  mirrorSin: number,
+  reflected: boolean
+): { x: number; y: number } {
+  const rx = x * rotCos - y * rotSin;
+  const ry = x * rotSin + y * rotCos;
+  if (!reflected) return { x: rx, y: ry };
+  return {
+    x: rx * mirrorCos - ry * mirrorSin,
+    y: -rx * mirrorSin - ry * mirrorCos,
+  };
+}
+
+function depositDihedralWedgeClippedChordCopies(
+  buf: Float32Array,
+  field: number,
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  i: number,
+  j: number,
+  weight: number
+): void {
+  const segment = wedgeClippedChordSegment(n, total, i, j);
+  if (!segment) return;
+  const delta = (2 * Math.PI) / total;
+  const mirrorCos = Math.cos(delta);
+  const mirrorSin = Math.sin(delta);
+  for (let k = 0; k < n; k++) {
+    const a = (2 * Math.PI * k) / n;
+    const rotCos = Math.cos(a);
+    const rotSin = Math.sin(a);
+    for (const reflected of [false, true]) {
+      const p = transformDihedralPoint(
+        segment.x1,
+        segment.y1,
+        rotCos,
+        rotSin,
+        mirrorCos,
+        mirrorSin,
+        reflected
+      );
+      const q = transformDihedralPoint(
+        segment.x2,
+        segment.y2,
+        rotCos,
+        rotSin,
+        mirrorCos,
+        mirrorSin,
+        reflected
+      );
+      depositUnitSegment(buf, field, viewport, p.x, p.y, q.x, q.y, weight);
+    }
+  }
+}
+
+function dihedralWedgeClippedChordIntersectsYankelovichViewport(
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  i: number,
+  j: number
+): boolean {
+  const segment = wedgeClippedChordSegment(n, total, i, j);
+  if (!segment) return false;
+  const delta = (2 * Math.PI) / total;
+  const mirrorCos = Math.cos(delta);
+  const mirrorSin = Math.sin(delta);
+  for (let k = 0; k < n; k++) {
+    const a = (2 * Math.PI * k) / n;
+    const rotCos = Math.cos(a);
+    const rotSin = Math.sin(a);
+    for (const reflected of [false, true]) {
+      const p = transformDihedralPoint(
+        segment.x1,
+        segment.y1,
+        rotCos,
+        rotSin,
+        mirrorCos,
+        mirrorSin,
+        reflected
+      );
+      const q = transformDihedralPoint(
+        segment.x2,
+        segment.y2,
+        rotCos,
+        rotSin,
+        mirrorCos,
+        mirrorSin,
+        reflected
+      );
+      if (segmentIntersectsYankelovichViewport(viewport, p.x, p.y, q.x, q.y)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 interface YankelovichChordCandidate {
@@ -3208,6 +3548,185 @@ function yankelovichFieldExact(
     timings.matrixEdges = matrixEdges;
   }
 
+  if (direct) return acc;
+  return symmetrizeYankelovichAccumulator(n, total, field, acc, viewport, timings);
+}
+
+/**
+ * Random Dₙ-symmetric matching control: sample source representatives from the
+ * fundamental sector and pair them with distinct random endpoints, then apply
+ * the same Dₙ field composite used by the Zaks analytic renderer.
+ */
+function yankelovichFieldRandomDihedral(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  return yankelovichFieldRandomDihedralBase(
+    n,
+    field,
+    hiddenGenerators,
+    false,
+    sampleCount,
+    sampleSeed,
+    viewport,
+    timings
+  );
+}
+
+function yankelovichFieldWedgeClippedDihedral(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  return yankelovichFieldRandomDihedralBase(
+    n,
+    field,
+    hiddenGenerators,
+    true,
+    sampleCount,
+    sampleSeed,
+    viewport,
+    timings
+  );
+}
+
+function yankelovichFieldRandomDihedralBase(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  wedgeClipped: boolean,
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const acc = new Float32Array(field * field);
+  const hidden = hiddenGeneratorSet(hiddenGenerators);
+  if (hidden && hidden.has(1)) {
+    if (timings) {
+      timings.matrixMs = 0;
+      timings.matrixEdges = 0;
+      timings.viewportMs = 0;
+      timings.visibleVertices = 0;
+    }
+    return acc;
+  }
+
+  const total = factorial(n);
+  const B = factorial(n - 1);
+  const sectorVertices = yankelovichDihedralSectorVertexCount(n);
+  const direct = !isFullYankelovichViewport(viewport);
+  const rng = makeYankelovichRng(sampleSeed);
+  const samples = Math.max(1, Math.round(sampleCount));
+  const maxAttempts = direct
+    ? Math.min(
+        YANKELOVICH_VISIBLE_SAMPLE_MAX_ATTEMPTS,
+        Math.max(samples, samples * YANKELOVICH_VISIBLE_SAMPLE_MAX_ATTEMPT_FACTOR)
+      )
+    : samples * 4;
+  const usedSources = new Set<number>();
+  const usedVertices = new Set<number>();
+  const candidates: YankelovichChordCandidate[] = [];
+
+  const findT0 = performance.now();
+  let matrixEdges = 0;
+  let attempts = 0;
+  while (matrixEdges < samples && attempts < maxAttempts) {
+    attempts++;
+    const i = Math.floor(rng() * sectorVertices);
+    if (usedSources.has(i) || usedVertices.has(i)) continue;
+
+    let j = Math.floor(rng() * total);
+    let targetAttempts = 0;
+    while ((j === i || usedVertices.has(j)) && targetAttempts < 20) {
+      j = Math.floor(rng() * total);
+      targetAttempts++;
+    }
+    if (j === i || usedVertices.has(j)) continue;
+    if (wedgeClipped && !wedgeClippedChordSegment(n, total, i, j)) continue;
+
+    if (direct) {
+      const visible = wedgeClipped
+        ? dihedralWedgeClippedChordIntersectsYankelovichViewport(
+            viewport,
+            n,
+            total,
+            i,
+            j
+          )
+        : dihedralChordIntersectsYankelovichViewport(
+            viewport,
+            n,
+            total,
+            B,
+            i,
+            j
+          );
+      if (!visible) continue;
+    }
+
+    usedSources.add(i);
+    usedVertices.add(i);
+    usedVertices.add(j);
+    if (direct) {
+      candidates.push({ i, j, weight: 1 });
+    } else if (wedgeClipped) {
+      depositWedgeClippedChord(acc, field, viewport, n, total, i, j, 1);
+    } else {
+      depositChord(acc, field, viewport, total, i, j, 1);
+    }
+    matrixEdges++;
+  }
+
+  if (timings) {
+    timings.viewportMs = direct ? performance.now() - findT0 : 0;
+    timings.visibleVertices = direct ? candidates.length : sectorVertices;
+  }
+
+  const matrixT0 = performance.now();
+  if (direct) {
+    for (const candidate of candidates) {
+      if (wedgeClipped) {
+        depositDihedralWedgeClippedChordCopies(
+          acc,
+          field,
+          viewport,
+          n,
+          total,
+          candidate.i,
+          candidate.j,
+          candidate.weight
+        );
+      } else {
+        depositDihedralChordCopies(
+          acc,
+          field,
+          viewport,
+          n,
+          total,
+          B,
+          candidate.i,
+          candidate.j,
+          candidate.weight
+        );
+      }
+    }
+  }
+  if (timings) {
+    timings.matrixMs = direct
+      ? performance.now() - matrixT0
+      : performance.now() - findT0;
+    timings.matrixEdges = matrixEdges;
+  }
   if (direct) return acc;
   return symmetrizeYankelovichAccumulator(n, total, field, acc, viewport, timings);
 }
@@ -4094,19 +4613,11 @@ export function toSVG(opts: SvgOpts): string {
 /* ------------------------------- symmetry --------------------------------- */
 
 /**
- * Presets whose layout has an exact n-fold rotational symmetry that the
- * Symmetry renderer can exploit. Both Zaks orderings (the greedy smallest-flip
- * walk and the explicit recursion) split into n consecutive blocks of (n-1)!
- * permutations sharing a leading symbol, and the whole edge set is invariant
- * under a shift of one block — i.e. a 360/n rotation. (Verified empirically for
- * every generator rₖ and for the edge parity, so hidden-generator and parity
- * filtering stay exact.)
+ * Presets whose layout has the exact Dₙ symmetry that the Symmetry renderer can
+ * exploit. This is intentionally limited to the greedy Pancake Zaks layout.
  */
 export function supportsSymmetry(graph: Pick<PancakeGraph, "preset">): boolean {
-  return (
-    graph.preset === "pancake-zaks" ||
-    graph.preset === "pancake-zaks-recursive"
-  );
+  return graph.preset === "pancake-zaks";
 }
 
 /**

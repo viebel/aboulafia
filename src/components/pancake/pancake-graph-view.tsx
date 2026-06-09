@@ -8,6 +8,11 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  AngleWhiteCharts,
+  CircularAutocorrelationChart,
+} from "@/components/analysis/analysis-view";
+import { LineSpaceView } from "@/components/analysis/line-space-view";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
@@ -22,6 +27,8 @@ import { Slider } from "@/components/ui/slider";
 import {
   asymmetricTreeCompressionFactor,
   buildPancakeGraph,
+  buildRandomDihedralSamplingGraph,
+  buildWedgeClippedDihedralSamplingGraph,
   buildZaksSymmetryGraph,
   buildZaksSamplingGraph,
   buildQuotientGraph,
@@ -79,6 +86,10 @@ import {
   readNonNegIntParam,
   writeUrlParams,
 } from "@/lib/url-state";
+import {
+  buildPancakeGraphLineSpace,
+  type LineSpace,
+} from "@/lib/radon-space";
 import { formatUiNumber } from "@/lib/utils";
 import {
   Download,
@@ -112,13 +123,23 @@ function yankelovichDihedralSectorVertexCount(n: number): number {
   return Math.max(1, Math.floor(factorial(n - 1) / 2));
 }
 
-function clampYankelovichSampleCount(count: number, n: number): number {
+function yankelovichSampleMax(n: number, preset: GraphPreset): number {
+  return usesAnalyticYankelovich(preset)
+    ? yankelovichDihedralSectorVertexCount(n)
+    : Math.max(1, graphEdgeCount(n, preset));
+}
+
+function clampYankelovichSampleCount(
+  count: number,
+  n: number,
+  preset: GraphPreset
+): number {
   const fallback = Math.min(
     YANKELOVICH_DEFAULT_SAMPLE_COUNT,
-    yankelovichDihedralSectorVertexCount(n)
+    yankelovichSampleMax(n, preset)
   );
   const parsed = Number.isFinite(count) ? Math.round(count) : fallback;
-  return Math.max(1, Math.min(yankelovichDihedralSectorVertexCount(n), parsed));
+  return Math.max(1, Math.min(yankelovichSampleMax(n, preset), parsed));
 }
 
 function secondsLabel(ms: number): string {
@@ -127,6 +148,13 @@ function secondsLabel(ms: number): string {
 
 function degreesLabel(value: number): string {
   return `${Number(value.toFixed(2)).toString()}°`;
+}
+
+function formatHistogramPercentage(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0%";
+  if (value < 0.1) return "<0.1%";
+  if (value < 10) return `${Number(value.toFixed(1)).toString()}%`;
+  return `${Math.round(value)}%`;
 }
 
 function yankelovichPhaseTimings(
@@ -144,7 +172,9 @@ function yankelovichPhaseTimings(
         ]
       : []),
     { id: "matrix", label: "Matrix", elapsedMs: field.matrixMs },
-    { id: "symmetries", label: "Symmetries", elapsedMs: field.symmetryMs },
+    ...(field.symmetryMs > 0
+      ? [{ id: "symmetries", label: "Symmetries", elapsedMs: field.symmetryMs }]
+      : []),
     { id: "canvas", label: "Canvas", elapsedMs: canvasMs },
   ];
 }
@@ -201,10 +231,19 @@ function defaultHiddenGenerators(graph: PancakeGraph): number[] {
 }
 type NValue = number;
 
+interface JumpHistogramBin {
+  minJump: number;
+  maxJump: number;
+  count: number;
+}
+
 const GRAPH_PRESETS: GraphPreset[] = [
   "pancake-zaks",
+  "random-dihedral",
+  "wedge-clipped-dihedral",
   "pancake-zaks-recursive",
   "pancake-williams",
+  "aes-powers",
   "complete",
   "cayley-complete",
   "star",
@@ -216,6 +255,7 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "kaleidoscope",
   "lexicographic",
   "hypercube",
+  "feistel",
   "sliding-puzzle",
   "simplex",
   "sierpinski",
@@ -230,9 +270,20 @@ type Renderer =
   | "yankelovich"
   | "sampled";
 
-/** The Yankelovich density-field renderer relies on the exact Zaks layout. */
 function supportsYankelovich(preset: GraphPreset): boolean {
-  return preset === "pancake-zaks";
+  return GRAPH_PRESETS.includes(preset);
+}
+
+function usesAnalyticYankelovich(preset: GraphPreset): boolean {
+  return (
+    preset === "pancake-zaks" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral"
+  );
+}
+
+function requiresYankelovich(preset: GraphPreset): boolean {
+  return preset === "random-dihedral" || preset === "wedge-clipped-dihedral";
 }
 
 /**
@@ -259,7 +310,7 @@ const YANKELOVICH_NOISE_FLOOR_OPTIONS: readonly number[] = Array.from(
   { length: 20 },
   (_, i) => i * 5
 );
-const YANKELOVICH_DEFAULT_SAMPLE_COUNT = 100_000;
+const YANKELOVICH_DEFAULT_SAMPLE_COUNT = 50_000;
 const YANKELOVICH_SAMPLE_COUNT_STEP = 50_000;
 
 // Like Yankelovich's "Random vertices", the sampled-lines count is the number
@@ -289,10 +340,11 @@ const YANKELOVICH_TONES: readonly YankelovichTone[] = [
   "equalize",
   "clahe",
 ];
+const YANKELOVICH_DEFAULT_TONE: YankelovichTone = "clahe";
 const YANKELOVICH_TONE_LABELS: Record<YankelovichTone, string> = {
-  log: "Log (default)",
+  log: "Log",
   equalize: "Equalize",
-  clahe: "CLAHE (local)",
+  clahe: "CLAHE (local, default)",
 };
 const YANKELOVICH_COLORMAPS: readonly YankelovichColormap[] = [
   "gray",
@@ -309,7 +361,7 @@ const YANKELOVICH_COLORMAP_LABELS: Record<YankelovichColormap, string> = {
 
 /** Highest n offered for a given preset + renderer combination. */
 function maxNForRenderer(preset: GraphPreset, renderer: Renderer): number {
-  if (renderer === "yankelovich" && supportsYankelovich(preset)) {
+  if (renderer === "yankelovich" && usesAnalyticYankelovich(preset)) {
     return YANKELOVICH_MAX_N;
   }
   if (renderer === "sampled" && supportsSampledLines(preset)) {
@@ -497,6 +549,7 @@ function readGraphState(params: URLSearchParams | null): GraphState {
   const preset = readEnumParam(params, "g", GRAPH_PRESETS, "pancake-zaks");
 
   let renderer = readEnumParam(params, "r", RENDERERS, "svg");
+  if (requiresYankelovich(preset)) renderer = "yankelovich";
   if (renderer === "quotient" && !supportsQuotient(preset)) renderer = "svg";
   if (renderer === "symmetry" && !supportsSymmetry({ preset })) renderer = "svg";
   if (renderer === "yankelovich" && !supportsYankelovich(preset)) renderer = "svg";
@@ -555,7 +608,12 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     ),
     yankelovichBinary: readEnumParam(params, "yb", ["0", "1"], "0") === "1",
     yankelovichInvert: readEnumParam(params, "yi", ["0", "1"], "0") === "1",
-    yankelovichTone: readEnumParam(params, "yt", YANKELOVICH_TONES, "log"),
+    yankelovichTone: readEnumParam(
+      params,
+      "yt",
+      YANKELOVICH_TONES,
+      YANKELOVICH_DEFAULT_TONE
+    ),
     yankelovichColormap: readEnumParam(
       params,
       "ycm",
@@ -564,7 +622,8 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     ),
     yankelovichSampleCount: clampYankelovichSampleCount(
       readNonNegIntParam(params, "ysc", YANKELOVICH_DEFAULT_SAMPLE_COUNT),
-      n
+      n,
+      preset
     ),
     yankelovichSampleSeed: readNonNegIntParam(params, "yseed", 0),
     sampledRepCount: clampSampledRepCount(
@@ -615,6 +674,9 @@ export function PancakeGraphView() {
     culled: boolean;
   } | null>(null);
   const [yankelovichTotalMs, setYankelovichTotalMs] = useState<number | null>(null);
+  const [radonAnalysis, setRadonAnalysis] = useState<LineSpace | null>(null);
+  const [radonComputing, setRadonComputing] = useState(false);
+  const [radonSeedWedgeOnly, setRadonSeedWedgeOnly] = useState(false);
 
   const [settings, setSettings] = useState<RenderSettings>({
     alpha: initial.alpha,
@@ -724,13 +786,14 @@ export function PancakeGraphView() {
   // is active we build the lightweight payload instead (and rebuild the full
   // graph lazily if the user switches to a graph-dependent renderer).
   const symmetryLite = preset === "pancake-zaks" && renderer === "symmetry";
-  // The Yankelovich density field is built straight from the Zaks recursion too,
-  // so it shares the lightweight O((n-1)!) build path (no full n! graph).
+  // Analytic Dₙ Yankelovich presets avoid materializing the n! graph.
+  const analyticYankelovich =
+    usesAnalyticYankelovich(preset) && renderer === "yankelovich";
   const yankelovich = supportsYankelovich(preset) && renderer === "yankelovich";
   // The sampled-lines renderer also draws straight from the Zaks recursion (it
   // samples chords analytically), so it uses the same lightweight build path.
   const sampledLines = supportsSampledLines(preset) && renderer === "sampled";
-  const liteBuild = symmetryLite || yankelovich || sampledLines;
+  const liteBuild = symmetryLite || analyticYankelovich || sampledLines;
   // Vector renders above this many segments are slow enough to be worth a
   // visible "Rendering…" phase; smaller ones draw synchronously to keep slider
   // tweaks snappy and flicker-free. Symmetry only emits a 1/n sector.
@@ -748,7 +811,8 @@ export function PancakeGraphView() {
   );
   const yankelovichSampleCount = clampYankelovichSampleCount(
     yankelovichSampleDraftCount,
-    n
+    n,
+    preset
   );
   const sampledRepCount = clampSampledRepCount(
     settings.sampledRepCount ?? SAMPLED_REPS_DEFAULT,
@@ -812,7 +876,8 @@ export function PancakeGraphView() {
       yb: settings.yankelovichBinary ? "1" : null,
       yi: settings.yankelovichInvert ? "1" : null,
       yt:
-        (settings.yankelovichTone ?? "log") !== "log"
+        (settings.yankelovichTone ?? YANKELOVICH_DEFAULT_TONE) !==
+        YANKELOVICH_DEFAULT_TONE
           ? settings.yankelovichTone
           : null,
       ycm:
@@ -942,9 +1007,13 @@ export function PancakeGraphView() {
           // sector is too large to materialize; the Yankelovich renderer samples
           // chords analytically, so hand it the O(n²) sampling payload instead.
           const g =
-            (yankelovich || sampledLines) && factorial(n - 1) > 4_000_000
-              ? buildZaksSamplingGraph(n)
-              : buildZaksSymmetryGraph(n);
+            preset === "random-dihedral"
+              ? buildRandomDihedralSamplingGraph(n)
+              : preset === "wedge-clipped-dihedral"
+                ? buildWedgeClippedDihedralSamplingGraph(n)
+                : (yankelovich || sampledLines) && factorial(n - 1) > 4_000_000
+                  ? buildZaksSamplingGraph(n)
+                  : buildZaksSymmetryGraph(n);
           if (signal.aborted) return;
           finishPhase();
           setGraph(g);
@@ -959,7 +1028,7 @@ export function PancakeGraphView() {
             vertices: graphVertexCount(n, preset),
             cayleyEdges: graphEdgeCount(n, preset),
             cycleEdges: factorial(n),
-            rnEdges: n,
+            rnEdges: preset === "pancake-zaks" ? n : 0,
             evenEdges: g.evenEdgeCount,
             oddEdges: g.oddEdgeCount,
             elapsedMs: Math.round(performance.now() - t0),
@@ -1349,8 +1418,9 @@ export function PancakeGraphView() {
     };
   }, [symmetryLite, graph, settings, stageSize, zoom, pan.x, pan.y, showRenderProgress]);
 
-  // Yankelovich density-field renderer (pancake-zaks only). Redraw can bind the
-  // matrix to the current zoom window; zoom/pan alone still repaints inline.
+  // Yankelovich density-field renderer. Pancake Zaks uses the analytic Dₙ field;
+  // other graphs sample their materialized edges. Redraw can bind the matrix to
+  // the current zoom window; zoom/pan alone still repaints inline.
   useEffect(() => {
     if (!yankelovich) return;
     if (running) return;
@@ -1377,6 +1447,7 @@ export function PancakeGraphView() {
     const draw = () => {
       drawYankelovichToCanvas(ctx, {
         n,
+        graph: graph ?? undefined,
         settings,
         cssWidth: width,
         cssHeight: height,
@@ -1398,6 +1469,7 @@ export function PancakeGraphView() {
       yankelovichCacheRef.current?.key ===
       yankelovichFieldKey({
         n,
+        graph: graph ?? undefined,
         settings,
         cssWidth: width,
         cssHeight: height,
@@ -1464,6 +1536,7 @@ export function PancakeGraphView() {
         };
         ensureYankelovichField({
           n,
+          graph: graph ?? undefined,
           settings,
           cssWidth: width,
           cssHeight: height,
@@ -1516,6 +1589,7 @@ export function PancakeGraphView() {
     running,
     n,
     preset,
+    graph,
     settings,
     stageSize,
     zoom,
@@ -1663,6 +1737,7 @@ export function PancakeGraphView() {
           const exportZoom = 1 / visible.scale;
           drawYankelovichToCanvas(ctx, {
             n: graph.n,
+            graph,
             settings,
             cssWidth: svgExportSize,
             cssHeight: svgExportSize,
@@ -1750,7 +1825,7 @@ export function PancakeGraphView() {
 
   const setYankelovichDraftStep = (delta: number) => {
     setYankelovichSampleDraftCount((value) =>
-      clampYankelovichSampleCount(value + delta, n)
+      clampYankelovichSampleCount(value + delta, n, preset)
     );
   };
 
@@ -1784,6 +1859,25 @@ export function PancakeGraphView() {
     setYankelovichFieldViewport(currentYankelovichViewport());
   };
 
+  const generateRadonAnalysis = useCallback(() => {
+    if (!graph || radonComputing) return;
+    if (graph.preset === "pancake-zaks" && graph.n > 10) return;
+    setRadonComputing(true);
+    setStatus("Computing Radon space…");
+    window.setTimeout(() => {
+      try {
+        const analysis = buildPancakeGraphLineSpace(graph);
+        setRadonAnalysis(analysis);
+        setStatus("Ready.");
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setStatus(`Radon space error: ${msg}`);
+      } finally {
+        setRadonComputing(false);
+      }
+    }, 30);
+  }, [graph, radonComputing]);
+
   const resetViewForGraph = (nextN: number, nextPreset: GraphPreset) => {
     // Switching graph or n changes the whole layout, so any prior
     // zoom/pan no longer makes sense — snap the view back to fit.
@@ -1791,6 +1885,8 @@ export function PancakeGraphView() {
     setPan({ x: 0, y: 0 });
     initialYankelovichFieldViewportRef.current = null;
     setYankelovichFieldViewport(null);
+    setRadonAnalysis(null);
+    setRadonSeedWedgeOnly(false);
 
     // Edge density changes too, so move the strength/width sliders to a
     // density-appropriate recommendation for the new graph. The sampled-lines
@@ -1800,12 +1896,20 @@ export function PancakeGraphView() {
       renderer === "sampled" && supportsSampledLines(nextPreset)
         ? { alpha: 100, width: 50 }
         : recommendedEdgeSliders(nextN, nextPreset);
+    const nextYankelovichSampleCount = clampYankelovichSampleCount(
+      YANKELOVICH_DEFAULT_SAMPLE_COUNT,
+      nextN,
+      nextPreset
+    );
     setSettings((s) => ({
       ...s,
       alpha: rec.alpha,
       width: rec.width,
       vertexOrbitLevel: nextN,
+      yankelovichSampleCount: nextYankelovichSampleCount,
+      sampledRepCount: clampSampledRepCount(SAMPLED_REPS_DEFAULT, nextN),
     }));
+    setYankelovichSampleDraftCount(nextYankelovichSampleCount);
 
     // Reset the quotient depth to the new graph's best default.
     setQuotientDepth(defaultQuotientDepth(nextN, nextPreset));
@@ -1819,7 +1923,11 @@ export function PancakeGraphView() {
 
   const selectPreset = (value: string) => {
     const nextPreset = value as GraphPreset;
-    const nextN = Math.min(DEFAULT_N, graphMaxN(nextPreset)) as NValue;
+    const nextRenderer = requiresYankelovich(nextPreset) ? "yankelovich" : renderer;
+    const nextN = Math.min(
+      DEFAULT_N,
+      maxNForRenderer(nextPreset, nextRenderer)
+    ) as NValue;
     // The quotient view only applies to full-permutation graphs; fall back to
     // Canvas when the new family does not support it.
     if (renderer === "quotient" && !supportsQuotient(nextPreset)) {
@@ -1829,9 +1937,8 @@ export function PancakeGraphView() {
     if (renderer === "symmetry" && !supportsSymmetry({ preset: nextPreset })) {
       setRenderer("svg");
     }
-    // The Yankelovich density field is built only for the Zaks pancake layout.
-    if (renderer === "yankelovich" && !supportsYankelovich(nextPreset)) {
-      setRenderer("svg");
+    if (requiresYankelovich(nextPreset)) {
+      setRenderer("yankelovich");
     }
     setPreset(nextPreset);
     // Switching graph family resets n to the default, clamped to the new
@@ -1993,6 +2100,46 @@ export function PancakeGraphView() {
       (a, b) => a.minDegrees - b.minDegrees
     );
   }, [graph, settings.hiddenGenerators]);
+  const selectedJumpHistogram = useMemo<JumpHistogramBin[]>(() => {
+    if (!graph || !metrics) return [];
+    const hidden = new Set(settings.hiddenGenerators);
+    const vertexCount = metrics.vertices;
+    const maxJump = Math.max(1, Math.floor(vertexCount / 2));
+
+    if (graph.edges.length > 0 && graph.path.length > 0) {
+      const binCount = Math.min(32, Math.max(1, maxJump));
+      const counts = new Array<number>(binCount).fill(0);
+      for (let t = 0; t < graph.edges.length; t += 3) {
+        if (hidden.has(graph.edges[t + 2])) continue;
+        const raw = Math.abs(graph.edges[t + 1] - graph.edges[t]);
+        const jump = Math.min(raw, vertexCount - raw);
+        const index = Math.min(
+          binCount - 1,
+          Math.floor(((Math.max(1, jump) - 1) / maxJump) * binCount)
+        );
+        counts[index]++;
+      }
+      return counts
+        .map((count, index) => ({
+          minJump: Math.floor((index / binCount) * maxJump) + 1,
+          maxJump: Math.max(
+            Math.floor(((index + 1) / binCount) * maxJump),
+            Math.floor((index / binCount) * maxJump) + 1
+          ),
+          count,
+        }))
+        .filter((bin) => bin.count > 0);
+    }
+
+    return selectedDistanceHistogram.map((bin) => ({
+      minJump: Math.max(1, Math.floor((bin.minDegrees / 180) * maxJump) + 1),
+      maxJump: Math.max(
+        1,
+        Math.floor((bin.maxDegrees / 180) * maxJump)
+      ),
+      count: bin.count,
+    }));
+  }, [graph, metrics, selectedDistanceHistogram, settings.hiddenGenerators]);
   const selectedGeneratorCount = useMemo(() => {
     if (!graph) return 0;
     const hidden = new Set(settings.hiddenGenerators);
@@ -2177,6 +2324,8 @@ export function PancakeGraphView() {
   };
 
   const stepTimings = yankelovich ? yankelovichTimings : (metrics?.timings ?? []);
+  const canGenerateRadon =
+    !!graph && (graph.preset !== "pancake-zaks" || graph.n <= 10);
 
   return (
     <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
@@ -2366,6 +2515,7 @@ export function PancakeGraphView() {
               <RadioGroup
                 value={activeRenderer}
                 onValueChange={(v) => {
+                  if (requiresYankelovich(preset) && v !== "yankelovich") return;
                   if (v === "svg" && !canUseInteractiveSvg) return;
                   if (v === "quotient" && !supportsQuotient(preset)) return;
                   if (v === "symmetry" && !supportsSymmetry({ preset })) return;
@@ -2394,17 +2544,19 @@ export function PancakeGraphView() {
                   value="svg"
                   label="SVG"
                   checked={activeRenderer === "svg"}
-                  disabled={!canUseInteractiveSvg}
+                  disabled={!canUseInteractiveSvg || requiresYankelovich(preset)}
                 />
                 <RendererRadio
                   value="canvas"
                   label="Canvas"
                   checked={activeRenderer === "canvas"}
+                  disabled={requiresYankelovich(preset)}
                 />
                 <RendererRadio
                   value="density"
                   label="Density"
                   checked={activeRenderer === "density"}
+                  disabled={requiresYankelovich(preset)}
                 />
                 <RendererRadio
                   value="quotient"
@@ -2829,7 +2981,9 @@ export function PancakeGraphView() {
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-                    Random vertices
+                    {sampledLines || usesAnalyticYankelovich(preset)
+                      ? "Random vertices"
+                      : "Random edges"}
                   </Label>
                   <span className="font-mono text-xs text-muted-foreground">
                     {formatUiNumber(
@@ -2837,13 +2991,15 @@ export function PancakeGraphView() {
                     )}
                   </span>
                 </div>
-                <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>Angular sector</span>
-                  <span className="font-mono">
-                    {formatUiNumber(yankelovichDihedralSectorVertexCount(n))}{" "}
-                    · {degreesLabel(180 / n)}
-                  </span>
-                </div>
+                {sampledLines || usesAnalyticYankelovich(preset) ? (
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Angular sector</span>
+                    <span className="font-mono">
+                      {formatUiNumber(yankelovichDihedralSectorVertexCount(n))}{" "}
+                      · {degreesLabel(180 / n)}
+                    </span>
+                  </div>
+                ) : null}
                 <div className="grid grid-cols-2 gap-2">
                   <Button
                     type="button"
@@ -2889,7 +3045,7 @@ export function PancakeGraphView() {
                             yankelovichDihedralSectorVertexCount(n)
                           )
                         : yankelovichSampleCount >=
-                          yankelovichDihedralSectorVertexCount(n)
+                          yankelovichSampleMax(n, preset)
                     }
                     aria-label="More samples"
                   >
@@ -2998,7 +3154,7 @@ export function PancakeGraphView() {
                     Tone mapping
                   </Label>
                   <Select
-                    value={settings.yankelovichTone ?? "log"}
+                    value={settings.yankelovichTone ?? YANKELOVICH_DEFAULT_TONE}
                     onValueChange={(v) =>
                       setS("yankelovichTone", v as YankelovichTone)
                     }
@@ -3211,6 +3367,10 @@ export function PancakeGraphView() {
                   bins={selectedDistanceHistogram}
                   selectedGeneratorCount={selectedGeneratorCount}
                 />
+                <JumpHistogram
+                  bins={selectedJumpHistogram}
+                  selectedGeneratorCount={selectedGeneratorCount}
+                />
               </div>
             ) : null}
 
@@ -3404,9 +3564,74 @@ export function PancakeGraphView() {
           )}
         </div>
       </Card>
+      <RadonSpaceCard
+        result={radonAnalysis}
+        computing={radonComputing}
+        onGenerate={generateRadonAnalysis}
+        disabled={!canGenerateRadon || running || isComputing || isRendering}
+        seedWedgeOnly={radonSeedWedgeOnly}
+        setSeedWedgeOnly={setRadonSeedWedgeOnly}
+      />
       {showOrbitTable ? <OrbitTable orbits={orbitTable} n={n} /> : null}
       </div>
     </div>
+  );
+}
+
+function RadonSpaceCard({
+  result,
+  computing,
+  onGenerate,
+  disabled,
+  seedWedgeOnly,
+  setSeedWedgeOnly,
+}: {
+  result: LineSpace | null;
+  computing: boolean;
+  onGenerate: () => void;
+  disabled: boolean;
+  seedWedgeOnly: boolean;
+  setSeedWedgeOnly: (value: boolean) => void;
+}) {
+  return (
+    <Card>
+      <CardHeader className="space-y-1">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <CardTitle className="text-base">Radon space</CardTitle>
+            <CardDescription>Dual chord coordinates.</CardDescription>
+          </div>
+          <Button
+            type="button"
+            variant={result ? "outline" : "default"}
+            size="sm"
+            onClick={onGenerate}
+            disabled={disabled || computing}
+          >
+            {computing ? <Loader2 className="size-3.5 animate-spin" /> : null}
+            {result ? "Regenerate" : "Generate charts"}
+          </Button>
+        </div>
+      </CardHeader>
+      {result ? (
+        <CardContent className="space-y-4">
+          <LineSpaceView
+            lineSpace={result}
+            orderLabel="graph"
+            showRasterLayer
+          />
+          <AngleWhiteCharts
+            lineSpace={result}
+            seedWedgeOnly={seedWedgeOnly}
+            setSeedWedgeOnly={setSeedWedgeOnly}
+          />
+          <CircularAutocorrelationChart
+            lineSpace={result}
+            seedWedgeOnly={seedWedgeOnly}
+          />
+        </CardContent>
+      ) : null}
+    </Card>
   );
 }
 
@@ -3737,10 +3962,13 @@ function DistanceHistogram({
         <div className="space-y-1">
           {bins.map((bin) => {
             const width = maxCount === 0 ? 0 : (bin.count / maxCount) * 100;
+            const percentage =
+              totalEdges === 0 ? 0 : (bin.count / totalEdges) * 100;
             return (
               <div
                 key={bin.minDegrees}
                 className="grid grid-cols-[4.5rem_minmax(0,1fr)_4rem] items-center gap-2 text-[10px]"
+                title={`${formatUiNumber(bin.count)} edges`}
               >
                 <span className="font-mono text-muted-foreground">
                   {bin.minDegrees}–{bin.maxDegrees}°
@@ -3752,7 +3980,7 @@ function DistanceHistogram({
                   />
                 </div>
                 <span className="text-right font-mono text-muted-foreground">
-                  {formatUiNumber(bin.count)}
+                  {formatHistogramPercentage(percentage)}
                 </span>
               </div>
             );
@@ -3761,6 +3989,76 @@ function DistanceHistogram({
       )}
     </div>
   );
+}
+
+function JumpHistogram({
+  bins,
+  selectedGeneratorCount,
+}: {
+  bins: JumpHistogramBin[];
+  selectedGeneratorCount: number;
+}) {
+  const maxCount = bins.reduce((max, bin) => Math.max(max, bin.count), 0);
+  const totalEdges = bins.reduce((sum, bin) => sum + bin.count, 0);
+
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <h3 className="text-xs font-medium">Edge jump histogram</h3>
+          <p className="text-[10px] text-muted-foreground">
+            circular index jumps · selected generators only
+          </p>
+        </div>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {selectedGeneratorCount} gen · {formatUiNumber(totalEdges)} edges
+        </span>
+      </div>
+
+      {selectedGeneratorCount === 0 ? (
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          Select at least one generator to see edge jumps.
+        </p>
+      ) : bins.length === 0 ? (
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          No edge jump data for the selected generators.
+        </p>
+      ) : (
+        <div className="space-y-1">
+          {bins.map((bin) => {
+            const width = maxCount === 0 ? 0 : (bin.count / maxCount) * 100;
+            const percentage =
+              totalEdges === 0 ? 0 : (bin.count / totalEdges) * 100;
+            return (
+              <div
+                key={`${bin.minJump}-${bin.maxJump}`}
+                className="grid grid-cols-[5.75rem_minmax(0,1fr)_4rem] items-center gap-2 text-[10px]"
+                title={`${formatUiNumber(bin.count)} edges`}
+              >
+                <span className="font-mono text-muted-foreground">
+                  {formatJumpRange(bin)}
+                </span>
+                <div className="h-2 overflow-hidden rounded-full bg-background">
+                  <div
+                    className="h-full rounded-full bg-primary/70"
+                    style={{ width: `${width}%` }}
+                  />
+                </div>
+                <span className="text-right font-mono text-muted-foreground">
+                  {formatHistogramPercentage(percentage)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatJumpRange(bin: JumpHistogramBin): string {
+  if (bin.minJump === bin.maxJump) return formatUiNumber(bin.minJump);
+  return `${formatUiNumber(bin.minJump)}–${formatUiNumber(bin.maxJump)}`;
 }
 
 function FieldHistogram({

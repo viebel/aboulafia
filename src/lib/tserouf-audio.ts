@@ -14,9 +14,18 @@
 // The same synthesis powers both live playback (TseroufPlayer) and offline
 // rendering to a downloadable WAV (renderTseroufWav).
 
-// Minor-pentatonic degrees from the root (A C D E G A' C' ...), warm and
-// consonant in any permutation order. Letter a -> degree 0, b -> 1, ...
-export const TSEROUF_SCALE_OFFSETS = [0, 3, 5, 7, 10, 12, 15] as const;
+export type TseroufScalePresetId = "hebrew-tetrachord" | "minor-pentatonic";
+
+export const TSEROUF_SCALE_PRESETS: {
+  id: TseroufScalePresetId;
+  label: string;
+  offsets: readonly number[];
+}[] = [
+  { id: "hebrew-tetrachord", label: "Hebrew tetrachord", offsets: [0, 1, 4, 5] },
+  { id: "minor-pentatonic", label: "Minor pentatonic", offsets: [0, 3, 5, 7, 10] },
+];
+export const DEFAULT_TSEROUF_SCALE_ID: TseroufScalePresetId = "hebrew-tetrachord";
+export const TSEROUF_SCALE_OFFSETS = TSEROUF_SCALE_PRESETS[0].offsets;
 export const TSEROUF_ROOT_MIDI = 57; // A3 — a comfortable classical-guitar register.
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -32,9 +41,22 @@ export interface TseroufMelodicTone {
   label: string;
 }
 
-export function tseroufMelodicTone(letter: string): TseroufMelodicTone {
+function scaleOffsetForLetterIndex(
+  letterIndex: number,
+  scaleOffsets: readonly number[]
+): number {
+  const offsets = scaleOffsets.length > 0 ? scaleOffsets : TSEROUF_SCALE_OFFSETS;
+  const degree = ((letterIndex % offsets.length) + offsets.length) % offsets.length;
+  const octave = Math.floor(letterIndex / offsets.length);
+  return offsets[degree] + octave * 12;
+}
+
+export function tseroufMelodicTone(
+  letter: string,
+  scaleOffsets: readonly number[] = TSEROUF_SCALE_OFFSETS
+): TseroufMelodicTone {
   const letterIndex = letter.charCodeAt(0) - 97;
-  const semitone = TSEROUF_SCALE_OFFSETS[letterIndex] ?? letterIndex * 2;
+  const semitone = scaleOffsetForLetterIndex(letterIndex, scaleOffsets);
   const midi = TSEROUF_ROOT_MIDI + semitone;
   const octave = Math.floor(midi / 12) - 1;
   return {
@@ -53,8 +75,11 @@ export function clampStartIndex(index: number | undefined, length: number): numb
   return Math.max(0, Math.min(Math.floor(index), length - 1));
 }
 
-function letterToFreq(letter: string): number {
-  return tseroufMelodicTone(letter).frequency;
+function letterToFreq(
+  letter: string,
+  scaleOffsets: readonly number[] = TSEROUF_SCALE_OFFSETS
+): number {
+  return tseroufMelodicTone(letter, scaleOffsets).frequency;
 }
 
 function isEvenPermutation(word: string): boolean {
@@ -107,6 +132,7 @@ export interface TseroufPlayOptions {
   loop?: boolean;
   instrument?: InstrumentId;
   playbackStyle?: TseroufPlaybackStyle;
+  scaleOffsets?: readonly number[];
   rhythmVolume?: number;
   // Index of the word to start playback from (defaults to 0). Lets the UI
   // jump into the piece at a clicked word.
@@ -122,6 +148,7 @@ export interface TseroufRenderOptions {
   stepSeconds?: number;
   instrument?: InstrumentId;
   playbackStyle?: TseroufPlaybackStyle;
+  scaleOffsets?: readonly number[];
   rhythmVolume?: number;
   loopCount?: number;
   loopStartIndex?: number;
@@ -990,6 +1017,7 @@ function scheduleWord(
   idx: number,
   startTime: number,
   stepSeconds: number,
+  scaleOffsets: readonly number[],
   options: { previousWord?: string; wrapsToStart?: boolean } = {}
 ): { advance: number; end: number } {
   const note = notes[idx];
@@ -1150,7 +1178,7 @@ function scheduleWord(
       pluckNote(
         synth,
         voice,
-        letterToFreq(letter),
+        letterToFreq(letter, scaleOffsets),
         t,
         velocity,
         ring,
@@ -1314,6 +1342,7 @@ function scheduleGuitarImproWord(
   idx: number,
   startTime: number,
   stepSeconds: number,
+  scaleOffsets: readonly number[],
   options: {
     wrapsToStart?: boolean;
     rhythmOriginTime?: number;
@@ -1396,7 +1425,7 @@ function scheduleGuitarImproWord(
       pluckNote(
         synth,
         voice,
-        letterToFreq(letter),
+        letterToFreq(letter, scaleOffsets),
         t,
         velocity,
         ring,
@@ -1408,13 +1437,13 @@ function scheduleGuitarImproWord(
     const next = letters[i + 1];
     // Guitaristic comments on the cell, kept inside A C D E, with rare G colour.
     if (letter === "b" && (next === "c" || phase > 0.55)) {
-      mark(pluckNote(synth, voice, letterToFreq("c"), t + letterStep * 0.42, velocity * 0.42, letterStep * 0.9, 0.018));
+      mark(pluckNote(synth, voice, letterToFreq("c", scaleOffsets), t + letterStep * 0.42, velocity * 0.42, letterStep * 0.9, 0.018));
     }
     if (letter === "d" && (next === "c" || phase > 0.5)) {
-      mark(pluckNote(synth, voice, letterToFreq("c"), t + letterStep * 0.36, velocity * 0.36, letterStep * 0.75, 0.015));
+      mark(pluckNote(synth, voice, letterToFreq("c", scaleOffsets), t + letterStep * 0.36, velocity * 0.36, letterStep * 0.75, 0.015));
     }
     if (phase > 0.58 && phase < 0.78 && i === 1 && idx % 4 === 1) {
-      mark(pluckNote(synth, voice, letterToFreq("e"), t + letterStep * 0.55, velocity * 0.26, letterStep * 1.2, 0.02));
+      mark(pluckNote(synth, voice, letterToFreq("e", scaleOffsets), t + letterStep * 0.55, velocity * 0.26, letterStep * 1.2, 0.02));
     }
   });
 
@@ -1426,7 +1455,7 @@ function scheduleGuitarImproWord(
         pluckNote(
           synth,
           voice,
-          letterToFreq(letter),
+          letterToFreq(letter, scaleOffsets),
           t,
           0.46 + 0.08 * j,
           beat * 1.35,
@@ -1478,6 +1507,7 @@ export class TseroufPlayer {
   private loop = false;
   private instrument: InstrumentId = "guitar";
   private playbackStyle: TseroufPlaybackStyle = "strict";
+  private scaleOffsets: readonly number[] = TSEROUF_SCALE_OFFSETS;
   private rhythmVolume = 1;
   private onStep?: (wordIndex: number, letterIndex?: number) => void;
   private onEnd?: () => void;
@@ -1514,6 +1544,7 @@ export class TseroufPlayer {
     this.loop = options.loop ?? false;
     if (options.instrument) this.instrument = options.instrument;
     this.playbackStyle = options.playbackStyle ?? "strict";
+    this.scaleOffsets = options.scaleOffsets ?? TSEROUF_SCALE_OFFSETS;
     this.rhythmVolume = options.rhythmVolume ?? 1;
     this.synth!.instrument = this.instrument;
     this.onStep = options.onStep;
@@ -1639,6 +1670,7 @@ export class TseroufPlayer {
               this.wordIdx,
               this.nextWordTime,
               this.stepSeconds,
+              this.scaleOffsets,
               {
                 wrapsToStart,
                 rhythmOriginTime: this.rhythmOriginTime,
@@ -1651,6 +1683,7 @@ export class TseroufPlayer {
               this.wordIdx,
               this.nextWordTime,
               this.stepSeconds,
+              this.scaleOffsets,
               {
                 previousWord:
                   this.wordIdx === 0 && this.hasLoopedToStart
@@ -1710,6 +1743,7 @@ export async function renderTseroufWav(
 ): Promise<Blob> {
   const stepSeconds = options.stepSeconds ?? 0.18;
   const playbackStyle = options.playbackStyle ?? "strict";
+  const scaleOffsets = options.scaleOffsets ?? TSEROUF_SCALE_OFFSETS;
   const rhythmVolume = options.rhythmVolume ?? 1;
   const loopCount = Math.max(1, Math.floor(options.loopCount ?? 1));
   const loopStartIndex = clampStartIndex(options.loopStartIndex, notes.length);
@@ -1758,12 +1792,12 @@ export async function renderTseroufWav(
   for (const item of plan) {
     const { advance } =
       playbackStyle === "guitar-impro"
-        ? scheduleGuitarImproWord(synth, notes, item.idx, startTime, stepSeconds, {
+        ? scheduleGuitarImproWord(synth, notes, item.idx, startTime, stepSeconds, scaleOffsets, {
             rhythmOriginTime: lead,
             rhythmVolume,
             wrapsToStart: item.wrapsToStart,
           })
-        : scheduleWord(synth, notes, item.idx, startTime, stepSeconds, {
+        : scheduleWord(synth, notes, item.idx, startTime, stepSeconds, scaleOffsets, {
             previousWord: item.previousWord,
             wrapsToStart: item.wrapsToStart,
           });

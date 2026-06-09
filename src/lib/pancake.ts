@@ -3,8 +3,8 @@
  *
  * The pancake, star, permutohedron, cyclic-adjacent, transposition, and
  * kaleidoscope graphs have every permutation of {1,…,n} as a vertex. The
- * hypercube has every n-bit string as a vertex. They differ by the generator
- * set used for edges.
+ * hypercube and Feistel graphs have every n-bit string as a vertex. They
+ * differ by the generator set used for edges.
  *
  * The simplex (Kₙ₊₁) and complete (Kₙ) graphs are tiny by comparison: their
  * vertices are single values placed on a regular polygon, joined by every
@@ -89,6 +89,9 @@ export type GraphPreset =
   | "pancake-zaks"
   | "pancake-zaks-recursive"
   | "pancake-williams"
+  | "random-dihedral"
+  | "wedge-clipped-dihedral"
+  | "aes-powers"
   | "star"
   | "permutohedron"
   | "permutahedron-compressed"
@@ -98,6 +101,7 @@ export type GraphPreset =
   | "kaleidoscope"
   | "lexicographic"
   | "hypercube"
+  | "feistel"
   | "sliding-puzzle"
   | "simplex"
   | "complete"
@@ -105,6 +109,9 @@ export type GraphPreset =
   | "sierpinski";
 export type GraphKind =
   | "pancake"
+  | "random-dihedral"
+  | "wedge-clipped-dihedral"
+  | "aes-powers"
   | "star"
   | "permutohedron"
   | "permutahedron-compressed"
@@ -114,6 +121,7 @@ export type GraphKind =
   | "kaleidoscope"
   | "lexicographic"
   | "hypercube"
+  | "feistel"
   | "sliding-puzzle"
   | "simplex"
   | "complete"
@@ -122,6 +130,29 @@ export type GraphKind =
 
 /** Number of symbols of the Sierpiński graph S(n, k); 3 = the triangle gasket. */
 const SIERPINSKI_K = 3;
+
+const AES_MIN_N = 3;
+const AES_MAX_N = 20;
+const AES_POLYNOMIALS: Record<number, number> = {
+  3: 0b1011,
+  4: 0b10011,
+  5: 0b100101,
+  6: 0b1000011,
+  7: 0b10000011,
+  8: 0x11d,
+  9: 0x211,
+  10: 0x409,
+  11: 0x805,
+  12: 0x1053,
+  13: 0x201b,
+  14: 0x402b,
+  15: 0x8003,
+  16: 0x1002d,
+  17: 0x20009,
+  18: 0x40027,
+  19: 0x80027,
+  20: 0x100009,
+};
 
 export interface PancakeCycle {
   order: PancakeOrder;
@@ -631,8 +662,9 @@ export async function buildPancakeGraph(
   signal?: AbortSignal
 ): Promise<PancakeGraph> {
   const maxN = graphMaxN(preset);
-  if (n < 2 || n > maxN) {
-    throw new Error(`n must be between 2 and ${maxN} for ${graphPresetLabel(preset)}, got ${n}`);
+  const minN = preset === "aes-powers" ? AES_MIN_N : 2;
+  if (n < minN || n > maxN) {
+    throw new Error(`n must be between ${minN} and ${maxN} for ${graphPresetLabel(preset)}, got ${n}`);
   }
   throwIfAborted(signal);
 
@@ -642,6 +674,10 @@ export async function buildPancakeGraph(
   const { path, flips } =
     preset === "hypercube"
       ? await hypercubeGrayOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
+      : preset === "feistel"
+      ? await feistelOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
+      : preset === "aes-powers"
+      ? await aesPowerCycleOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : preset === "sliding-puzzle"
       ? await slidingPuzzleOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : preset === "simplex"
@@ -698,7 +734,7 @@ export async function buildPancakeGraph(
   onProgress?.("parity", 0, total);
   const vertexParity = await computeVertexParity(
     path,
-    preset === "hypercube",
+    preset === "hypercube" || preset === "feistel" || preset === "aes-powers",
     (done, totalSteps) => onProgress?.("parity", done, totalSteps),
     signal
   );
@@ -706,6 +742,77 @@ export async function buildPancakeGraph(
 
   const generators = graphGenerators(n, preset);
   const generatorInfos = computeGeneratorInfos(n, preset, generators);
+  if (preset === "aes-powers") {
+    const edges = new Uint32Array(total * 3);
+    const coords = new Float64Array(total * 2);
+    let evenEdgeCount = 0;
+    let oddEdgeCount = 0;
+    const bins = new Uint32Array(EDGE_DISTANCE_BIN_COUNT);
+    let arcStepSum = 0;
+    const degreesPerStep = 360 / total;
+    const totalValues = 2 ** n - 1;
+
+    onProgress?.("edges", 0, total);
+    for (let i = 0; i < total; i++) {
+      const j = (i + 1) % total;
+      edges[i * 3] = i;
+      edges[i * 3 + 1] = j;
+      edges[i * 3 + 2] = 1;
+      const value = aesBitsToValue(path[i]);
+      const angle = (2 * Math.PI * (value - 1)) / totalValues;
+      coords[2 * i] = 0.98 * Math.cos(angle);
+      coords[2 * i + 1] = 0.98 * Math.sin(angle);
+
+      const rawSteps = Math.abs(j - i);
+      const arcSteps = Math.min(rawSteps, total - rawSteps);
+      const arcDegrees = arcSteps * degreesPerStep;
+      const binIndex = Math.min(
+        EDGE_DISTANCE_BIN_COUNT - 1,
+        Math.floor(arcDegrees / EDGE_DISTANCE_BIN_DEGREES)
+      );
+      bins[binIndex]++;
+      arcStepSum += arcSteps;
+      if ((vertexParity[i] ^ vertexParity[j]) === 0) {
+        evenEdgeCount++;
+      } else {
+        oddEdgeCount++;
+      }
+      if ((i + 1) % 50_000 === 0) {
+        onProgress?.("edges", i + 1, total);
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+      }
+    }
+    onProgress?.("edges", total, total);
+
+    if (generatorInfos[0]) {
+      generatorInfos[0].avgArcDegrees = (arcStepSum / total) * degreesPerStep;
+      generatorInfos[0].distanceBins = Array.from(bins, (binCount, index) => ({
+        minDegrees: index * EDGE_DISTANCE_BIN_DEGREES,
+        maxDegrees:
+          index === EDGE_DISTANCE_BIN_COUNT - 1
+            ? 180
+            : (index + 1) * EDGE_DISTANCE_BIN_DEGREES,
+        count: binCount,
+      })).filter((bin) => bin.count > 0);
+    }
+
+    return {
+      n,
+      preset,
+      kind,
+      order,
+      path,
+      flips,
+      edges,
+      rn: new Uint32Array(0),
+      vertexParity,
+      evenEdgeCount,
+      oddEdgeCount,
+      generators: generatorInfos,
+      coords,
+    };
+  }
   // Upper bound on undirected edges. Round up: for non-regular graphs whose
   // generators have fixed points (e.g. the Sierpiński graph) generators × total
   // can be odd, and the tail is trimmed below anyway.
@@ -1195,11 +1302,58 @@ export function buildZaksSamplingGraph(n: number): PancakeGraph {
   };
 }
 
+/** Lightweight payload for the analytic random Dₙ matching renderers. */
+function buildDihedralSamplingGraph(n: number, preset: GraphPreset): PancakeGraph {
+  const generatorInfos = computeGeneratorInfos(n, preset, graphGenerators(n, preset));
+  const totalEdges = factorial(n) / 2;
+  if (generatorInfos[0]) {
+    generatorInfos[0].avgArcDegrees = 90;
+    generatorInfos[0].distanceBins = Array.from(
+      { length: EDGE_DISTANCE_BIN_COUNT },
+      (_, index) => ({
+        minDegrees: index * EDGE_DISTANCE_BIN_DEGREES,
+        maxDegrees:
+          index === EDGE_DISTANCE_BIN_COUNT - 1
+            ? 180
+            : (index + 1) * EDGE_DISTANCE_BIN_DEGREES,
+        count: totalEdges / EDGE_DISTANCE_BIN_COUNT,
+      })
+    );
+  }
+  const empty = new Uint32Array(0);
+  return {
+    n,
+    preset,
+    kind: preset === "wedge-clipped-dihedral" ? "wedge-clipped-dihedral" : "random-dihedral",
+    order: undefined,
+    path: [],
+    flips: [],
+    edges: empty,
+    rn: empty,
+    vertexParity: new Uint8Array(0),
+    evenEdgeCount: 0,
+    oddEdgeCount: totalEdges,
+    generators: generatorInfos,
+  };
+}
+
+export function buildRandomDihedralSamplingGraph(n: number): PancakeGraph {
+  return buildDihedralSamplingGraph(n, "random-dihedral");
+}
+
+export function buildWedgeClippedDihedralSamplingGraph(n: number): PancakeGraph {
+  return buildDihedralSamplingGraph(n, "wedge-clipped-dihedral");
+}
+
 function computeGeneratorInfos(
   n: number,
   preset: GraphPreset,
   generators: Generator[]
 ): GeneratorInfo[] {
+  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") {
+    return [{ id: 1, parity: 1, label: "random matching" }];
+  }
+
   if (preset === "sliding-puzzle") {
     // Every move swaps the blank with a neighbor — a transposition, hence
     // odd. The identity-application trick below would not find a blank, so we
@@ -1228,16 +1382,26 @@ function computeGeneratorInfos(
     return infos;
   }
 
-  const isHypercube = preset === "hypercube";
+  if (preset === "aes-powers") {
+    return generators
+      .map((gen) => ({
+        id: gen.id,
+        parity: 1 as 0 | 1,
+        label: generatorLabel(gen.id, preset, n),
+      }))
+      .sort((a, b) => a.id - b.id);
+  }
+
+  const isBitString = preset === "hypercube" || preset === "feistel";
   const identity = new Uint8Array(n);
-  if (!isHypercube) {
+  if (!isBitString) {
     for (let i = 0; i < n; i++) identity[i] = i + 1;
   }
 
   const infos = generators.map((gen) => {
     const result = gen.apply(identity);
     let parity: 0 | 1 = 0;
-    if (isHypercube) {
+    if (isBitString) {
       let s = 0;
       for (let i = 0; i < n; i++) s ^= result[i];
       parity = (s & 1) as 0 | 1;
@@ -1275,6 +1439,13 @@ function generatorLabel(
   }
   if (preset === "hypercube") {
     return String(id);
+  }
+  if (preset === "feistel") {
+    const round = Math.floor((id + 1) / 2);
+    return id % 2 === 1 ? `L${round}` : `R${round}`;
+  }
+  if (preset === "aes-powers") {
+    return id === 1 ? "×02" : "÷02";
   }
   if (preset === "star") {
     return String(id);
@@ -1360,10 +1531,16 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Pancake graph — Zaks (recursive)";
     case "pancake-williams":
       return "Pancake graph — Williams";
+    case "random-dihedral":
+      return "Random graph — Dₙ symmetry";
+    case "wedge-clipped-dihedral":
+      return "Wedge-clipped Dₙ density";
+    case "aes-powers":
+      return "AES powers of two";
     case "star":
       return "Star graph";
     case "permutohedron":
-      return "Permutohedron graph";
+      return "Permutohedron graph — Steinhaus–Johnson–Trotter";
     case "permutahedron-compressed":
       return "Permutahedron — Gregor–Merino–Mütze compression";
     case "cyclic-adjacent":
@@ -1378,6 +1555,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Lexicographic graph";
     case "hypercube":
       return "Hypercube";
+    case "feistel":
+      return "Feistel cipher";
     case "sliding-puzzle":
       return "Sliding puzzle (15-puzzle)";
     case "simplex":
@@ -1399,6 +1578,12 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Suffix reversals, Zaks' explicit recursion pathₙ = (pathₙ₋₁ rₙ)ⁿ⁻¹ pathₙ₋₁";
     case "pancake-williams":
       return "Suffix reversals, maximum new flip";
+    case "random-dihedral":
+      return "Random matching with Dₙ symmetry on n! vertices";
+    case "wedge-clipped-dihedral":
+      return "Random matching clipped to a Dₙ fundamental wedge";
+    case "aes-powers":
+      return "Repeated AES xtime multiplication in GF(2ⁿ)";
     case "star":
       return "Swap the first position with any other";
     case "permutohedron":
@@ -1417,6 +1602,8 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Lexicographic-successor generators Aₙ = {pᵢ⁻¹·pᵢ₊₁}";
     case "hypercube":
       return "Flip one bit";
+    case "feistel":
+      return "Toy Feistel round mixers on n-bit blocks";
     case "sliding-puzzle":
       return "Slide a tile into the blank on a 2 × n grid";
     case "simplex":
@@ -1431,14 +1618,19 @@ export function graphPresetDescription(preset: GraphPreset): string {
 }
 
 export function graphVertexCount(n: number, preset: GraphPreset): number {
+  if (preset === "aes-powers") return aesPowerCycleLength(n);
   if (preset === "sliding-puzzle") return factorial(SLIDING_PUZZLE_ROWS * n);
   if (preset === "simplex") return n + 1;
   if (preset === "complete") return n;
   if (preset === "sierpinski") return SIERPINSKI_K ** n;
-  return preset === "hypercube" ? 2 ** n : factorial(n);
+  return preset === "hypercube" || preset === "feistel" ? 2 ** n : factorial(n);
 }
 
 export function graphEdgeCount(n: number, preset: GraphPreset): number {
+  if (preset === "aes-powers") return aesPowerCycleLength(n);
+  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") {
+    return factorial(n) / 2;
+  }
   if (preset === "simplex") return (n * (n + 1)) / 2;
   if (preset === "complete") return (n * (n - 1)) / 2;
   if (preset === "cayley-complete") {
@@ -1446,6 +1638,7 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
     return (v * (v - 1)) / 2;
   }
   if (preset === "hypercube") return n * 2 ** (n - 1);
+  if (preset === "feistel") return 2 * feistelRoundCount(n) * 2 ** (n - 1);
   // S(n, k) has k(kⁿ − 1)/2 edges (each of levels 1..n contributes kʰ(k−1)/2).
   if (preset === "sierpinski") {
     const k = SIERPINSKI_K;
@@ -1482,6 +1675,7 @@ export function graphEdgesPerVertex(n: number, preset: GraphPreset): number | nu
 }
 
 export function graphMaxN(preset: GraphPreset): number {
+  if (preset === "aes-powers") return AES_MAX_N;
   // The puzzle has (2n)! states, so it hits the 10! ceiling already at n = 5
   // (a 2 × 5 grid). The true 15-puzzle (4 × 4, 16!/2 ≈ 10¹³ states) is far
   // beyond what can be enumerated here.
@@ -1490,6 +1684,9 @@ export function graphMaxN(preset: GraphPreset): number {
   // cheap far past the permutation graphs' limits. Kₙ is just as cheap.
   if (preset === "simplex") return 40;
   if (preset === "complete") return 40;
+  // Materialized views are intentionally not used for this preset; Yankelovich
+  // samples it analytically up to n = 40.
+  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") return 8;
   // K_{n!} explodes fast: the generator set is S_n \ {id}, so edge-building
   // is O((n!)²). n = 6 already gives 720 vertices, 719 generators, and
   // ~259k edges; n = 7 would be 5040 vertices and ~12.7M edges, so cap here.
@@ -1499,6 +1696,7 @@ export function graphMaxN(preset: GraphPreset): number {
   if (preset === "asymmetric-tree") return 8;
   // S(n, 3) has 3ⁿ vertices: 3¹⁰ ≈ 59k stays comfortable, 3¹¹ ≈ 177k is heavy.
   if (preset === "sierpinski") return 10;
+  if (preset === "feistel") return 16;
   if (
     preset === "pancake-zaks" ||
     preset === "pancake-zaks-recursive" ||
@@ -1515,6 +1713,7 @@ export function graphMaxN(preset: GraphPreset): number {
 function graphKind(preset: GraphPreset): GraphKind {
   if (
     preset === "star" ||
+    preset === "aes-powers" ||
     preset === "permutohedron" ||
     preset === "permutahedron-compressed" ||
     preset === "cyclic-adjacent" ||
@@ -1523,10 +1722,13 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "kaleidoscope" ||
     preset === "lexicographic" ||
     preset === "hypercube" ||
+    preset === "feistel" ||
     preset === "sliding-puzzle" ||
     preset === "simplex" ||
     preset === "complete" ||
     preset === "cayley-complete" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral" ||
     preset === "sierpinski"
   ) {
     return preset;
@@ -1550,6 +1752,9 @@ function materializedPancakeGeneratorIds(
 }
 
 function graphGenerators(n: number, preset: GraphPreset): Generator[] {
+  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") {
+    return [{ id: 1, apply: (p) => p }];
+  }
   if (preset.startsWith("pancake")) {
     return materializedPancakeGeneratorIds(n, preset).map((k) => ({
       id: k,
@@ -1574,6 +1779,26 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
       });
     }
     return generators;
+  }
+  if (preset === "feistel") {
+    const generators: Generator[] = [];
+    const rounds = feistelRoundCount(n);
+    for (let round = 0; round < rounds; round++) {
+      generators.push({
+        id: round * 2 + 1,
+        apply: (p) => feistelMix(p, n, round, "left"),
+      });
+      generators.push({
+        id: round * 2 + 2,
+        apply: (p) => feistelMix(p, n, round, "right"),
+      });
+    }
+    return generators;
+  }
+  if (preset === "aes-powers") {
+    return [
+      { id: 1, apply: (p) => aesValueToBits(aesXtime(aesBitsToValue(p), n), n) },
+    ];
   }
   if (
     preset === "permutohedron" ||
@@ -1779,6 +2004,65 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
   return [];
 }
 
+function aesPolynomial(n: number): number {
+  const poly = AES_POLYNOMIALS[n];
+  if (!poly) {
+    throw new Error(`AES powers are available for n = ${AES_MIN_N}…${AES_MAX_N}.`);
+  }
+  return poly;
+}
+
+function aesXtime(value: number, n: number): number {
+  const highBit = 1 << (n - 1);
+  const mask = (1 << n) - 1;
+  const shifted = (value << 1) & mask;
+  return value & highBit ? shifted ^ (aesPolynomial(n) & mask) : shifted;
+}
+
+function aesPowerCycleLength(n: number): number {
+  aesPolynomial(n);
+  return 2 ** n - 1;
+}
+
+function aesValueToBits(value: number, n: number): Perm {
+  const bits = new Uint8Array(n) as Perm;
+  for (let bit = 0; bit < n; bit++) {
+    bits[n - bit - 1] = (value >> bit) & 1;
+  }
+  return bits;
+}
+
+function aesBitsToValue(bits: ArrayLike<number>): number {
+  let value = 0;
+  for (let i = 0; i < bits.length; i++) value = (value << 1) | bits[i];
+  return value;
+}
+
+async function aesPowerCycleOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 50_000
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const total = aesPowerCycleLength(n);
+  const path: Perm[] = [];
+  const flips: number[] = [];
+  let value = 1;
+  for (let i = 0; i < total; i++) {
+    path.push(aesValueToBits(value, n));
+    flips.push(1);
+    value = aesXtime(value, n);
+    if ((i + 1) % chunk === 0) {
+      onProgress?.(i + 1, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+  onProgress?.(total, total);
+  return { path, flips };
+}
+
 async function hypercubeGrayOrder(
   n: number,
   onProgress?: (done: number, total: number) => void,
@@ -1809,6 +2093,90 @@ async function hypercubeGrayOrder(
   if (path.length > 1) flips.push(changedBitId(path[path.length - 1], path[0]));
   onProgress?.(total, total);
   return { path, flips };
+}
+
+function feistelRoundCount(n: number): number {
+  return Math.max(2, Math.min(6, n));
+}
+
+async function feistelOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 50_000
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const total = 2 ** n;
+  const rounds = feistelRoundCount(n);
+  const path: Perm[] = [];
+
+  for (let i = 0; i < total; i++) {
+    let vertex = bitsFromInteger(i ^ (i >> 1), n);
+    for (let round = 0; round < rounds; round++) {
+      vertex = feistelMix(vertex, n, round, round % 2 === 0 ? "left" : "right");
+    }
+    path.push(vertex);
+    if ((i + 1) % chunk === 0) {
+      onProgress?.(i + 1, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+
+  onProgress?.(total, total);
+  return { path, flips: [] };
+}
+
+function bitsFromInteger(value: number, n: number): Perm {
+  const out = new Uint8Array(n);
+  for (let bit = 0; bit < n; bit++) {
+    out[n - bit - 1] = (value >> bit) & 1;
+  }
+  return out;
+}
+
+function feistelMix(
+  p: Perm,
+  n: number,
+  round: number,
+  side: "left" | "right"
+): Perm {
+  const leftLen = Math.floor(n / 2);
+  const rightLen = n - leftLen;
+  const targetStart = side === "left" ? 0 : leftLen;
+  const targetLen = side === "left" ? leftLen : rightLen;
+  const sourceStart = side === "left" ? leftLen : 0;
+  const sourceLen = side === "left" ? rightLen : leftLen;
+  const mask = feistelMask(p, sourceStart, sourceLen, targetLen, round, side);
+  const q = new Uint8Array(p);
+  for (let bit = 0; bit < targetLen; bit++) {
+    q[targetStart + bit] ^= (mask >> (targetLen - bit - 1)) & 1;
+  }
+  return q;
+}
+
+function feistelMask(
+  p: Perm,
+  start: number,
+  sourceLen: number,
+  targetLen: number,
+  round: number,
+  side: "left" | "right"
+): number {
+  let source = 0;
+  for (let i = 0; i < sourceLen; i++) source = (source << 1) | p[start + i];
+  const limit = 1 << targetLen;
+  let x =
+    (source * 0x45d9f3b +
+      (round + 1) * 0x9e3779b +
+      (side === "left" ? 0x7f4a7c15 : 0x94d049bb)) >>>
+    0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x7feb352d) >>> 0;
+  x ^= x >>> 15;
+  x = Math.imul(x, 0x846ca68b) >>> 0;
+  x ^= x >>> 16;
+  return (x % (limit - 1)) + 1;
 }
 
 async function lexicographicOrder(

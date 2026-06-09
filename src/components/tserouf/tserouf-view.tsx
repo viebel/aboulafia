@@ -18,12 +18,15 @@ import {
 } from "@/components/ui/select";
 import { factorial, key, type Perm } from "@/lib/pancake";
 import {
+  DEFAULT_TSEROUF_SCALE_ID,
   INSTRUMENTS,
   renderTseroufWav,
   tseroufMelodicTone,
+  TSEROUF_SCALE_PRESETS,
   TSEROUF_SCALE_OFFSETS,
   TseroufPlayer,
   type InstrumentId,
+  type TseroufScalePresetId,
 } from "@/lib/tserouf-audio";
 import {
   renderTseroufDroneWav,
@@ -91,7 +94,7 @@ type Alphabet = "latin" | "hebrew";
 type Layout = "flat" | "hamilton";
 type LetterSet = "sequence" | "elohim" | "amash" | "yhw";
 
-const DEFAULT_N: NValue = 3;
+const DEFAULT_N: NValue = 4;
 const ALPHABETS: readonly Alphabet[] = ["latin", "hebrew"];
 const URL_LAYOUTS = ["flat", "tree", "hamilton"] as const;
 const LETTER_SETS: readonly LetterSet[] = ["sequence", "elohim", "amash", "yhw"];
@@ -113,8 +116,18 @@ const soundKindFor = (choice: SoundChoice): SoundKind =>
 const TEMPO_OPTIONS = [60, 72, 88, 108, 128, 152, 176, 208, 240] as const;
 const DEFAULT_TEMPO = 128;
 const secondsPerBeat = (tempo: number) => 60 / tempo;
-const RHYTHM_VOLUME_OPTIONS = Array.from({ length: 21 }, (_, i) => i * 10);
-const DEFAULT_RHYTHM_VOLUME = 100;
+const NOTE_VALUES = ["quarter", "eighth"] as const;
+type NoteValue = (typeof NOTE_VALUES)[number];
+const DEFAULT_NOTE_VALUE: NoteValue = "quarter";
+const noteValueMultiplier = (value: NoteValue) => (value === "eighth" ? 0.5 : 1);
+const secondsPerNote = (tempo: number, value: NoteValue) =>
+  secondsPerBeat(tempo) * noteValueMultiplier(value);
+type ScaleChoice = TseroufScalePresetId | "manual";
+const SCALE_CHOICES = [
+  ...TSEROUF_SCALE_PRESETS.map((preset) => preset.id),
+  "manual",
+] as readonly ScaleChoice[];
+const CHROMATIC_OFFSETS = Array.from({ length: 12 }, (_, i) => i);
 const WAV_LOOP_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8] as const;
 const WAV_LOOP_PARAM_OPTIONS = [
   ...WAV_LOOP_OPTIONS.map(String),
@@ -141,9 +154,25 @@ interface TseroufState {
   letterSet: LetterSet;
   instrument: SoundChoice;
   tempo: number;
-  rhythmVolume: number;
+  noteValue: NoteValue;
+  scaleChoice: ScaleChoice;
+  customScaleOffsets: readonly number[];
   wavLoops: WavLoops;
   loop: boolean;
+}
+
+function readScaleOffsetsParam(params: URLSearchParams | null): readonly number[] {
+  const raw = params?.get("tones");
+  if (!raw) return TSEROUF_SCALE_OFFSETS;
+  const offsets = Array.from(
+    new Set(
+      raw
+        .split(",")
+        .map((part) => Number(part))
+        .filter((value) => Number.isInteger(value) && value >= 0 && value <= 11)
+    )
+  ).sort((a, b) => a - b);
+  return offsets.length > 0 ? offsets : TSEROUF_SCALE_OFFSETS;
 }
 
 function readTseroufState(params: URLSearchParams | null): TseroufState {
@@ -157,12 +186,19 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     DEFAULT_INSTRUMENT
   );
   const tempo = readIntParam(params, "tempo", TEMPO_OPTIONS, DEFAULT_TEMPO);
-  const rhythmVolume = readIntParam(
+  const noteValue = readEnumParam(
     params,
-    "rhythm",
-    RHYTHM_VOLUME_OPTIONS,
-    DEFAULT_RHYTHM_VOLUME
+    "dur",
+    NOTE_VALUES,
+    DEFAULT_NOTE_VALUE
   );
+  const scaleChoice = readEnumParam(
+    params,
+    "scale",
+    SCALE_CHOICES,
+    DEFAULT_TSEROUF_SCALE_ID
+  );
+  const customScaleOffsets = readScaleOffsetsParam(params);
   const wavLoopParam = readEnumParam(
     params,
     "wavLoops",
@@ -175,17 +211,17 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
 
   // The "elohim" set is a fixed 5-letter Hebrew word, so it pins n and alphabet.
   if (letterSet === "elohim") {
-    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, rhythmVolume, wavLoops, loop };
+    return { n: ELOHIM_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, noteValue, scaleChoice, customScaleOffsets, wavLoops, loop };
   }
 
   // The "amash" set is the three mother letters, a fixed 3-letter Hebrew word.
   if (letterSet === "amash") {
-    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, rhythmVolume, wavLoops, loop };
+    return { n: AMASH_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, noteValue, scaleChoice, customScaleOffsets, wavLoops, loop };
   }
 
   // The "yhw" set is a fixed 3-letter Hebrew word.
   if (letterSet === "yhw") {
-    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, rhythmVolume, wavLoops, loop };
+    return { n: YHW_N, alphabet: "hebrew", layout, letterSet, instrument, tempo, noteValue, scaleChoice, customScaleOffsets, wavLoops, loop };
   }
 
   return {
@@ -195,7 +231,9 @@ function readTseroufState(params: URLSearchParams | null): TseroufState {
     letterSet,
     instrument,
     tempo,
-    rhythmVolume,
+    noteValue,
+    scaleChoice,
+    customScaleOffsets,
     wavLoops,
     loop,
   };
@@ -234,10 +272,12 @@ const PlayWordContext = createContext<((word: string) => void) | null>(null);
 
 interface TonePreviewSettings {
   kind: SoundKind;
+  scaleOffsets: readonly number[];
 }
 
 const TonePreviewContext = createContext<TonePreviewSettings>({
   kind: "invention",
+  scaleOffsets: TSEROUF_SCALE_OFFSETS,
 });
 
 interface EdgeSpec {
@@ -270,12 +310,15 @@ type RecCell =
   | { kind: "pair"; words: ZaksWord[] }
   | { kind: "group"; level: number; children: RecCell[] };
 
-type PlaybackMode = "impro" | "zaks";
+type PlaybackMode = "impro" | "zaks" | "zaks-word";
 
-interface ImproPathStep {
+interface PlaybackStep {
   word: string;
   sourceIndex: number;
   note: ZaksWord;
+}
+
+interface ImproPathStep extends PlaybackStep {
   role: string;
   duration: string;
   durationRatio: number;
@@ -290,12 +333,16 @@ export function TseroufView() {
   const [letterSet, setLetterSet] = useState<LetterSet>(initial.letterSet);
   const [instrument, setInstrument] = useState<SoundChoice>(initial.instrument);
   const [tempo, setTempo] = useState<number>(initial.tempo);
-  const [rhythmVolume, setRhythmVolume] = useState<number>(
-    initial.rhythmVolume
+  const [noteValue, setNoteValue] = useState<NoteValue>(initial.noteValue);
+  const [scaleChoice, setScaleChoice] = useState<ScaleChoice>(
+    initial.scaleChoice
+  );
+  const [customScaleOffsets, setCustomScaleOffsets] = useState<readonly number[]>(
+    initial.customScaleOffsets
   );
   const [wavLoops, setWavLoops] = useState<WavLoops>(initial.wavLoops);
   const [loopPlayback] = useState<boolean>(initial.loop);
-  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("impro");
+  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("zaks");
   const [words, setWords] = useState<ZaksWord[]>([]);
   const [status, setStatus] = useState("Ready.");
   const [copied, setCopied] = useState(false);
@@ -316,6 +363,13 @@ export function TseroufView() {
     [n]
   );
   const displayBaseWord = displayWord(baseWord, alphabet, hebrewLetters);
+  const effectiveScaleOffsets = useMemo(() => {
+    if (scaleChoice === "manual") return customScaleOffsets;
+    return (
+      TSEROUF_SCALE_PRESETS.find((preset) => preset.id === scaleChoice)?.offsets ??
+      TSEROUF_SCALE_OFFSETS
+    );
+  }, [customScaleOffsets, scaleChoice]);
   const recursiveCell = useMemo(
     () => (words.length > 0 ? buildRecursiveCells(words, n) : null),
     [n, words]
@@ -328,7 +382,8 @@ export function TseroufView() {
   const effectivePlaybackMode: PlaybackMode =
     playbackMode === "impro" && !improEnabled ? "zaks" : playbackMode;
   const playbackSteps = useMemo(
-    () => (effectivePlaybackMode === "impro" ? improPath : null),
+    (): PlaybackStep[] | null =>
+      effectivePlaybackMode === "impro" ? improPath : null,
     [effectivePlaybackMode, improPath]
   );
   const playbackNotes = useMemo(
@@ -367,8 +422,10 @@ export function TseroufView() {
       layout,
       instrument,
       tempo: String(tempo),
-      rhythm:
-        rhythmVolume === DEFAULT_RHYTHM_VOLUME ? null : String(rhythmVolume),
+      dur: noteValue === DEFAULT_NOTE_VALUE ? null : noteValue,
+      scale: scaleChoice === DEFAULT_TSEROUF_SCALE_ID ? null : scaleChoice,
+      tones:
+        scaleChoice === "manual" ? customScaleOffsets.join(",") : null,
       wavLoops: wavLoops === DEFAULT_WAV_LOOPS ? null : String(wavLoops),
       loop: loopPlayback ? "1" : null,
     });
@@ -379,7 +436,9 @@ export function TseroufView() {
     letterSet,
     instrument,
     tempo,
-    rhythmVolume,
+    noteValue,
+    scaleChoice,
+    customScaleOffsets,
     wavLoops,
     loopPlayback,
   ]);
@@ -502,7 +561,7 @@ export function TseroufView() {
         : "Playing the music of Tserouf…"
     );
     playerRef.current.play(activeNotes, {
-      loop: loopPlayback,
+      loop: true,
       startIndex,
       loopStartIndex:
         mode === "impro" &&
@@ -517,9 +576,10 @@ export function TseroufView() {
             : (instrument as InstrumentId)
           : undefined,
       playbackStyle: mode === "impro" ? "guitar-impro" : "strict",
-      rhythmVolume: rhythmVolume / 100,
-      stepSeconds: secondsPerBeat(tempo),
-      noteSeconds: secondsPerBeat(tempo),
+      scaleOffsets: effectiveScaleOffsets,
+      rhythmVolume: 0,
+      stepSeconds: secondsPerNote(tempo, noteValue),
+      noteSeconds: secondsPerNote(tempo, noteValue),
       onStep: (index, letterIndex = 0) => {
         const note = activeNotes[index];
         const pathStep = activeSteps?.[index];
@@ -546,6 +606,48 @@ export function TseroufView() {
     });
   };
 
+  const playSingleWord = (word: string) => {
+    const sourceIndex = wordIndexMap.get(word);
+    const sourceNote = sourceIndex === undefined ? undefined : words[sourceIndex];
+    if (!sourceNote) return;
+
+    const kind = soundKindFor(instrument);
+    if (!playerRef.current || playerKindRef.current !== kind) {
+      playerRef.current?.dispose();
+      playerRef.current =
+        kind === "drone" ? new TseroufDronePlayer() : new TseroufPlayer();
+      playerKindRef.current = kind;
+    }
+
+    setPlayState("playing");
+    setStatus("Playing word…");
+    playerRef.current.play([{ ...sourceNote, flip: undefined }], {
+      loop: false,
+      startIndex: 0,
+      instrument: kind === "invention" ? (instrument as InstrumentId) : undefined,
+      playbackStyle: "strict",
+      scaleOffsets: effectiveScaleOffsets,
+      rhythmVolume: 0,
+      stepSeconds: secondsPerNote(tempo, noteValue),
+      noteSeconds: secondsPerNote(tempo, noteValue),
+      onStep: (_index, letterIndex = 0) => {
+        setPlayingFocus({
+          word,
+          wordIndex: sourceIndex,
+          sequenceIndex: sourceIndex,
+          sequenceLength: words.length,
+          letterIndex,
+          mode: "zaks-word",
+        });
+      },
+      onEnd: () => {
+        setPlayState("stopped");
+        setPlayingFocus(null);
+        setStatus("Tserouf playback finished.");
+      },
+    });
+  };
+
   // Clicking a word (re)starts playback from that word — a quick way to jump
   // straight into any point of the piece. The current player is torn down and
   // rebuilt so it begins cleanly at the chosen index.
@@ -558,9 +660,15 @@ export function TseroufView() {
   const playFromWord = useCallback(
     (word: string) => {
       const pathIndex = playbackSteps?.findIndex((step) => step.word === word);
-      if (improEnabled && pathIndex !== undefined && pathIndex >= 0) {
+      if (effectivePlaybackMode === "impro" && pathIndex !== undefined && pathIndex >= 0) {
         playerRef.current?.stop();
-        startPlayback(pathIndex, "impro");
+        setPlaybackMode(effectivePlaybackMode);
+        startPlayback(pathIndex, effectivePlaybackMode);
+        return;
+      }
+      if (effectivePlaybackMode === "zaks-word") {
+        playerRef.current?.stop();
+        playSingleWord(word);
         return;
       }
       const index = wordIndexMap.get(word);
@@ -574,13 +682,14 @@ export function TseroufView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       effectivePlaybackMode,
-      improEnabled,
+      playbackSteps,
       wordIndexMap,
       instrument,
       loopPlayback,
       playbackMode,
+      noteValue,
       tempo,
-      rhythmVolume,
+      effectiveScaleOffsets,
       words,
     ]
   );
@@ -620,17 +729,38 @@ export function TseroufView() {
     setTempo(value);
     const player = playerRef.current;
     if (player instanceof TseroufPlayer) {
-      player.setStepSeconds(secondsPerBeat(value));
+      player.setStepSeconds(secondsPerNote(value, noteValue));
     } else if (player instanceof TseroufDronePlayer) {
-      player.setNoteSeconds(secondsPerBeat(value));
+      player.setNoteSeconds(secondsPerNote(value, noteValue));
     }
   };
 
-  const handleRhythmVolumeChange = (value: number) => {
-    setRhythmVolume(value);
-    if (playerRef.current instanceof TseroufPlayer) {
-      playerRef.current.setRhythmVolume(value / 100);
+  const handleNoteValueChange = (value: NoteValue) => {
+    setNoteValue(value);
+    const stepSeconds = secondsPerNote(tempo, value);
+    const player = playerRef.current;
+    if (player instanceof TseroufPlayer) {
+      player.setStepSeconds(stepSeconds);
+    } else if (player instanceof TseroufDronePlayer) {
+      player.setNoteSeconds(stepSeconds);
     }
+  };
+
+  const handleScaleChoiceChange = (value: ScaleChoice) => {
+    setScaleChoice(value);
+    if (playState !== "stopped") stopPlayback();
+  };
+
+  const toggleCustomScaleOffset = (offset: number) => {
+    setCustomScaleOffsets((current) => {
+      if (current.includes(offset)) {
+        return current.length <= 1
+          ? current
+          : current.filter((item) => item !== offset);
+      }
+      return [...current, offset].sort((a, b) => a - b);
+    });
+    if (playState !== "stopped") stopPlayback();
   };
 
   const handleInstrumentChange = (value: SoundChoice) => {
@@ -654,7 +784,7 @@ export function TseroufView() {
       const blob =
         effectivePlaybackMode !== "impro" && soundKindFor(instrument) === "drone"
           ? await renderTseroufDroneWav(playbackNotes, {
-              noteSeconds: secondsPerBeat(tempo),
+              noteSeconds: secondsPerNote(tempo, noteValue),
               loopCount: exportLoopCount,
               maxSeconds: 150 * exportLoopCount,
             })
@@ -665,7 +795,8 @@ export function TseroufView() {
                   : (instrument as InstrumentId),
               playbackStyle:
                 effectivePlaybackMode === "impro" ? "guitar-impro" : "strict",
-              rhythmVolume: rhythmVolume / 100,
+              scaleOffsets: effectiveScaleOffsets,
+              rhythmVolume: 0,
               loopCount: exportLoopCount,
               loopStartIndex:
                 effectivePlaybackMode === "impro" &&
@@ -674,7 +805,7 @@ export function TseroufView() {
                   ? 1
                   : 0,
               maxSeconds: 75 * exportLoopCount,
-              stepSeconds: secondsPerBeat(tempo),
+              stepSeconds: secondsPerNote(tempo, noteValue),
             });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -993,30 +1124,74 @@ export function TseroufView() {
           </div>
 
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label
-                htmlFor="tserouf-rhythm-volume"
-                className="text-xs uppercase tracking-wider text-muted-foreground"
-              >
-                Rhythm
-              </Label>
-              <span className="font-mono text-xs tabular-nums text-muted-foreground">
-                {rhythmVolume}%
-              </span>
-            </div>
-            <input
-              id="tserouf-rhythm-volume"
-              type="range"
-              min={0}
-              max={200}
-              step={10}
-              value={rhythmVolume}
-              onChange={(event) =>
-                handleRhythmVolumeChange(Number(event.currentTarget.value))
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Scale
+            </Label>
+            <Select
+              value={scaleChoice}
+              onValueChange={(value) =>
+                handleScaleChoiceChange(value as ScaleChoice)
               }
-              className="w-full accent-primary"
-              aria-label="Rhythm volume"
-            />
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {TSEROUF_SCALE_PRESETS.map((preset) => (
+                  <SelectItem key={preset.id} value={preset.id}>
+                    {preset.label}
+                  </SelectItem>
+                ))}
+                <SelectItem value="manual">Manual</SelectItem>
+              </SelectContent>
+            </Select>
+            {scaleChoice === "manual" ? (
+              <div className="grid grid-cols-6 gap-1">
+                {CHROMATIC_OFFSETS.map((offset) => {
+                  const selected = customScaleOffsets.includes(offset);
+                  return (
+                    <Button
+                      key={offset}
+                      type="button"
+                      size="sm"
+                      variant={selected ? "default" : "outline"}
+                      className="h-8 px-0 font-mono text-xs"
+                      onClick={() => toggleCustomScaleOffset(offset)}
+                      aria-pressed={selected}
+                      aria-label={`${offset} semitones`}
+                    >
+                      {offset}
+                    </Button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+              Note value
+            </Label>
+            <div className="grid grid-cols-2 gap-1 rounded-md border p-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={noteValue === "quarter" ? "default" : "ghost"}
+                className="h-8"
+                onClick={() => handleNoteValueChange("quarter")}
+              >
+                Quarter
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={noteValue === "eighth" ? "default" : "ghost"}
+                className="h-8"
+                onClick={() => handleNoteValueChange("eighth")}
+              >
+                Eighth
+              </Button>
+            </div>
           </div>
 
           <Button
@@ -1069,10 +1244,11 @@ export function TseroufView() {
                   <TonePreviewContext.Provider
                     value={{
                       kind: soundKindFor(instrument),
+                      scaleOffsets: effectiveScaleOffsets,
                     }}
                   >
                     <div className="mb-4 flex justify-end">
-                      <div className="grid grid-cols-2 gap-1 rounded-md border p-1">
+                      <div className="grid grid-cols-3 gap-1 rounded-md border p-1">
                         <Button
                           type="button"
                           size="sm"
@@ -1096,6 +1272,20 @@ export function TseroufView() {
                         >
                           {alphabet === "hebrew" ? "ישרה" : "Yeshara"}
                         </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={
+                            effectivePlaybackMode === "zaks-word"
+                              ? "default"
+                              : "ghost"
+                          }
+                          className="h-8"
+                          onClick={() => handlePlaybackModeChange("zaks-word")}
+                          aria-label="Play clicked word"
+                        >
+                          Word
+                        </Button>
                       </div>
                     </div>
                     <div ref={renderRef} className="p-2 font-mono text-sm">
@@ -1109,6 +1299,7 @@ export function TseroufView() {
                           }
                           alphabet={alphabet}
                           kind={soundKindFor(instrument)}
+                          scaleOffsets={effectiveScaleOffsets}
                           onStepClick={(index) => {
                             playerRef.current?.stop();
                             setPlaybackMode("impro");
@@ -1269,12 +1460,14 @@ function ImproPathView({
   activeIndex,
   alphabet,
   kind,
+  scaleOffsets,
   onStepClick,
 }: {
   path: ImproPathStep[];
   activeIndex: number | null;
   alphabet: Alphabet;
   kind: SoundKind;
+  scaleOffsets: readonly number[];
   onStepClick: (index: number) => void;
 }) {
   const stable = stablePositions(path.map((step) => step.note));
@@ -1362,6 +1555,7 @@ function ImproPathView({
                 stable={stable}
                 alphabet={alphabet}
                 kind={kind}
+                scaleOffsets={scaleOffsets}
                 register={(el) => {
                   tileRefs.current[index] = el;
                 }}
@@ -1390,6 +1584,7 @@ function ImproPathTile({
   stable,
   alphabet,
   kind,
+  scaleOffsets,
   register,
   onClick,
   style,
@@ -1400,6 +1595,7 @@ function ImproPathTile({
   stable: boolean[];
   alphabet: Alphabet;
   kind: SoundKind;
+  scaleOffsets: readonly number[];
   register: (el: HTMLButtonElement | null) => void;
   onClick: () => void;
   style?: CSSProperties;
@@ -1415,7 +1611,11 @@ function ImproPathTile({
       type="button"
       dir={isHebrew ? "rtl" : "ltr"}
       onClick={onClick}
-      title={`${index + 1}. ${step.role} · ${tonePreviewTitle(step.word, kind)}`}
+      title={`${index + 1}. ${step.role} · ${tonePreviewTitle(
+        step.word,
+        kind,
+        scaleOffsets
+      )}`}
       style={style}
       className={`mx-2 flex min-w-0 flex-col items-stretch rounded-md border px-1.5 py-1 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-offset-background focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background ${parityClassName(
         step.word
@@ -1456,7 +1656,11 @@ function ImproPathTile({
           </span>
         ))}
       </span>
-      <AlignedTonalPreview word={step.word} kind={kind} />
+      <AlignedTonalPreview
+        word={step.word}
+        kind={kind}
+        scaleOffsets={scaleOffsets}
+      />
     </button>
   );
 }
@@ -1464,11 +1668,13 @@ function ImproPathTile({
 function AlignedTonalPreview({
   word,
   kind,
+  scaleOffsets,
 }: {
   word: string;
   kind: SoundKind;
+  scaleOffsets: readonly number[];
 }) {
-  const tones = tonePreviewTones(word, kind);
+  const tones = tonePreviewTones(word, kind, scaleOffsets);
   if (tones.length === 0) return null;
 
   const width = 100;
@@ -1838,7 +2044,11 @@ function HamiltonWordsView({
           ) : null}
           {points.map(({ item, index, x, y, display }) => {
             const isActive = playingFocus?.word === item.word;
-            const title = `${display} · ${tonePreviewTitle(item.word, tonePreview.kind)}`;
+            const title = `${display} · ${tonePreviewTitle(
+              item.word,
+              tonePreview.kind,
+              tonePreview.scaleOffsets
+            )}`;
             return (
               <circle
                 key={`${index}-${item.word}`}
@@ -1877,7 +2087,11 @@ function HamiltonWordsView({
                   key={`${index}-${item.word}`}
                   type="button"
                   dir={isHebrew ? "rtl" : "ltr"}
-                  title={`${display} · ${tonePreviewTitle(item.word, tonePreview.kind)}`}
+                  title={`${display} · ${tonePreviewTitle(
+                    item.word,
+                    tonePreview.kind,
+                    tonePreview.scaleOffsets
+                  )}`}
                   onClick={() => play(item.word)}
                   className={`absolute rounded-md border bg-background/90 px-1.5 py-0.5 text-lg leading-6 shadow-sm [unicode-bidi:isolate] ${
                     playWord
@@ -2165,12 +2379,16 @@ function WordTile({
       }
       title={
         playWord
-          ? `Play from here · ${tonePreviewTitle(item.word, tonePreview.kind)} · ${
-              isEvenPermutationWord(item.word) ? "Even" : "Odd"
-            } permutation`
-          : `${tonePreviewTitle(item.word, tonePreview.kind)} · ${
-              isEvenPermutationWord(item.word) ? "Even" : "Odd"
-            } permutation`
+          ? `Play from here · ${tonePreviewTitle(
+              item.word,
+              tonePreview.kind,
+              tonePreview.scaleOffsets
+            )} · ${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`
+          : `${tonePreviewTitle(
+              item.word,
+              tonePreview.kind,
+              tonePreview.scaleOffsets
+            )} · ${isEvenPermutationWord(item.word) ? "Even" : "Odd"} permutation`
       }
       className={`inline-flex flex-col items-stretch rounded-md border px-1.5 py-1 text-2xl leading-8 transition-shadow [unicode-bidi:isolate] ${
         playWord
@@ -2207,6 +2425,7 @@ function WordTile({
       <TonalPreview
         word={word}
         kind={tonePreview.kind}
+        scaleOffsets={tonePreview.scaleOffsets}
       />
     </span>
   );
@@ -2215,15 +2434,17 @@ function WordTile({
 function TonalPreview({
   word,
   kind,
+  scaleOffsets,
   stretch = false,
   alignToLetters = false,
 }: {
   word: string;
   kind: SoundKind;
+  scaleOffsets: readonly number[];
   stretch?: boolean;
   alignToLetters?: boolean;
 }) {
-  const tones = tonePreviewTones(word, kind);
+  const tones = tonePreviewTones(word, kind, scaleOffsets);
   if (tones.length === 0) return null;
 
   const width = stretch ? 100 : Math.max(42, tones.length * 13);
@@ -2281,15 +2502,18 @@ function TonalPreview({
 
 function tonePreviewTones(
   word: string,
-  kind: SoundKind
+  kind: SoundKind,
+  scaleOffsets: readonly number[]
 ): { y: number; label: string }[] {
   const letters = Array.from(word);
   const maxLetterIndex = Math.max(
     0,
     ...letters.map((letter) => letter.charCodeAt(0) - 97)
   );
-  const melodicMax =
-    TSEROUF_SCALE_OFFSETS[maxLetterIndex] ?? maxLetterIndex * 2;
+  const melodicMax = tseroufMelodicTone(
+    String.fromCharCode(97 + maxLetterIndex),
+    scaleOffsets
+  ).semitone;
   const droneMax = Math.log2(
     TSEROUF_DRONE_HARMONICS[maxLetterIndex] ?? maxLetterIndex + 2
   );
@@ -2299,7 +2523,7 @@ function tonePreviewTones(
     const value =
       kind === "drone"
         ? Math.log2(tseroufDroneTone(letter).harmonic)
-        : tseroufMelodicTone(letter).semitone;
+        : tseroufMelodicTone(letter, scaleOffsets).semitone;
     const [min, max] = range;
     const norm = max === min ? 0.5 : (value - min) / (max - min);
     return {
@@ -2307,14 +2531,20 @@ function tonePreviewTones(
       label:
         kind === "drone"
           ? tseroufDroneTone(letter).label
-          : tseroufMelodicTone(letter).label,
+          : tseroufMelodicTone(letter, scaleOffsets).label,
     };
   });
 }
 
-function tonePreviewTitle(word: string, kind: SoundKind): string {
+function tonePreviewTitle(
+  word: string,
+  kind: SoundKind,
+  scaleOffsets: readonly number[]
+): string {
   const labels = Array.from(word).map((letter) =>
-    kind === "drone" ? tseroufDroneTone(letter).label : tseroufMelodicTone(letter).label
+    kind === "drone"
+      ? tseroufDroneTone(letter).label
+      : tseroufMelodicTone(letter, scaleOffsets).label
   );
   return kind === "drone"
     ? `Overtone contour: ${labels.join(" -> ")}`

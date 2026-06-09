@@ -1,5 +1,6 @@
 import { DihedralView } from "@/components/dihedral/dihedral-view";
 import type { Metadata } from "next";
+import { Suspense } from "react";
 
 export const metadata: Metadata = {
   title: "Dihedral",
@@ -10,7 +11,9 @@ export const metadata: Metadata = {
 export default function DihedralPage() {
   return (
     <div className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6">
-      <DihedralView />
+      <Suspense fallback={null}>
+        <DihedralView />
+      </Suspense>
     </div>
   );
 }

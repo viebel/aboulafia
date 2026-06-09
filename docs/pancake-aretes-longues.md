@@ -224,6 +224,38 @@ change de signe ; A₄ = zéro double de `ρ`. **Validée** : Williams → 0 cus
 coin = signature d'**auto-similarité**, pas de nouveauté. **A₄ : aucun signal
 robuste** (candidats dispersés 0/1/2, incohérents entre feuillets = bruit).
 
+### Sonde elliptique (`elliptic-probe.mjs`)
+
+Question testée : les branches de caustique dans le coin fondamental `π/n`
+ressemblent-elles à des **cubiques lisses** stables, donc à de vraies candidates
+elliptiques, plutôt qu'à une simple analogie ?
+
+Méthode : reconstruire la caustique depuis la fonction de support
+`H(ψ)` (`x=H cosψ-H' sinψ`, `y=H sinψ+H' cosψ`), découper par coins `π/n`,
+puis fitter des courbes implicites de degrés 2, 3 et 4 avec validation croisée
+pair/impair. Une piste elliptique demanderait :
+
+- gros gain degré 2 → 3 ;
+- faible gain degré 3 → 4 ;
+- stabilité entre `n=10` et `n=12` ;
+- échec du témoin Williams.
+
+Résultat (`NB=1440`, `3M` cordes, lissage `21`) :
+
+| Objet | feuillet | verdict |
+|---|---|---|
+| Williams `n=8` | bord / centre | degré 2 suffit → témoin rationnel/dégénéré |
+| Zaks `n=8` | bord / centre | degré 4 améliore fortement → structure > cubique |
+| Zaks `n=10` | bord | seul signal cubique possible |
+| Zaks `n=10` | centre | degré 4 améliore fortement → structure > cubique |
+| Zaks `n=12` | bord / centre | degré 4 améliore fortement → structure > cubique |
+
+**Conclusion elliptique provisoire :** pas de signal elliptique robuste. Le seul
+cas compatible avec une cubique (`n=10`, feuillet bord) ne survit pas au passage
+à `n=12`. Les courbes Zaks semblent plutôt relever d'une enveloppe
+auto-similaire à structure supérieure à la cubique, tandis que Williams valide le
+témoin rationnel/dégénéré attendu.
+
 ## Conclusion de l'enquête
 
 - **Auto-similarité** : confirmée, forte, et **propre au layout de Zaks**
@@ -262,6 +294,8 @@ robuste** (candidats dispersés 0/1/2, incohérents entre feuillets = bruit).
   (`src/lib/pancake.ts`).
 - `drawYankelovichToCanvas` — champ de densité / caustiques `rₙ`
   (`src/lib/pancake-render.ts`).
+- `scratch/elliptic-probe.mjs` — sonde cubique/elliptique sur les coins
+  fondamentaux via fits implicites de degrés 2/3/4.
 - `buildZaksSamplingGraph(n)` — échantillonnage `O(n²)` des cordes `rₙ`.
 - `forEachZaksFundamentalEdge`, `computeZaksOrbits` — secteur fondamental
   (orbites `Cₙ`) ; replier en plus par `ω` pour le coin `π/n`.
