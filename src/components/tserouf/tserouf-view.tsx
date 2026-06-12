@@ -608,7 +608,9 @@ export function TseroufView() {
 
   const playSingleWord = (word: string) => {
     const sourceIndex = wordIndexMap.get(word);
-    const sourceNote = sourceIndex === undefined ? undefined : words[sourceIndex];
+    if (sourceIndex === undefined) return;
+
+    const sourceNote = words[sourceIndex];
     if (!sourceNote) return;
 
     const kind = soundKindFor(instrument);
