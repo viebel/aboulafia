@@ -1,0 +1,82 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+
+\newtheorem*{theorem}{Result}
+
+\newcommand{\R}{\mathbb R}
+\newcommand{\Z}{\mathbb Z}
+\newcommand{\ch}{\operatorname{Ch}}
+
+\title{A Dihedrally Equivariant Ordering of Type \(A\) Chambers}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+Let \(W=S_n\) be the Weyl group of type \(A_{n-1}\), acting on
+\[
+  V=\R^n/\langle(1,\ldots,1)\rangle
+\]
+by permuting coordinates. Let
+\[
+  \mathcal A_{n-1}
+  =
+  \{\,x_i=x_j : 1\leq i<j\leq n\,\}
+\]
+be the Coxeter arrangement of type \(A_{n-1}\). Its chambers are naturally
+indexed by the elements of \(W\), equivalently by the \(n!\) linear orders of
+the coordinates \(x_1,\ldots,x_n\).
+
+Place the indices \(1,\ldots,n\) on the vertices of a regular \(n\)-gon. This
+chooses a dihedral subgroup
+\[
+  D_n=\langle r,s\rangle \subset S_n,
+\]
+where
+\[
+  r:1\mapsto 2\mapsto\cdots\mapsto n\mapsto 1
+\]
+is a Coxeter element of type \(A_{n-1}\), and \(s\) is a reflection of the
+\(n\)-gon. The group \(D_n\) acts on the arrangement, hence on its chambers.
+
+\begin{theorem}
+For every \(n\geq 5\), there is a recursively constructed cyclic ordering of all
+chambers of the type \(A_{n-1}\) Coxeter arrangement,
+\[
+  \Phi_n:\ch(\mathcal A_{n-1})\longrightarrow \Z/n!\Z,
+\]
+with the following dihedral equivariance property.
+
+For every chamber \(C\),
+\[
+  \Phi_n(r\cdot C)
+  =
+  \Phi_n(C)+(n-1)!
+  \pmod{n!}.
+\]
+Thus the Coxeter element \(r\) acts on the ordering as a rotation of the cycle
+of \(n!\) chambers.
+
+Moreover, the reflection \(s\) acts as a reflection of the same cycle: there is
+a constant \(a\in\Z/n!\Z\), depending on the choice of origin of the ordering,
+such that
+\[
+  \Phi_n(s\cdot C)
+  =
+  a-\Phi_n(C)
+  \pmod{n!}.
+\]
+\end{theorem}
+
+Equivalently, the recursive construction realizes the natural dihedral action
+\[
+  D_n\curvearrowright \ch(\mathcal A_{n-1})
+\]
+as the ordinary dihedral symmetry of the cyclically ordered set
+\(\Z/n!\Z\). The ordering is produced recursively from rank \(n-2\) to rank
+\(n-1\), rather than by choosing representatives of \(D_n\)-orbits.
+
+\end{document}

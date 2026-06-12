@@ -20,21 +20,37 @@ export function LineSpaceView({
   lineSpace,
   orderLabel,
   showRasterLayer,
+  seedWedgeOnly = false,
 }: {
   lineSpace: LineSpace;
   orderLabel: string;
   showRasterLayer: boolean;
+  seedWedgeOnly?: boolean;
 }) {
   const width = 900;
   const height = 380;
   const margin = { top: 16, right: 16, bottom: 34, left: 44 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
-  const cellWidth = plotWidth / lineSpace.psiBins;
+  const showSeedWedge = lineSpace.hasSeedWedge && seedWedgeOnly;
+  const thetaMax = showSeedWedge ? lineSpace.thetaMax / lineSpace.n : lineSpace.thetaMax;
+  const psiBins = showSeedWedge ? lineSpace.seedWedgePsiBins : lineSpace.psiBins;
+  const bins = showSeedWedge ? lineSpace.seedWedgeBins : lineSpace.bins;
+  const maxCount = showSeedWedge
+    ? lineSpace.seedWedgeMaxCount
+    : lineSpace.maxCount;
+  const cellWidth = plotWidth / psiBins;
   const cellHeight = plotHeight / lineSpace.pBins;
   const yForP = (p: number) => margin.top + ((1 - (p + 1) / 2) * plotHeight);
   const xForTheta = (theta: number) =>
-    margin.left + (theta / lineSpace.thetaMax) * plotWidth;
+    margin.left + (theta / thetaMax) * plotWidth;
+  const wedgeStep = lineSpace.thetaMax / lineSpace.n;
+  const wedgeMarkers = lineSpace.hasSeedWedge
+    ? Array.from(
+        { length: Math.floor(thetaMax / wedgeStep) + 1 },
+        (_, i) => i * wedgeStep
+      )
+    : [];
 
   return (
     <section className="rounded-lg border bg-card p-3">
@@ -55,13 +71,14 @@ export function LineSpaceView({
           >
             <p className="text-xs leading-relaxed text-muted-foreground">
               Maps each {orderLabel} edge chord to its normal form (θ, p), then
-              counts hits in a 180 × 120 grid. White means no or few chords hit
-              that cell; deeper orange means more chords share the same line
-              coordinates.
+              counts hits in a {psiBins} × {lineSpace.pBins} grid. White means
+              no or few chords hit that cell; deeper orange means more chords
+              share the same line coordinates.
             </p>
           </TooltipContent>
         </Tooltip>
         <span className="font-mono text-xs text-muted-foreground">
+          bins {psiBins} × {lineSpace.pBins} ·{" "}
           total {formatUiNumber(lineSpace.totalEdgeCount)}
           {lineSpace.hasSeedWedge
             ? ` · seed ${formatUiNumber(lineSpace.seedEdgeCount)}`
@@ -100,7 +117,7 @@ export function LineSpaceView({
           </g>
         ))}
 
-        {[0, lineSpace.thetaMax / 2, lineSpace.thetaMax].map((theta) => (
+        {[0, thetaMax / 2, thetaMax].map((theta) => (
           <g key={`theta-${theta}`}>
             <line
               x1={svgNumber(xForTheta(theta))}
@@ -115,15 +132,35 @@ export function LineSpaceView({
               textAnchor="middle"
               className="fill-muted-foreground text-[11px]"
             >
-              {theta === 0 ? "0" : theta === lineSpace.thetaMax ? "π" : "π/2"}
+              {theta === 0
+                ? "0"
+                : theta === thetaMax && showSeedWedge
+                  ? `π/${lineSpace.n}`
+                  : theta === thetaMax
+                    ? "π"
+                    : showSeedWedge
+                      ? `π/${2 * lineSpace.n}`
+                      : "π/2"}
             </text>
           </g>
         ))}
 
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`wedge-${index}`}
+            x1={svgNumber(xForTheta(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForTheta(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.55 : 0.28)}
+            strokeDasharray="3 5"
+          />
+        ))}
+
         {showRasterLayer &&
-          lineSpace.bins.map((bin) => {
+          bins.map((bin) => {
             const opacity =
-              0.12 + 0.88 * Math.sqrt(bin.count / Math.max(1, lineSpace.maxCount));
+              0.12 + 0.88 * Math.sqrt(bin.count / Math.max(1, maxCount));
             return (
               <rect
                 key={`${bin.x}-${bin.y}`}
@@ -135,6 +172,18 @@ export function LineSpaceView({
               />
             );
           })}
+
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`wedge-overlay-${index}`}
+            x1={svgNumber(xForTheta(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForTheta(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.75 : 0.5)}
+            strokeDasharray="3 5"
+          />
+        ))}
 
         <text
           x={svgNumber(margin.left + plotWidth / 2)}

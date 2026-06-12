@@ -44,7 +44,12 @@ export type EdgeRenderMode = "line" | "density";
  */
 export type YankelovichTone = "log" | "equalize" | "clahe";
 /** Color ramp applied to the normalized Yankelovich tone. */
-export type YankelovichColormap = "gray" | "viridis" | "magma" | "inferno";
+export type YankelovichColormap =
+  | "gray"
+  | "viridis"
+  | "magma"
+  | "inferno"
+  | "stained";
 
 /**
  * Color scheme for the Symmetry renderer, used to visualize the dihedral (Dₙ)
@@ -65,6 +70,7 @@ export type YankelovichColormap = "gray" | "viridis" | "magma" | "inferno";
  *                 and long between-block full reversals (rₙ).
  */
 export type SymmetryColoring = "parity" | "orbit" | "dihedral" | "blocks";
+export type ZaksFundamentalView = "wedge" | "circle" | "flat";
 
 /** Which images to show in the vertex-orbit overlay. */
 export type OrbitParts = "both" | "rotations" | "reflections";
@@ -125,6 +131,10 @@ export interface RenderSettings {
   hiddenGenerators: number[];
   /** Symmetry-renderer color scheme (defaults to "parity"). */
   symmetryColoring?: SymmetryColoring;
+  /** For pancake-zaks symmetry rendering, show only the enlarged seed sector. */
+  zaksFundamentalOnly?: boolean;
+  /** Projection used when the pancake-zaks fundamental scope is active. */
+  zaksFundamentalView?: ZaksFundamentalView;
   /**
    * Draw the Dₙ overlay on the Symmetry renderer: the n radial sector lines at
    * the ρ-block boundaries, a shaded fundamental 360/n wedge, and the ω mirror
@@ -321,7 +331,8 @@ export function supportsVertexLabels(
   return (
     graph.n <= VERTEX_LABEL_MAX_N &&
     graph.kind !== "sliding-puzzle" &&
-    graph.kind !== "sierpinski"
+    graph.kind !== "sierpinski" &&
+    graph.kind !== "kaleidoscope"
   );
 }
 
@@ -347,6 +358,18 @@ function point(i: number, total: number, c: number, r: number): [number, number]
  */
 function sizingN(graph: PancakeGraph): number {
   if (graph.kind === "sliding-puzzle") return 2 * graph.n;
+  // |Bₙ| = 2ⁿ·n! grows much faster than n!; size it like the permutation graph
+  // whose order is closest from below (m! ≤ 2ⁿ·n!).
+  if (graph.kind === "hyperoctahedral") {
+    const v = 2 ** graph.n * factorial(graph.n);
+    let m = 1;
+    let f = 1;
+    while (f * (m + 1) <= v) {
+      m++;
+      f *= m;
+    }
+    return Math.max(3, m);
+  }
   // The Sierpiński graph has 3ⁿ vertices, far fewer than n! at large n, so size
   // it like the permutation graph whose order is closest from below (m! ≤ 3ⁿ).
   if (graph.kind === "sierpinski") {
@@ -427,14 +450,15 @@ function drawDihedralOverlayToCanvas(
   const { n, total, c, cy, r, scale } = geom;
   const off = dihedralOffset(total);
   const step = (2 * Math.PI) / n;
+  const chamber = Math.PI / n;
 
   ctx.save();
   ctx.setLineDash([]);
 
-  // Shaded fundamental 360/n wedge (block 0 = one ρ-orbit fundamental domain).
+  // Shaded Dₙ fundamental chamber: half of one ρ-sector, angle π/n.
   ctx.beginPath();
   ctx.moveTo(c, cy);
-  ctx.arc(c, cy, r, off, off + step);
+  ctx.arc(c, cy, r, off, off + chamber);
   ctx.closePath();
   ctx.fillStyle = withAlpha(palette.dihedralWedge, 0.1);
   ctx.fill();
@@ -722,15 +746,42 @@ function buildSectorMasks(
   total: number,
   c: number,
   cy: number,
-  r: number
+  r: number,
+  fundamentalOnly = false,
+  fundamentalView: ZaksFundamentalView = "wedge"
 ): ZaksSymmetryMask[] {
   const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
   const halfTurns = n % 2 === 0 ? n / 2 : 0;
+  const mappedFundamental = fundamentalOnly && fundamentalView !== "wedge";
   const seg = (e: { i: number; j: number }): [number, number, number, number] => {
     const [ax, ay] = pointXY(e.i, total, c, cy, r);
     const [bx, by] = pointXY(e.j, total, c, cy, r);
     return [ax, ay, bx, by];
   };
+  const segments = (e: { i: number; j: number; half?: boolean }) => {
+    if (!mappedFundamental) return [seg(e)];
+    const repeats = e.half ? halfTurns : n;
+    const block = total / n;
+    const out: Array<[number, number, number, number]> = [];
+    for (let s = 0; s < repeats; s++) {
+      const a = (e.i + s * block) % total;
+      const b = (e.j + s * block) % total;
+      const clipped = zaksFundamentalSegmentXY(
+        a,
+        b,
+        total,
+        n,
+        c,
+        cy,
+        r,
+        fundamentalView
+      );
+      if (clipped) out.push(clipped);
+    }
+    return out;
+  };
+  const fullRepeats = mappedFundamental ? 1 : n;
+  const halfRepeats = mappedFundamental ? 1 : halfTurns;
 
   if (coloring === "orbit" || coloring === "dihedral") {
     // One hue per orbit. For "orbit" each fundamental representative is its own
@@ -743,23 +794,30 @@ function buildSectorMasks(
     const halfCoords: number[] = [];
     const halfColors: string[] = [];
     forEachZaksFundamentalEdge(n, (e) => {
+      if (fundamentalOnly && e.gen < n) return;
       const color = orbitColor(qmap.get(canonicalOrbitCode(e.i, e.j, n, total, B)) ?? 0);
       if (hidden && hidden.has(e.gen)) return;
-      const [ax, ay, bx, by] = seg(e);
-      if (e.half) {
-        halfCoords.push(ax, ay, bx, by);
-        halfColors.push(color);
-      } else {
-        fullCoords.push(ax, ay, bx, by);
-        fullColors.push(color);
+      for (const [ax, ay, bx, by] of segments(e)) {
+        if (e.half && !mappedFundamental) {
+          halfCoords.push(ax, ay, bx, by);
+          halfColors.push(color);
+        } else {
+          fullCoords.push(ax, ay, bx, by);
+          fullColors.push(color);
+        }
       }
     });
     const masks: ZaksSymmetryMask[] = [
-      { repeats: n, coords: Float32Array.from(fullCoords), color: null, colors: fullColors },
+      {
+        repeats: fullRepeats,
+        coords: Float32Array.from(fullCoords),
+        color: null,
+        colors: fullColors,
+      },
     ];
-    if (halfTurns > 0 && halfCoords.length > 0) {
+    if (halfRepeats > 0 && halfCoords.length > 0) {
       masks.push({
-        repeats: halfTurns,
+        repeats: halfRepeats,
         coords: Float32Array.from(halfCoords),
         color: null,
         colors: halfColors,
@@ -776,21 +834,23 @@ function buildSectorMasks(
     const betweenFull: number[] = [];
     const betweenHalf: number[] = [];
     forEachZaksFundamentalEdge(n, (e) => {
+      if (fundamentalOnly && e.gen < n) return;
       if (hidden && hidden.has(e.gen)) return;
-      const [ax, ay, bx, by] = seg(e);
-      if (e.gen < n) {
-        withinFull.push(ax, ay, bx, by);
-      } else if (e.half) {
-        betweenHalf.push(ax, ay, bx, by);
-      } else {
-        betweenFull.push(ax, ay, bx, by);
+      for (const [ax, ay, bx, by] of segments(e)) {
+        if (e.gen < n) {
+          withinFull.push(ax, ay, bx, by);
+        } else if (e.half && !mappedFundamental) {
+          betweenHalf.push(ax, ay, bx, by);
+        } else {
+          betweenFull.push(ax, ay, bx, by);
+        }
       }
     });
     const masks: ZaksSymmetryMask[] = [];
     // Within-block chords first (light), then the rₙ skeleton on top (dark).
     if (withinFull.length > 0) {
       masks.push({
-        repeats: n,
+        repeats: fullRepeats,
         coords: Float32Array.from(withinFull),
         color: palette.blockWithinStroke,
         colors: null,
@@ -798,15 +858,15 @@ function buildSectorMasks(
     }
     if (betweenFull.length > 0) {
       masks.push({
-        repeats: n,
+        repeats: fullRepeats,
         coords: Float32Array.from(betweenFull),
         color: palette.blockBetweenStroke,
         colors: null,
       });
     }
-    if (halfTurns > 0 && betweenHalf.length > 0) {
+    if (halfRepeats > 0 && betweenHalf.length > 0) {
       masks.push({
-        repeats: halfTurns,
+        repeats: halfRepeats,
         coords: Float32Array.from(betweenHalf),
         color: palette.blockBetweenStroke,
         colors: null,
@@ -826,6 +886,7 @@ function buildSectorMasks(
   let evenWeight = 0;
   let oddWeight = 0;
   forEachZaksFundamentalEdge(n, (e) => {
+    if (fundamentalOnly && e.gen < n) return;
     const orbit = e.half ? n / 2 : n;
     if (e.parityXor === 0) evenWeight += orbit;
     else oddWeight += orbit;
@@ -850,15 +911,28 @@ function buildSectorMasks(
       full = oddF;
       half = oddH;
     }
-    const [ax, ay, bx, by] = seg(e);
-    if (e.half) half.push(ax, ay, bx, by);
-    else full.push(ax, ay, bx, by);
+    for (const [ax, ay, bx, by] of segments(e)) {
+      if (e.half && !mappedFundamental) half.push(ax, ay, bx, by);
+      else full.push(ax, ay, bx, by);
+    }
   });
   const mk = (color: string, f: number[], hh: number[]): ZaksSymmetryMask[] => {
     const out: ZaksSymmetryMask[] = [];
-    if (f.length > 0) out.push({ repeats: n, coords: Float32Array.from(f), color, colors: null });
-    if (halfTurns > 0 && hh.length > 0) {
-      out.push({ repeats: halfTurns, coords: Float32Array.from(hh), color, colors: null });
+    if (f.length > 0) {
+      out.push({
+        repeats: fullRepeats,
+        coords: Float32Array.from(f),
+        color,
+        colors: null,
+      });
+    }
+    if (halfRepeats > 0 && hh.length > 0) {
+      out.push({
+        repeats: halfRepeats,
+        coords: Float32Array.from(hh),
+        color,
+        colors: null,
+      });
     }
     return out;
   };
@@ -933,13 +1007,14 @@ function dihedralOverlaySVG(
   const { n, total, c, r, scale } = geom;
   const off = dihedralOffset(total);
   const step = (2 * Math.PI) / n;
+  const chamber = Math.PI / n;
   const parts: string[] = [];
 
   const wx0 = c + r * Math.cos(off);
   const wy0 = c + r * Math.sin(off);
-  const wx1 = c + r * Math.cos(off + step);
-  const wy1 = c + r * Math.sin(off + step);
-  const large = step > Math.PI ? 1 : 0;
+  const wx1 = c + r * Math.cos(off + chamber);
+  const wy1 = c + r * Math.sin(off + chamber);
+  const large = chamber > Math.PI ? 1 : 0;
   parts.push(
     `<path d="M${c},${c}L${wx0.toFixed(2)},${wy0.toFixed(2)}A${r.toFixed(2)},${r.toFixed(
       2
@@ -1973,8 +2048,17 @@ export function drawToCanvas(
   const scale = size / 1000;
 
   const k = constantsFor(n, scale);
-  const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
-  const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
+  const coxeterPlane =
+    graph.preset === "coxeter-a" ||
+    graph.preset === "coxeter-b" ||
+    graph.preset === "coxeter-d" ||
+    graph.preset === "coxeter-h4-600-cell";
+  const edgeAlpha = coxeterPlane
+    ? Math.max(0.82, sliderToEdgeAlpha(settings.alpha))
+    : sliderToEdgeAlpha(settings.alpha);
+  const edgeWidth = coxeterPlane
+    ? Math.max(0.95 * scale, sliderToEdgeWidth(settings.width) * scale)
+    : sliderToEdgeWidth(settings.width) * scale;
   // Explicit 2-D layout (the Sierpiński gasket) when present; otherwise the
   // vertex sits on the circle at angle 2πi/total.
   const posXY = (i: number): [number, number] =>
@@ -2106,7 +2190,7 @@ export function drawToCanvas(
   const labelMode = settings.showLabels && supportsVertexLabels(graph);
 
   if (settings.showVertices) {
-    const dotRadius = Math.max(0.5, k.vertexRadius);
+    const dotRadius = coxeterPlane ? Math.max(1.2 * scale, 0.7) : Math.max(0.5, k.vertexRadius);
     if (coloring === "blocks") {
       // Band the dots into n arcs by leading symbol (one ρ-block per arc).
       const B = total / graph.n;
@@ -2231,6 +2315,201 @@ function getScratchCanvas(w: number, h: number): HTMLCanvasElement {
 // perimeter cycle already conveys the ring). The flat SVG export is unaffected.
 const SYMMETRY_VERTEX_LIMIT = 50_000;
 
+function zaksFundamentalPointXY(
+  i: number,
+  total: number,
+  n: number,
+  cx: number,
+  cy: number,
+  r: number,
+  view: ZaksFundamentalView = "wedge"
+): [number, number] {
+  const sourceStart = dihedralOffset(total);
+  const sourceWedge = Math.PI / n;
+  const sourceTheta = (2 * Math.PI * i) / total;
+  if (view === "wedge") {
+    return [cx + r * Math.cos(sourceTheta), cy + r * Math.sin(sourceTheta)];
+  }
+  const u = (sourceTheta - sourceStart) / sourceWedge;
+  if (view === "circle") {
+    const a = -Math.PI / 2 + u * 2 * Math.PI;
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  }
+  return [cx + (u - 0.5) * 1.5 * r, cy - 0.42 * r];
+}
+
+function zaksFundamentalSegmentXY(
+  i: number,
+  j: number,
+  total: number,
+  n: number,
+  cx: number,
+  cy: number,
+  r: number,
+  view: ZaksFundamentalView = "wedge"
+): [number, number, number, number] | null {
+  const sourceStart = dihedralOffset(total);
+  const sourceEnd = sourceStart + Math.PI / n;
+  if (view === "circle") {
+    const foldedPoint = (index: number): [number, number] => {
+      const period = (2 * Math.PI) / n;
+      const chamber = Math.PI / n;
+      const theta = (2 * Math.PI * index) / total;
+      const t = ((theta - sourceStart) % period + period) % period;
+      const folded = t <= chamber ? t : period - t;
+      const a = -Math.PI / 2 + (folded / chamber) * 2 * Math.PI;
+      return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+    };
+    const [ax, ay] = foldedPoint(i);
+    const [bx, by] = foldedPoint(j);
+    return [ax, ay, bx, by];
+  }
+  const ai = (2 * Math.PI * i) / total;
+  const aj = (2 * Math.PI * j) / total;
+  let x0 = Math.cos(ai);
+  let y0 = Math.sin(ai);
+  let x1 = Math.cos(aj);
+  let y1 = Math.sin(aj);
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (f0: number, f1: number): boolean => {
+    const df = f1 - f0;
+    if (Math.abs(df) < 1e-12) return f0 >= 0;
+    const t = -f0 / df;
+    if (df > 0) t0 = Math.max(t0, t);
+    else t1 = Math.min(t1, t);
+    return t0 <= t1;
+  };
+  const sx = Math.cos(sourceStart);
+  const sy = Math.sin(sourceStart);
+  const ex = Math.cos(sourceEnd);
+  const ey = Math.sin(sourceEnd);
+  // Inside the wedge: left of the first ray and right of the second ray.
+  if (!clip(sx * y0 - sy * x0, sx * y1 - sy * x1)) return null;
+  if (!clip(-(ex * y0 - ey * x0), -(ex * y1 - ey * x1))) return null;
+  const ox0 = x0;
+  const oy0 = y0;
+  const ox1 = x1;
+  const oy1 = y1;
+  x0 = ox0 + (ox1 - ox0) * t0;
+  y0 = oy0 + (oy1 - oy0) * t0;
+  x1 = ox0 + (ox1 - ox0) * t1;
+  y1 = oy0 + (oy1 - oy0) * t1;
+  const map = (x: number, y: number): [number, number] => {
+    const rr = Math.hypot(x, y);
+    let theta = Math.atan2(y, x);
+    while (theta < sourceStart) theta += 2 * Math.PI;
+    const u = (theta - sourceStart) / (sourceEnd - sourceStart);
+    if (view === "wedge") {
+      return [cx + r * rr * Math.cos(theta), cy + r * rr * Math.sin(theta)];
+    }
+    return [cx + (u - 0.5) * 1.5 * r, cy + (0.62 - rr) * 1.35 * r];
+  };
+  const [ax, ay] = map(x0, y0);
+  const [bx, by] = map(x1, y1);
+  return [ax, ay, bx, by];
+}
+
+function drawZaksFundamentalFrame(
+  ctx: CanvasRenderingContext2D,
+  geom: { n: number; total: number; c: number; cy: number; r: number; scale: number },
+  palette: Palette,
+  view: ZaksFundamentalView = "wedge"
+): void {
+  const { n, total, c, cy, r, scale } = geom;
+  if (view === "circle") {
+    ctx.save();
+    ctx.lineWidth = Math.max(1.2, 1.4 * scale);
+    ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.9);
+    ctx.beginPath();
+    ctx.arc(c, cy, r, 0, 2 * Math.PI);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+  if (view === "flat") {
+    ctx.save();
+    ctx.lineWidth = Math.max(1.2, 1.4 * scale);
+    ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.9);
+    ctx.strokeRect(c - 0.75 * r, cy - 0.73 * r, 1.5 * r, 1.35 * r);
+    ctx.restore();
+    return;
+  }
+  const a0 = dihedralOffset(total);
+  const a1 = a0 + Math.PI / n;
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(c, cy);
+  ctx.lineTo(c + r * Math.cos(a0), cy + r * Math.sin(a0));
+  ctx.arc(c, cy, r, a0, a1);
+  ctx.lineTo(c, cy);
+  ctx.closePath();
+  ctx.fillStyle = withAlpha(palette.dihedralWedge, 0.08);
+  ctx.fill();
+  ctx.lineWidth = Math.max(1.2, 1.4 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.9);
+  ctx.beginPath();
+  ctx.moveTo(c, cy);
+  ctx.lineTo(c + r * Math.cos(a0), cy + r * Math.sin(a0));
+  ctx.arc(c, cy, r, a0, a1);
+  ctx.lineTo(c, cy);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawReflectionQuotientCircleToCanvas(
+  ctx: CanvasRenderingContext2D,
+  opts: {
+    n: number;
+    c: number;
+    cy: number;
+    r: number;
+    scale: number;
+    edgeAlpha: number;
+    edgeWidth: number;
+    palette: Palette;
+  }
+): void {
+  const { n, c, cy, r, scale, edgeAlpha, edgeWidth, palette } = opts;
+  if (n < 3) return;
+  const total = factorial(n);
+  const block = factorial(n - 1);
+  const quotient = total / 2;
+  const halfTurns = n % 2 === 0 ? n / 2 : 0;
+  const foldedPoint = (index: number): [number, number] => {
+    const folded = Math.min(index, total - 1 - index);
+    const a = -Math.PI / 2 + (folded / quotient) * 2 * Math.PI;
+    return [c + r * Math.cos(a), cy + r * Math.sin(a)];
+  };
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineWidth = Math.max(0.55 * scale, edgeWidth * 0.85);
+  ctx.strokeStyle = withAlpha(palette.cayleyStroke, Math.min(0.75, edgeAlpha));
+  forEachZaksFundamentalEdge(n, (e) => {
+    if (e.gen < n) return;
+    const repeats = e.half ? halfTurns : n;
+    for (let s = 0; s < repeats; s++) {
+      const a = (e.i + s * block) % total;
+      const b = (e.j + s * block) % total;
+      const [x0, y0] = foldedPoint(a);
+      const [x1, y1] = foldedPoint(b);
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.stroke();
+    }
+  });
+
+  ctx.lineWidth = Math.max(1.2, 1.4 * scale);
+  ctx.strokeStyle = withAlpha(palette.dihedralSector, 0.9);
+  ctx.beginPath();
+  ctx.arc(c, cy, r, 0, 2 * Math.PI);
+  ctx.stroke();
+  ctx.restore();
+}
+
 /**
  * On-screen symmetry renderer for the pancake-zaks layout. Draws only the
  * fundamental sector (block 0) and composites n rotated copies with canvas
@@ -2273,18 +2552,49 @@ export function drawZaksSymmetryToCanvas(
 
   const size = Math.min(w, h);
   const c = size / 2 + (w - size) / 2;
-  const cy = size / 2 + (h - size) / 2;
-  const r = size * 0.405;
+  const compareReflectionQuotient =
+    (settings.zaksFundamentalOnly ?? false) &&
+    (settings.zaksFundamentalView ?? "wedge") === "circle" &&
+    n > 3;
+  const cy = compareReflectionQuotient
+    ? size * 0.24 + (h - size) / 2
+    : size / 2 + (h - size) / 2;
+  const r = size * (compareReflectionQuotient ? 0.22 : 0.405);
   const scale = size / 1000;
   const k = constantsFor(n, scale);
   const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
   const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
   const step = (2 * Math.PI) / n;
+  const fundamentalOnly = settings.zaksFundamentalOnly ?? false;
+  const fundamentalView = settings.zaksFundamentalView ?? "wedge";
   ctx.lineCap = "round";
+
+  if (fundamentalOnly && fundamentalView === "wedge") {
+    const a0 = dihedralOffset(total);
+    const a1 = a0 + Math.PI / n;
+    ctx.beginPath();
+    ctx.moveTo(c, cy);
+    ctx.lineTo(c + r * Math.cos(a0), cy + r * Math.sin(a0));
+    ctx.arc(c, cy, r, a0, a1);
+    ctx.lineTo(c, cy);
+    ctx.closePath();
+    ctx.clip();
+  }
 
   if (settings.showCycle) {
     ctx.beginPath();
-    ctx.arc(c, cy, r, 0, 2 * Math.PI);
+    if (fundamentalOnly) {
+      if (fundamentalView === "wedge") {
+        const a0 = dihedralOffset(total);
+        ctx.arc(c, cy, r, a0, a0 + Math.PI / n);
+      } else if (fundamentalView === "circle") {
+        ctx.arc(c, cy, r, 0, 2 * Math.PI);
+      } else {
+        ctx.rect(c - 0.75 * r, cy - 0.73 * r, 1.5 * r, 1.35 * r);
+      }
+    } else {
+      ctx.arc(c, cy, r, 0, 2 * Math.PI);
+    }
     ctx.strokeStyle = withAlpha(palette.cayleyStroke, edgeAlpha);
     ctx.lineWidth = k.cycleWidth;
     ctx.stroke();
@@ -2296,16 +2606,35 @@ export function drawZaksSymmetryToCanvas(
   const hiddenKey = [...new Set(settings.hiddenGenerators)]
     .sort((a, b) => a - b)
     .join(",");
-  const key = `${n}|${w}x${h}|${coloring}|${settings.parityMode}|${hiddenKey}`;
+  const key = `${n}|${w}x${h}|${coloring}|${settings.parityMode}|${hiddenKey}|${
+    fundamentalOnly ? `fund-${fundamentalView}` : "full"
+  }`;
   let sectors = cache?.current && cache.current.key === key ? cache.current : null;
   if (!sectors) {
-    const masks = buildSectorMasks(n, coloring, settings, palette, total, c, cy, r);
+    const vertexSeedCount =
+      fundamentalOnly && fundamentalView !== "wedge"
+        ? Math.max(1, Math.floor(B / 2))
+        : B;
+    const masks = buildSectorMasks(
+      n,
+      coloring,
+      settings,
+      palette,
+      total,
+      c,
+      cy,
+      r,
+      fundamentalOnly,
+      fundamentalView
+    );
     const vertices =
       settings.showVertices && total <= SYMMETRY_VERTEX_LIMIT
         ? (() => {
-            const v = new Float32Array(B * 2);
-            for (let i = 0; i < B; i++) {
-              const [x, y] = pointXY(i, total, c, cy, r);
+            const v = new Float32Array(vertexSeedCount * 2);
+            for (let i = 0; i < vertexSeedCount; i++) {
+              const [x, y] = fundamentalOnly
+                ? zaksFundamentalPointXY(i, total, n, c, cy, r, fundamentalView)
+                : pointXY(i, total, c, cy, r);
               v[2 * i] = x;
               v[2 * i + 1] = y;
             }
@@ -2380,7 +2709,9 @@ export function drawZaksSymmetryToCanvas(
     const plainFill = labelMode
       ? withAlpha(palette.labelVertexFill, 0.95)
       : withAlpha(palette.cayleyStroke, edgeAlpha);
-    for (let s = 0; s < n; s++) {
+    const vertexCopies =
+      fundamentalOnly && fundamentalView !== "wedge" ? 1 : n;
+    for (let s = 0; s < vertexCopies; s++) {
       ctx.save();
       ctx.translate(c, cy);
       ctx.rotate(step * s);
@@ -2399,16 +2730,18 @@ export function drawZaksSymmetryToCanvas(
   }
 
   if (
-    settings.showFundamentalDomain ||
-    settings.showSymmetryAxes ||
-    settings.showDihedralAxes ||
+    (!fundamentalOnly && settings.showFundamentalDomain) ||
+    (!fundamentalOnly && settings.showSymmetryAxes) ||
+    (!fundamentalOnly && settings.showDihedralAxes) ||
     settings.showVertexOrbit
   ) {
     const geom = { n, total, c, cy, r, scale };
-    if (settings.showFundamentalDomain)
+    if (!fundamentalOnly && settings.showFundamentalDomain)
       drawFundamentalDomainToCanvas(ctx, geom, settings, palette);
-    if (settings.showSymmetryAxes) drawSymmetryAxesToCanvas(ctx, geom, palette);
-    if (settings.showDihedralAxes) drawDihedralOverlayToCanvas(ctx, geom, palette);
+    if (!fundamentalOnly && settings.showSymmetryAxes)
+      drawSymmetryAxesToCanvas(ctx, geom, palette);
+    if (!fundamentalOnly && settings.showDihedralAxes)
+      drawDihedralOverlayToCanvas(ctx, geom, palette);
     if (settings.showVertexOrbit)
       drawVertexOrbitToCanvas(
         ctx,
@@ -2420,14 +2753,41 @@ export function drawZaksSymmetryToCanvas(
       );
   }
 
+  drawZaksFundamentalFrame(
+    ctx,
+    { n, total, c, cy, r, scale },
+    palette,
+    fundamentalOnly ? fundamentalView : "wedge"
+  );
+
+  if (compareReflectionQuotient) {
+    drawReflectionQuotientCircleToCanvas(ctx, {
+      n: n - 1,
+      c,
+      cy: size * 0.76 + (h - size) / 2,
+      r,
+      scale,
+      edgeAlpha,
+      edgeWidth,
+      palette,
+    });
+  }
+
   if (labelMode) {
     const labelOf = makeZaksLabelOf(n);
     ctx.fillStyle = palette.labelFill;
     ctx.font = `${vertexLabelFontSize(total) * dpr}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    for (let i = 0; i < total; i++) {
-      const [x, y] = pointXY(i, total, c, cy, r);
+    const labelCount =
+      fundamentalOnly && fundamentalView !== "wedge"
+        ? Math.max(1, Math.floor(B / 2))
+        : total;
+    for (let i = 0; i < labelCount; i++) {
+      const [x, y] =
+        fundamentalOnly && fundamentalView !== "wedge"
+          ? zaksFundamentalPointXY(i, total, n, c, cy, r, fundamentalView)
+          : pointXY(i, total, c, cy, r);
       ctx.fillText(labelOf(i), x, y);
     }
   }
@@ -2725,6 +3085,22 @@ function dihedralChordIntersectsYankelovichViewport(
   return false;
 }
 
+function cyclicChordIntersectsYankelovichViewport(
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  block: number,
+  i: number,
+  j: number
+): boolean {
+  for (let k = 0; k < n; k++) {
+    const a = (i + k * block) % total;
+    const b = (j + k * block) % total;
+    if (chordIntersectsYankelovichViewport(viewport, total, a, b)) return true;
+  }
+  return false;
+}
+
 /**
  * Israel Yankelovich's density-field visualization of a circular graph drawing.
  *
@@ -2734,9 +3110,9 @@ function dihedralChordIntersectsYankelovichViewport(
  * to white, so the chord *envelopes* (caustics) emerge — structure the plain
  * alpha-blended disk hides once it saturates to black.
  *
- * Analytic Dₙ presets exploit the fundamental angular sector: sample one sector,
- * then composite its n rotations and mirrored copies over the disk. Other
- * presets sample their materialized edge list directly.
+ * Analytic Cₙ / Dₙ presets exploit the fundamental angular sector: sample one
+ * sector, then composite its rotations (and Dₙ mirrored copies) over the disk.
+ * Other presets sample their materialized edge list directly.
  */
 export function drawYankelovichToCanvas(
   ctx: CanvasRenderingContext2D,
@@ -2856,13 +3232,15 @@ export function yankelovichFieldKey(opts: YankelovichCanvasOpts): string {
   const analyticDn =
     !graph ||
     graph.preset === "pancake-zaks" ||
+    graph.preset === "random-cyclic" ||
     graph.preset === "random-dihedral" ||
     graph.preset === "wedge-clipped-dihedral";
   const genericSampleCount =
     settings.yankelovichSampleCount ?? YANKELOVICH_DEFAULT_SAMPLE_COUNT;
   const sampleKey = !analyticDn
     ? `${genericSampleCount}|${yankelovichSampleSeed(settings)}`
-    : graph?.preset === "random-dihedral" ||
+    : graph?.preset === "random-cyclic" ||
+        graph?.preset === "random-dihedral" ||
         graph?.preset === "wedge-clipped-dihedral"
     ? `${yankelovichSampleCount(settings, n)}|${yankelovichSampleSeed(settings)}`
     : sampled
@@ -2898,7 +3276,17 @@ function buildYankelovichField(
     visibleVertices: 0,
   };
   const out =
-    graph?.preset === "random-dihedral"
+    graph?.preset === "random-cyclic"
+      ? yankelovichFieldRandomCyclic(
+          n,
+          field,
+          settings.hiddenGenerators,
+          yankelovichSampleCount(settings, n),
+          yankelovichSampleSeed(settings),
+          viewport,
+          timings
+        )
+      : graph?.preset === "random-dihedral"
       ? yankelovichFieldRandomDihedral(
           n,
           field,
@@ -2914,6 +3302,16 @@ function buildYankelovichField(
             field,
             settings.hiddenGenerators,
             yankelovichSampleCount(settings, n),
+            yankelovichSampleSeed(settings),
+            viewport,
+            timings
+          )
+      : graph?.preset === "simplex" && graph.edges.length === 0
+        ? yankelovichFieldSimplex(
+            n,
+            field,
+            settings,
+            settings.yankelovichSampleCount ?? YANKELOVICH_DEFAULT_SAMPLE_COUNT,
             yankelovichSampleSeed(settings),
             viewport,
             timings
@@ -3009,6 +3407,86 @@ function graphEdgeIntersectsYankelovichViewport(
 }
 
 /**
+ * Analytic Yankelovich field for a simplex viewed as the complete graph on n!
+ * vertices in circular order. Only sampled chords are drawn; no vertices or
+ * complete edge list are materialized.
+ */
+function yankelovichFieldSimplex(
+  n: number,
+  field: number,
+  settings: RenderSettings,
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const acc = new Float32Array(field * field);
+  const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
+  if (hidden && hidden.has(1)) return acc;
+
+  const total = factorial(n);
+  if (total < 2) return acc;
+  const edgeCount = (total * (total - 1)) / 2;
+  const direct = !isFullYankelovichViewport(viewport);
+  const rng = makeYankelovichRng(sampleSeed);
+  const target = Math.max(1, Math.min(edgeCount, Math.round(sampleCount)));
+  const enumerate = edgeCount <= target && total <= 10_000;
+  const maxAttempts = enumerate
+    ? edgeCount
+    : Math.min(edgeCount * 4, Math.max(target, target * 20));
+
+  const matrixT0 = performance.now();
+  let matrixEdges = 0;
+  let attempts = 0;
+  const sampledEdges = new Set<string>();
+  const drawChord = (i: number, j: number): boolean => {
+    if (i === j) return false;
+    const a = (2 * Math.PI * i) / total;
+    const b = (2 * Math.PI * j) / total;
+    const x1 = Math.cos(a);
+    const y1 = Math.sin(a);
+    const x2 = Math.cos(b);
+    const y2 = Math.sin(b);
+    if (
+      direct &&
+      !segmentIntersectsYankelovichViewport(viewport, x1, y1, x2, y2)
+    ) {
+      return false;
+    }
+    depositUnitSegment(acc, field, viewport, x1, y1, x2, y2, 1);
+    matrixEdges++;
+    return true;
+  };
+
+  if (enumerate) {
+    for (let i = 0; i < total; i++) {
+      for (let j = i + 1; j < total; j++) drawChord(i, j);
+    }
+  } else {
+    while (matrixEdges < target && attempts < maxAttempts) {
+      attempts++;
+      const i = Math.floor(rng() * total);
+      let j = Math.floor(rng() * total);
+      if (j === i) j = (j + 1) % total;
+      const a = Math.min(i, j);
+      const b = Math.max(i, j);
+      const key = `${a},${b}`;
+      if (sampledEdges.has(key)) continue;
+      if (drawChord(a, b)) sampledEdges.add(key);
+    }
+  }
+
+  if (timings) {
+    timings.matrixMs = performance.now() - matrixT0;
+    timings.symmetryMs = 0;
+    timings.matrixEdges = matrixEdges;
+    timings.viewportMs = 0;
+    timings.visibleVertices = total;
+  }
+  return acc;
+}
+
+/**
  * Generic Yankelovich field: sample this graph's actual edge set directly.
  * Unlike the Zaks pancake branch, this applies no Dₙ rotations or reflections.
  */
@@ -3029,7 +3507,9 @@ function yankelovichFieldFromGraph(
   const direct = !isFullYankelovichViewport(viewport);
   const rng = makeYankelovichRng(sampleSeed);
   const target = Math.max(1, Math.min(edgeCount, Math.round(sampleCount)));
-  const enumerate = target >= edgeCount;
+  // The kaleidoscope is a small deterministic vector graph: always draw every
+  // segment so the Dₙ symmetry is exact (no sampling / no edge-count limit).
+  const enumerate = graph.preset === "kaleidoscope" || target >= edgeCount;
   const maxAttempts = enumerate ? edgeCount : Math.min(edgeCount * 4, target * 20);
 
   const matrixT0 = performance.now();
@@ -3250,6 +3730,59 @@ function symmetrizeYankelovichAccumulator(
   return out;
 }
 
+function symmetrizeCyclicYankelovichAccumulator(
+  n: number,
+  field: number,
+  acc: Float32Array,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  const symmetryT0 = performance.now();
+  const out = new Float32Array(field * field);
+  const cos = new Float64Array(n);
+  const sin = new Float64Array(n);
+  for (let k = 0; k < n; k++) {
+    const a = (2 * Math.PI * k) / n;
+    cos[k] = Math.cos(a);
+    sin[k] = Math.sin(a);
+  }
+  const sampleAcc = (ux: number, uy: number): number => {
+    const { x, y } = mapYankelovichUnitToField(field, viewport, ux, uy);
+    if (x < 0 || y < 0 || x >= field - 1 || y >= field - 1) return 0;
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+    const i = y0 * field + x0;
+    return (
+      acc[i] * (1 - fx) * (1 - fy) +
+      acc[i + 1] * fx * (1 - fy) +
+      acc[i + field] * (1 - fx) * fy +
+      acc[i + field + 1] * fx * fy
+    );
+  };
+
+  for (let oy = 0; oy < field; oy++) {
+    for (let ox = 0; ox < field; ox++) {
+      const { ux: rx, uy: ry } = fieldToYankelovichUnit(
+        field,
+        viewport,
+        ox + 0.5,
+        oy + 0.5
+      );
+      let v = 0;
+      for (let k = 0; k < n; k++) {
+        const ux = rx * cos[k] + ry * sin[k];
+        const uy = -rx * sin[k] + ry * cos[k];
+        v += sampleAcc(ux, uy);
+      }
+      out[oy * field + ox] = v;
+    }
+  }
+  if (timings) timings.symmetryMs = performance.now() - symmetryT0;
+  return out;
+}
+
 function depositDihedralChordCopies(
   buf: Float32Array,
   field: number,
@@ -3266,6 +3799,24 @@ function depositDihedralChordCopies(
     const b = (j + k * block) % total;
     depositChord(buf, field, viewport, total, a, b, weight);
     depositChord(buf, field, viewport, total, total - 1 - a, total - 1 - b, weight);
+  }
+}
+
+function depositCyclicChordCopies(
+  buf: Float32Array,
+  field: number,
+  viewport: YankelovichFieldViewport,
+  n: number,
+  total: number,
+  block: number,
+  i: number,
+  j: number,
+  weight: number
+): void {
+  for (let k = 0; k < n; k++) {
+    const a = (i + k * block) % total;
+    const b = (j + k * block) % total;
+    depositChord(buf, field, viewport, total, a, b, weight);
   }
 }
 
@@ -3553,10 +4104,31 @@ function yankelovichFieldExact(
 }
 
 /**
- * Random Dₙ-symmetric matching control: sample source representatives from the
- * fundamental sector and pair them with distinct random endpoints, then apply
- * the same Dₙ field composite used by the Zaks analytic renderer.
+ * Random Cₙ / Dₙ-symmetric matching controls: sample source representatives
+ * from the fundamental sector and pair them with distinct random endpoints.
  */
+function yankelovichFieldRandomCyclic(
+  n: number,
+  field: number,
+  hiddenGenerators: number[],
+  sampleCount: number,
+  sampleSeed: number,
+  viewport: YankelovichFieldViewport,
+  timings?: YankelovichFieldTimings
+): Float32Array {
+  return yankelovichFieldRandomSymmetricBase(
+    n,
+    field,
+    hiddenGenerators,
+    "cyclic",
+    false,
+    sampleCount,
+    sampleSeed,
+    viewport,
+    timings
+  );
+}
+
 function yankelovichFieldRandomDihedral(
   n: number,
   field: number,
@@ -3566,10 +4138,11 @@ function yankelovichFieldRandomDihedral(
   viewport: YankelovichFieldViewport,
   timings?: YankelovichFieldTimings
 ): Float32Array {
-  return yankelovichFieldRandomDihedralBase(
+  return yankelovichFieldRandomSymmetricBase(
     n,
     field,
     hiddenGenerators,
+    "dihedral",
     false,
     sampleCount,
     sampleSeed,
@@ -3587,10 +4160,11 @@ function yankelovichFieldWedgeClippedDihedral(
   viewport: YankelovichFieldViewport,
   timings?: YankelovichFieldTimings
 ): Float32Array {
-  return yankelovichFieldRandomDihedralBase(
+  return yankelovichFieldRandomSymmetricBase(
     n,
     field,
     hiddenGenerators,
+    "dihedral",
     true,
     sampleCount,
     sampleSeed,
@@ -3599,10 +4173,11 @@ function yankelovichFieldWedgeClippedDihedral(
   );
 }
 
-function yankelovichFieldRandomDihedralBase(
+function yankelovichFieldRandomSymmetricBase(
   n: number,
   field: number,
   hiddenGenerators: number[],
+  symmetry: "cyclic" | "dihedral",
   wedgeClipped: boolean,
   sampleCount: number,
   sampleSeed: number,
@@ -3663,14 +4238,23 @@ function yankelovichFieldRandomDihedralBase(
             i,
             j
           )
-        : dihedralChordIntersectsYankelovichViewport(
-            viewport,
-            n,
-            total,
-            B,
-            i,
-            j
-          );
+        : symmetry === "cyclic"
+          ? cyclicChordIntersectsYankelovichViewport(
+              viewport,
+              n,
+              total,
+              B,
+              i,
+              j
+            )
+          : dihedralChordIntersectsYankelovichViewport(
+              viewport,
+              n,
+              total,
+              B,
+              i,
+              j
+            );
       if (!visible) continue;
     }
 
@@ -3706,6 +4290,18 @@ function yankelovichFieldRandomDihedralBase(
           candidate.j,
           candidate.weight
         );
+      } else if (symmetry === "cyclic") {
+        depositCyclicChordCopies(
+          acc,
+          field,
+          viewport,
+          n,
+          total,
+          B,
+          candidate.i,
+          candidate.j,
+          candidate.weight
+        );
       } else {
         depositDihedralChordCopies(
           acc,
@@ -3728,7 +4324,9 @@ function yankelovichFieldRandomDihedralBase(
     timings.matrixEdges = matrixEdges;
   }
   if (direct) return acc;
-  return symmetrizeYankelovichAccumulator(n, total, field, acc, viewport, timings);
+  return symmetry === "cyclic"
+    ? symmetrizeCyclicYankelovichAccumulator(n, field, acc, viewport, timings)
+    : symmetrizeYankelovichAccumulator(n, total, field, acc, viewport, timings);
 }
 
 /**
@@ -4134,6 +4732,13 @@ const COLORMAPS: Record<
   inferno: [
     [0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66],
     [245, 125, 21], [250, 193, 39], [252, 255, 164], [252, 255, 164],
+  ],
+  // Stained-glass rainbow: violet → blue → teal → green → gold → orange →
+  // crimson, capped by a bright highlight where many panes overlap.
+  stained: [
+    [26, 0, 51], [40, 30, 150], [20, 110, 190], [10, 170, 160],
+    [60, 190, 80], [210, 200, 40], [240, 130, 30], [215, 40, 70],
+    [255, 240, 210],
   ],
 };
 
@@ -4876,12 +5481,20 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
   const edgeAlpha = sliderToEdgeAlpha(settings.alpha);
   const edgeWidth = sliderToEdgeWidth(settings.width) * scale;
   const halfTurns = n % 2 === 0 ? n / 2 : 0;
+  const fundamentalOnly = settings.zaksFundamentalOnly ?? false;
+  const fundamentalVertexCount = fundamentalOnly ? Math.max(1, Math.floor(B / 2)) : B;
 
   const rotate = (steps: number): string =>
     steps === 0
       ? ""
       : ` transform="rotate(${((360 / n) * steps).toFixed(4)} ${c} ${c})"`;
   const seg = (i: number, j: number): string => {
+    if (fundamentalOnly) {
+      const clipped = zaksFundamentalSegmentXY(i, j, total, n, c, c, r);
+      if (!clipped) return "";
+      const [ax, ay, bx, by] = clipped;
+      return `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
+    }
     const [ax, ay] = point(i, total, c, r);
     const [bx, by] = point(j, total, c, r);
     return `M${ax.toFixed(2)},${ay.toFixed(2)}L${bx.toFixed(2)},${by.toFixed(2)}`;
@@ -4894,8 +5507,24 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
   parts.push(`<rect width="100%" height="100%" fill="${palette.background}"/>`);
 
   if (settings.showCycle) {
+    const cyclePath = fundamentalOnly
+      ? (() => {
+          const a0 = dihedralOffset(total);
+          const a1 = a0 + Math.PI / n;
+          const x0 = c + r * Math.cos(a0);
+          const y0 = c + r * Math.sin(a0);
+          const x1 = c + r * Math.cos(a1);
+          const y1 = c + r * Math.sin(a1);
+          return `<path d="M${x0.toFixed(2)},${y0.toFixed(2)}A${r.toFixed(
+            2
+          )},${r.toFixed(2)} 0 0 1 ${x1.toFixed(2)},${y1.toFixed(
+            2
+          )}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`;
+        })()
+      : null;
     parts.push(
-      `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`
+      cyclePath ??
+        `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${palette.cayleyStroke}" stroke-width="${k.cycleWidth}" stroke-opacity="${edgeAlpha}"/>`
     );
   }
 
@@ -4908,7 +5537,8 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     defs.push(
       `<path id="${id}" d="${d}" fill="none" stroke="${color}" stroke-width="${edgeWidth}" stroke-opacity="${edgeAlpha}" stroke-linecap="round"/>`
     );
-    for (let s = 0; s < repeats; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
+    const copies = fundamentalOnly ? 1 : repeats;
+    for (let s = 0; s < copies; s++) uses.push(`<use href="#${id}"${rotate(s)}/>`);
   };
 
   const coloring: SymmetryColoring = settings.symmetryColoring ?? "parity";
@@ -4920,6 +5550,7 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     const hidden = hiddenGeneratorSet(settings.hiddenGenerators);
     const qmap = orbitIndexMap(n, coloring);
     forEachZaksFundamentalEdge(n, (e) => {
+      if (fundamentalOnly && e.gen < n) return;
       const color = orbitColor(qmap.get(canonicalOrbitCode(e.i, e.j, n, total, B)) ?? 0);
       if (hidden && hidden.has(e.gen)) return;
       emitFragment(seg(e.i, e.j), color, e.half ? halfTurns : n);
@@ -4931,6 +5562,7 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     let betweenFull = "";
     let betweenHalf = "";
     forEachZaksFundamentalEdge(n, (e) => {
+      if (fundamentalOnly && e.gen < n) return;
       if (hidden && hidden.has(e.gen)) return;
       if (e.gen < n) within += seg(e.i, e.j);
       else if (e.half) betweenHalf += seg(e.i, e.j);
@@ -4953,6 +5585,7 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
     let oddWeight = 0;
 
     forEachZaksFundamentalEdge(n, (e) => {
+      if (fundamentalOnly && e.gen < n) return;
       // Pass-order weights track every edge (hidden or not), matching how the
       // full build's even/odd counts are computed before render-time hiding.
       const orbit = e.half ? n / 2 : n;
@@ -4990,8 +5623,10 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
   if (settings.showVertices) {
     const dotRadius = Math.max(0.5, k.vertexRadius);
     let dots = "";
-    for (let i = 0; i < B; i++) {
-      const [x, y] = point(i, total, c, r);
+    for (let i = 0; i < fundamentalVertexCount; i++) {
+      const [x, y] = fundamentalOnly
+        ? zaksFundamentalPointXY(i, total, n, c, c, r)
+        : point(i, total, c, r);
       dots += `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotRadius.toFixed(
         2
       )}"/>`;
@@ -5002,7 +5637,8 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
       if (coloring === "blocks") {
         // Band the dots: rotation s carries the ρ-block's hue.
         const bandAlpha = labelMode ? 0.95 : Math.max(0.4, Math.min(0.95, edgeAlpha * 1.8));
-        for (let s = 0; s < n; s++) {
+        const copies = fundamentalOnly ? 1 : n;
+        for (let s = 0; s < copies; s++) {
           uses.push(
             `<use href="#${id}" fill="${blockColor(s, n, labelMode)}" fill-opacity="${bandAlpha}"${rotate(s)}/>`
           );
@@ -5010,7 +5646,8 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
       } else {
         const dotFill = labelMode ? palette.labelVertexFill : palette.cayleyStroke;
         const dotOpacity = labelMode ? 0.95 : edgeAlpha;
-        for (let s = 0; s < n; s++) {
+        const copies = fundamentalOnly ? 1 : n;
+        for (let s = 0; s < copies; s++) {
           uses.push(
             `<use href="#${id}" fill="${dotFill}" fill-opacity="${dotOpacity}"${rotate(s)}/>`
           );
@@ -5025,16 +5662,18 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
   }
 
   if (
-    settings.showFundamentalDomain ||
-    settings.showSymmetryAxes ||
-    settings.showDihedralAxes ||
+    (!fundamentalOnly && settings.showFundamentalDomain) ||
+    (!fundamentalOnly && settings.showSymmetryAxes) ||
+    (!fundamentalOnly && settings.showDihedralAxes) ||
     settings.showVertexOrbit
   ) {
     const geom = { n, total, c, r, scale };
-    if (settings.showFundamentalDomain)
+    if (!fundamentalOnly && settings.showFundamentalDomain)
       parts.push(fundamentalDomainSVG(geom, settings, palette));
-    if (settings.showSymmetryAxes) parts.push(symmetryAxesSVG(geom, palette));
-    if (settings.showDihedralAxes) parts.push(dihedralOverlaySVG(geom, palette));
+    if (!fundamentalOnly && settings.showSymmetryAxes)
+      parts.push(symmetryAxesSVG(geom, palette));
+    if (!fundamentalOnly && settings.showDihedralAxes)
+      parts.push(dihedralOverlaySVG(geom, palette));
     if (settings.showVertexOrbit)
       parts.push(
         vertexOrbitSVG(
@@ -5047,11 +5686,33 @@ export function toZaksSymmetrySVG(opts: SvgOpts): string {
       );
   }
 
+  if (fundamentalOnly) {
+    const a0 = dihedralOffset(total);
+    const a1 = a0 + Math.PI / n;
+    const x0 = c + r * Math.cos(a0);
+    const y0 = c + r * Math.sin(a0);
+    const x1 = c + r * Math.cos(a1);
+    const y1 = c + r * Math.sin(a1);
+    parts.push(
+      `<path d="M${c},${c}L${x0.toFixed(2)},${y0.toFixed(2)}A${r.toFixed(
+        2
+      )},${r.toFixed(2)} 0 0 1 ${x1.toFixed(2)},${y1.toFixed(
+        2
+      )}Z" fill="none" stroke="${palette.dihedralSector}" stroke-width="${Math.max(
+        1.2,
+        1.4 * scale
+      )}" stroke-opacity="0.9"/>`
+    );
+  }
+
   if (labelMode) {
     const fs = vertexLabelFontSize(total);
     const labelOf = makeZaksLabelOf(n);
-    for (let i = 0; i < total; i++) {
-      const [x, y] = point(i, total, c, r);
+    const labelCount = fundamentalOnly ? fundamentalVertexCount : total;
+    for (let i = 0; i < labelCount; i++) {
+      const [x, y] = fundamentalOnly
+        ? zaksFundamentalPointXY(i, total, n, c, c, r)
+        : point(i, total, c, r);
       parts.push(
         `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${fs}" text-anchor="middle" dominant-baseline="middle" fill="${palette.labelFill}">${labelOf(i)}</text>`
       );

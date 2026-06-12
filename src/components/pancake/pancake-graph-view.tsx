@@ -27,7 +27,10 @@ import { Slider } from "@/components/ui/slider";
 import {
   asymmetricTreeCompressionFactor,
   buildPancakeGraph,
+  buildKaleidoscopeSamplingGraph,
+  buildRandomCyclicSamplingGraph,
   buildRandomDihedralSamplingGraph,
+  buildSimplexSamplingGraph,
   buildWedgeClippedDihedralSamplingGraph,
   buildZaksSymmetryGraph,
   buildZaksSamplingGraph,
@@ -76,6 +79,7 @@ import {
   type OrbitParts,
   type RenderSettings,
   type SymmetryColoring,
+  type ZaksFundamentalView,
   supportsVertexLabels,
   VERTEX_LABEL_MAX_N,
 } from "@/lib/pancake-render";
@@ -89,9 +93,11 @@ import {
 import {
   buildPancakeGraphLineSpace,
   type LineSpace,
+  type LineSpaceResolution,
 } from "@/lib/radon-space";
 import { formatUiNumber } from "@/lib/utils";
 import {
+  Dices,
   Download,
   Loader2,
   Minus,
@@ -115,6 +121,40 @@ import { flushSync } from "react-dom";
 
 const SVG_VIEWBOX = 1200;
 
+const RADON_GRID_OPTIONS = [
+  { key: "90x80", psiBins: 90, pBins: 80, label: "90 × 80" },
+  { key: "180x120", psiBins: 180, pBins: 120, label: "180 × 120" },
+  { key: "360x180", psiBins: 360, pBins: 180, label: "360 × 180" },
+] as const;
+type RadonGridKey = (typeof RADON_GRID_OPTIONS)[number]["key"];
+const DEFAULT_RADON_GRID_KEY: RadonGridKey = "180x120";
+
+const RADON_SEED_PSI_OPTIONS = [180, 360, 720] as const;
+type RadonSeedPsi = (typeof RADON_SEED_PSI_OPTIONS)[number];
+const DEFAULT_RADON_SEED_PSI: RadonSeedPsi = 360;
+
+const RADON_FFT_OPTIONS = [
+  { key: "512x64", thetaBins: 512, pBins: 64, label: "512 × 64" },
+  { key: "1024x128", thetaBins: 1024, pBins: 128, label: "1024 × 128" },
+  { key: "2048x128", thetaBins: 2048, pBins: 128, label: "2048 × 128" },
+] as const;
+type RadonFftKey = (typeof RADON_FFT_OPTIONS)[number]["key"];
+const DEFAULT_RADON_FFT_KEY: RadonFftKey = "1024x128";
+
+function radonGridOption(key: RadonGridKey) {
+  return (
+    RADON_GRID_OPTIONS.find((option) => option.key === key) ??
+    RADON_GRID_OPTIONS[1]
+  );
+}
+
+function radonFftOption(key: RadonFftKey) {
+  return (
+    RADON_FFT_OPTIONS.find((option) => option.key === key) ??
+    RADON_FFT_OPTIONS[1]
+  );
+}
+
 function vertexCountLabel(count: number): string {
   return formatUiNumber(count);
 }
@@ -123,7 +163,24 @@ function yankelovichDihedralSectorVertexCount(n: number): number {
   return Math.max(1, Math.floor(factorial(n - 1) / 2));
 }
 
-function yankelovichSampleMax(n: number, preset: GraphPreset): number {
+function simplexYankelovichVertexCount(n: number): number {
+  return factorial(n);
+}
+
+function simplexYankelovichEdgeCount(n: number): number {
+  const vertices = simplexYankelovichVertexCount(n);
+  return (vertices * (vertices - 1)) / 2;
+}
+
+function yankelovichSampleMax(
+  n: number,
+  preset: GraphPreset,
+  renderer?: Renderer,
+  simplexFactorial = false
+): number {
+  if (preset === "simplex" && renderer === "yankelovich" && simplexFactorial) {
+    return simplexYankelovichEdgeCount(n);
+  }
   return usesAnalyticYankelovich(preset)
     ? yankelovichDihedralSectorVertexCount(n)
     : Math.max(1, graphEdgeCount(n, preset));
@@ -132,14 +189,19 @@ function yankelovichSampleMax(n: number, preset: GraphPreset): number {
 function clampYankelovichSampleCount(
   count: number,
   n: number,
-  preset: GraphPreset
+  preset: GraphPreset,
+  renderer?: Renderer,
+  simplexFactorial = false
 ): number {
   const fallback = Math.min(
     YANKELOVICH_DEFAULT_SAMPLE_COUNT,
-    yankelovichSampleMax(n, preset)
+    yankelovichSampleMax(n, preset, renderer, simplexFactorial)
   );
   const parsed = Number.isFinite(count) ? Math.round(count) : fallback;
-  return Math.max(1, Math.min(yankelovichSampleMax(n, preset), parsed));
+  return Math.max(
+    1,
+    Math.min(yankelovichSampleMax(n, preset, renderer, simplexFactorial), parsed)
+  );
 }
 
 function secondsLabel(ms: number): string {
@@ -190,6 +252,14 @@ function recommendedEdgeSliders(
   n: number,
   preset: GraphPreset
 ): { alpha: number; width: number } {
+  if (
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d" ||
+    preset === "coxeter-h4-600-cell"
+  ) {
+    return { alpha: 100, width: 70 };
+  }
   const e = Math.max(1, graphEdgeCount(n, preset));
   const targetAlpha = 2.4 / Math.pow(e, 0.2);
   const targetWidth = 4.2 / Math.pow(e, 0.3);
@@ -206,12 +276,35 @@ function recommendedEdgeSliders(
   };
 }
 
+function defaultVisibilityFor(preset: GraphPreset): {
+  showCycle: boolean;
+  showVertices: boolean;
+} {
+  if (
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d"
+  ) {
+    return { showCycle: false, showVertices: true };
+  }
+  if (
+    preset === "coxeter-h4-600-cell"
+  ) {
+    return { showCycle: false, showVertices: false };
+  }
+  return { showCycle: true, showVertices: true };
+}
+
 // Values above 10 only apply to graphs/renderers that opt into them
 // (simplex/complete stay tiny, while Yankelovich samples analytically);
 // availableNOptions filters this list per preset + renderer.
 const N_OPTIONS: readonly number[] = Array.from(
   { length: 38 },
   (_, i) => i + 3
+);
+const SIMPLEX_YANKELOVICH_N_OPTIONS: readonly number[] = Array.from(
+  { length: 19 },
+  (_, i) => i + 4
 );
 const DEFAULT_N = 6;
 
@@ -239,8 +332,13 @@ interface JumpHistogramBin {
 
 const GRAPH_PRESETS: GraphPreset[] = [
   "pancake-zaks",
+  "random-cyclic",
   "random-dihedral",
   "wedge-clipped-dihedral",
+  "kaleidoscope",
+  "coxeter-a",
+  "coxeter-b",
+  "coxeter-d",
   "pancake-zaks-recursive",
   "pancake-williams",
   "aes-powers",
@@ -252,12 +350,16 @@ const GRAPH_PRESETS: GraphPreset[] = [
   "cyclic-adjacent",
   "transposition",
   "asymmetric-tree",
-  "kaleidoscope",
+  "reversal",
+  "reversal-greedy",
+  "reversal-graycode",
   "lexicographic",
+  "hyperoctahedral",
   "hypercube",
   "feistel",
   "sliding-puzzle",
   "simplex",
+  "coxeter-h4-600-cell",
   "sierpinski",
 ];
 
@@ -277,13 +379,31 @@ function supportsYankelovich(preset: GraphPreset): boolean {
 function usesAnalyticYankelovich(preset: GraphPreset): boolean {
   return (
     preset === "pancake-zaks" ||
+    preset === "random-cyclic" ||
     preset === "random-dihedral" ||
     preset === "wedge-clipped-dihedral"
   );
 }
 
 function requiresYankelovich(preset: GraphPreset): boolean {
-  return preset === "random-dihedral" || preset === "wedge-clipped-dihedral";
+  return (
+    preset === "random-cyclic" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral"
+  );
+}
+
+/**
+ * The kaleidoscope is a small materialized vector graph (shards × 2n segments),
+ * so it renders in SVG / Canvas / density alike. Its pattern is rebuilt from the
+ * sample seed, so reseeding must rebuild the graph.
+ */
+function isKaleidoscope(preset: GraphPreset): boolean {
+  return preset === "kaleidoscope";
+}
+
+function isVariableCoxeterRootPreset(preset: GraphPreset): boolean {
+  return preset === "coxeter-a" || preset === "coxeter-b" || preset === "coxeter-d";
 }
 
 /**
@@ -312,6 +432,9 @@ const YANKELOVICH_NOISE_FLOOR_OPTIONS: readonly number[] = Array.from(
 );
 const YANKELOVICH_DEFAULT_SAMPLE_COUNT = 50_000;
 const YANKELOVICH_SAMPLE_COUNT_STEP = 50_000;
+const YANKELOVICH_SAMPLE_STEP_OPTIONS: readonly number[] = [
+  1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+];
 
 // Like Yankelovich's "Random vertices", the sampled-lines count is the number
 // of representatives accepted; each is drawn with its 2n symmetric copies, so
@@ -351,16 +474,26 @@ const YANKELOVICH_COLORMAPS: readonly YankelovichColormap[] = [
   "viridis",
   "magma",
   "inferno",
+  "stained",
 ];
 const YANKELOVICH_COLORMAP_LABELS: Record<YankelovichColormap, string> = {
   gray: "Grayscale",
   viridis: "Viridis",
   magma: "Magma",
   inferno: "Inferno",
+  stained: "Stained glass",
 };
+
+/** The kaleidoscope reads as stained glass; everything else defaults to gray. */
+function defaultColormapFor(preset: GraphPreset): YankelovichColormap {
+  return preset === "kaleidoscope" ? "stained" : "gray";
+}
 
 /** Highest n offered for a given preset + renderer combination. */
 function maxNForRenderer(preset: GraphPreset, renderer: Renderer): number {
+  if (renderer === "yankelovich" && preset === "simplex") {
+    return SIMPLEX_YANKELOVICH_N_OPTIONS[SIMPLEX_YANKELOVICH_N_OPTIONS.length - 1];
+  }
   if (renderer === "yankelovich" && usesAnalyticYankelovich(preset)) {
     return YANKELOVICH_MAX_N;
   }
@@ -368,6 +501,150 @@ function maxNForRenderer(preset: GraphPreset, renderer: Renderer): number {
     return YANKELOVICH_MAX_N;
   }
   return graphMaxN(preset);
+}
+
+function nOptionsForRenderer(
+  preset: GraphPreset,
+  renderer: Renderer
+): readonly number[] {
+  if (
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d"
+  ) {
+    return Array.from(
+      { length: maxNForRenderer(preset, renderer) - 2 },
+      (_, i) => i + 3
+    );
+  }
+  if (preset === "simplex" && renderer === "yankelovich") {
+    return N_OPTIONS.filter((option) => option <= graphMaxN(preset));
+  }
+  return N_OPTIONS.filter((option) => option <= maxNForRenderer(preset, renderer));
+}
+
+function displayVertexCount(
+  n: number,
+  preset: GraphPreset,
+  renderer: Renderer,
+  simplexFactorial = false
+): number {
+  return preset === "simplex" && renderer === "yankelovich" && simplexFactorial
+    ? simplexYankelovichVertexCount(n)
+    : graphVertexCount(n, preset);
+}
+
+function displayEdgeCount(
+  n: number,
+  preset: GraphPreset,
+  renderer: Renderer,
+  simplexFactorial = false
+): number {
+  if (preset === "simplex" && renderer === "yankelovich" && simplexFactorial) {
+    return simplexYankelovichEdgeCount(n);
+  }
+  return graphEdgeCount(n, preset);
+}
+
+function hypercubeRecursiveCoords(graph: PancakeGraph): Float64Array {
+  const coords = new Float64Array(graph.path.length * 2);
+  const pad = 0.08;
+  const size = 2 - 2 * pad;
+
+  for (let i = 0; i < graph.path.length; i++) {
+    const bits = graph.path[i];
+    let x0 = -1 + pad;
+    let x1 = x0 + size;
+    let y0 = -1 + pad;
+    let y1 = y0 + size;
+    let mirrorX = false;
+    let mirrorY = false;
+
+    for (let bitIndex = 0; bitIndex < bits.length; bitIndex++) {
+      const bit = bits[bitIndex];
+      const splitX = bitIndex % 2 === 0;
+      if (splitX) {
+        const mid = (x0 + x1) / 2;
+        const visualBit = bit ^ (mirrorX ? 1 : 0);
+        if (visualBit === 0) x1 = mid;
+        else x0 = mid;
+        if (bit === 1) mirrorX = !mirrorX;
+      } else {
+        const mid = (y0 + y1) / 2;
+        const visualBit = bit ^ (mirrorY ? 1 : 0);
+        if (visualBit === 0) y1 = mid;
+        else y0 = mid;
+        if (bit === 1) mirrorY = !mirrorY;
+      }
+    }
+
+    coords[2 * i] = (x0 + x1) / 2;
+    coords[2 * i + 1] = (y0 + y1) / 2;
+  }
+
+  return coords;
+}
+
+function displayEdgesPerVertex(
+  n: number,
+  preset: GraphPreset,
+  renderer: Renderer,
+  simplexFactorial = false
+): number | null {
+  if (preset === "simplex" && renderer === "yankelovich" && simplexFactorial) {
+    return simplexYankelovichVertexCount(n) - 1;
+  }
+  return graphEdgesPerVertex(n, preset);
+}
+
+interface NSelectOption {
+  value: string;
+  n: number;
+  simplexFactorial: boolean;
+}
+
+function nSelectOptionsForRenderer(
+  preset: GraphPreset,
+  renderer: Renderer
+): readonly NSelectOption[] {
+  const options = nOptionsForRenderer(preset, renderer).map((n) => ({
+    value: `n:${n}`,
+    n,
+    simplexFactorial: false,
+  }));
+  if (preset !== "simplex" || renderer !== "yankelovich") return options;
+  return [
+    ...options,
+    ...SIMPLEX_YANKELOVICH_N_OPTIONS.map((n) => ({
+      value: `f:${n}`,
+      n,
+      simplexFactorial: true,
+    })),
+  ];
+}
+
+function nSelectValue(n: number, simplexFactorial: boolean): string {
+  return `${simplexFactorial ? "f" : "n"}:${n}`;
+}
+
+function parseNSelectValue(value: string): NSelectOption {
+  const simplexFactorial = value.startsWith("f:");
+  const n = Number(value.slice(2));
+  return {
+    value,
+    n: Number.isFinite(n) ? n : DEFAULT_N,
+    simplexFactorial,
+  };
+}
+
+function nOptionLabel(option: NSelectOption, preset: GraphPreset, renderer: Renderer): string {
+  if (preset === "kaleidoscope") {
+    return `${option.n} mirrors · ${degreesLabel(180 / option.n)} wedge`;
+  }
+  const prefix = option.simplexFactorial ? `n = ${option.n}!` : `n = ${option.n}`;
+  return `${prefix} — ${vertexCountLabel(
+    displayVertexCount(option.n, preset, renderer, option.simplexFactorial)
+  )} vertices`;
 }
 
 /** Number of quotient blocks = n·(n-1)···(n-depth+1). */
@@ -484,6 +761,11 @@ const SYMMETRY_COLORING_LABELS: Record<SymmetryColoring, string> = {
 const SYMMETRY_COLORINGS = Object.keys(
   SYMMETRY_COLORING_LABELS
 ) as SymmetryColoring[];
+const ZAKS_FUNDAMENTAL_VIEWS: readonly ZaksFundamentalView[] = [
+  "wedge",
+  "circle",
+  "flat",
+];
 
 const ORBIT_PARTS: readonly OrbitParts[] = ["both", "rotations", "reflections"];
 
@@ -500,6 +782,8 @@ const SLIDER_RANGE: readonly number[] = Array.from(
 // Dihedral recursion level m for the vertex-orbit overlay (3…n); the renderer
 // clamps to [3, n], so the exact upper bound here is not critical.
 const LEVEL_RANGE: readonly number[] = Array.from({ length: 38 }, (_, i) => i + 3);
+const HYPERCUBE_LAYOUTS = ["circle", "recursive"] as const;
+type HypercubeLayout = (typeof HYPERCUBE_LAYOUTS)[number];
 
 /** The n a preset starts at: the global default, clamped to its maximum. */
 function defaultNFor(preset: GraphPreset): NValue {
@@ -510,7 +794,10 @@ interface GraphState {
   n: NValue;
   preset: GraphPreset;
   renderer: Renderer;
+  simplexFactorial: boolean;
   symmetryColoring: SymmetryColoring;
+  zaksFundamentalOnly: boolean;
+  zaksFundamentalView: ZaksFundamentalView;
   showDihedralAxes: boolean;
   showSymmetryAxes: boolean;
   showFundamentalDomain: boolean;
@@ -539,9 +826,30 @@ interface GraphState {
   yankelovichColormap: YankelovichColormap;
   yankelovichSampleCount: number;
   yankelovichSampleSeed: number;
+  kaleidoscopeLevel: number;
   sampledRepCount: number;
   sampledContrast: number;
   quotientDepth: number;
+  hypercubeLayout: HypercubeLayout;
+}
+
+// The kaleidoscope's density is picked from five discrete levels; each maps to a
+// base-ribbon count tuned to render as a nice rosette.
+const KALEIDOSCOPE_LEVELS: readonly number[] = [8, 14, 22, 34, 50];
+const KALEIDOSCOPE_LEVEL_VALUES: readonly number[] = [1, 2, 3, 4, 5];
+const KALEIDOSCOPE_DEFAULT_LEVEL = 3;
+const KALEIDOSCOPE_LEVEL_LABELS: Record<number, string> = {
+  1: "1 — minimal",
+  2: "2 — sparse",
+  3: "3 — balanced",
+  4: "4 — dense",
+  5: "5 — maximal",
+};
+
+/** Base-ribbon count for a kaleidoscope level (1…5). */
+function kaleidoscopeStrokesForLevel(level: number): number {
+  const i = Math.max(1, Math.min(KALEIDOSCOPE_LEVELS.length, Math.round(level)));
+  return KALEIDOSCOPE_LEVELS[i - 1];
 }
 
 /** Restore the explorer's controls from the URL query string (deep linking). */
@@ -554,13 +862,17 @@ function readGraphState(params: URLSearchParams | null): GraphState {
   if (renderer === "symmetry" && !supportsSymmetry({ preset })) renderer = "svg";
   if (renderer === "yankelovich" && !supportsYankelovich(preset)) renderer = "svg";
   if (renderer === "sampled" && !supportsSampledLines(preset)) renderer = "svg";
+  if (isVariableCoxeterRootPreset(preset) && renderer === "svg") renderer = "canvas";
 
   // The n ceiling depends on the renderer: Yankelovich samples chords, so it
   // reaches n = 40 where the other renderers top out at graphMaxN(preset).
-  const allowedN = N_OPTIONS.filter(
-    (opt) => opt <= maxNForRenderer(preset, renderer)
-  );
+  const allowedN = nOptionsForRenderer(preset, renderer);
   const n = readIntParam(params, "n", allowedN, defaultNFor(preset)) as NValue;
+  const simplexFactorial =
+    preset === "simplex" &&
+    renderer === "yankelovich" &&
+    n >= SIMPLEX_YANKELOVICH_N_OPTIONS[0] &&
+    readEnumParam(params, "sf", ["0", "1"], "0") === "1";
 
   // Sampled lines wants bold, thick strokes by default (its accumulation +
   // tone-map expects them); other renderers use a density-appropriate guess.
@@ -573,7 +885,16 @@ function readGraphState(params: URLSearchParams | null): GraphState {
     n,
     preset,
     renderer,
+    simplexFactorial,
     symmetryColoring: readEnumParam(params, "sc", SYMMETRY_COLORINGS, "parity"),
+    zaksFundamentalOnly:
+      readEnumParam(params, "zfw", ["0", "1"], "0") === "1",
+    zaksFundamentalView: readEnumParam(
+      params,
+      "zfv",
+      ZAKS_FUNDAMENTAL_VIEWS,
+      "wedge"
+    ),
     showDihedralAxes: readEnumParam(params, "ax", ["0", "1"], "0") === "1",
     showSymmetryAxes: readEnumParam(params, "sym", ["0", "1"], "0") === "1",
     showFundamentalDomain: readEnumParam(params, "fd", ["0", "1"], "0") === "1",
@@ -618,14 +939,22 @@ function readGraphState(params: URLSearchParams | null): GraphState {
       params,
       "ycm",
       YANKELOVICH_COLORMAPS,
-      "gray"
+      defaultColormapFor(preset)
     ),
     yankelovichSampleCount: clampYankelovichSampleCount(
       readNonNegIntParam(params, "ysc", YANKELOVICH_DEFAULT_SAMPLE_COUNT),
       n,
-      preset
+      preset,
+      renderer,
+      simplexFactorial
     ),
     yankelovichSampleSeed: readNonNegIntParam(params, "yseed", 0),
+    kaleidoscopeLevel: readIntParam(
+      params,
+      "kst",
+      KALEIDOSCOPE_LEVEL_VALUES,
+      KALEIDOSCOPE_DEFAULT_LEVEL
+    ),
     sampledRepCount: clampSampledRepCount(
       readNonNegIntParam(params, "srp", SAMPLED_REPS_DEFAULT),
       n
@@ -637,6 +966,7 @@ function readGraphState(params: URLSearchParams | null): GraphState {
       quotientDepthOptions(n, preset),
       defaultQuotientDepth(n, preset)
     ),
+    hypercubeLayout: readEnumParam(params, "hy", HYPERCUBE_LAYOUTS, "circle"),
   };
 }
 
@@ -644,8 +974,17 @@ export function PancakeGraphView() {
   const searchParams = useSearchParams();
   const initial = useMemo(() => readGraphState(searchParams), [searchParams]);
   const [n, setN] = useState<NValue>(initial.n);
+  const [kaleidoscopeLevel, setKaleidoscopeLevel] = useState<number>(
+    initial.kaleidoscopeLevel
+  );
   const [preset, setPreset] = useState<GraphPreset>(initial.preset);
   const [renderer, setRenderer] = useState<Renderer>(initial.renderer);
+  const [hypercubeLayout, setHypercubeLayout] = useState<HypercubeLayout>(
+    initial.hypercubeLayout
+  );
+  const [simplexFactorial, setSimplexFactorial] = useState(
+    initial.simplexFactorial
+  );
   const [graph, setGraph] = useState<PancakeGraph | null>(null);
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [status, setStatus] = useState<string>("Ready.");
@@ -677,16 +1016,38 @@ export function PancakeGraphView() {
   const [radonAnalysis, setRadonAnalysis] = useState<LineSpace | null>(null);
   const [radonComputing, setRadonComputing] = useState(false);
   const [radonSeedWedgeOnly, setRadonSeedWedgeOnly] = useState(false);
+  const [radonGridKey, setRadonGridKey] = useState<RadonGridKey>(
+    DEFAULT_RADON_GRID_KEY
+  );
+  const [radonSeedPsi, setRadonSeedPsi] = useState<RadonSeedPsi>(
+    DEFAULT_RADON_SEED_PSI
+  );
+  const [radonFftKey, setRadonFftKey] = useState<RadonFftKey>(
+    DEFAULT_RADON_FFT_KEY
+  );
+  const radonResolution = useMemo<LineSpaceResolution>(() => {
+    const grid = radonGridOption(radonGridKey);
+    const fft = radonFftOption(radonFftKey);
+    return {
+      psiBins: grid.psiBins,
+      pBins: grid.pBins,
+      seedWedgePsiBins: radonSeedPsi,
+      autocorrThetaBins: fft.thetaBins,
+      autocorrPBins: fft.pBins,
+    };
+  }, [radonFftKey, radonGridKey, radonSeedPsi]);
 
   const [settings, setSettings] = useState<RenderSettings>({
     alpha: initial.alpha,
     width: initial.width,
     showCayley: true,
-    showCycle: true,
-    showVertices: true,
+    showCycle: defaultVisibilityFor(initial.preset).showCycle,
+    showVertices: defaultVisibilityFor(initial.preset).showVertices,
     showLabels: initial.showLabels,
     parityMode: "off",
     symmetryColoring: initial.symmetryColoring,
+    zaksFundamentalOnly: initial.zaksFundamentalOnly,
+    zaksFundamentalView: initial.zaksFundamentalView,
     showDihedralAxes: initial.showDihedralAxes,
     showSymmetryAxes: initial.showSymmetryAxes,
     showFundamentalDomain: initial.showFundamentalDomain,
@@ -715,6 +1076,9 @@ export function PancakeGraphView() {
   });
   const [yankelovichSampleDraftCount, setYankelovichSampleDraftCount] =
     useState<number>(initial.yankelovichSampleCount);
+  const [yankelovichSampleStep, setYankelovichSampleStep] = useState<number>(
+    YANKELOVICH_SAMPLE_COUNT_STEP
+  );
   const [yankelovichFieldDraftSize, setYankelovichFieldDraftSize] =
     useState<number>(initial.yankelovichFieldSize);
   const [svgExportSize, setSvgExportSize] = useState<number>(2400);
@@ -733,6 +1097,11 @@ export function PancakeGraphView() {
   // ring in an infinite loop at `orbitSpeed` vertices per second.
   const [orbitPlaying, setOrbitPlaying] = useState(false);
   const [orbitSpeed, setOrbitSpeed] = useState(3);
+  const needsTallStage =
+    preset === "pancake-zaks" &&
+    renderer === "symmetry" &&
+    (settings.zaksFundamentalOnly ?? false) &&
+    (settings.zaksFundamentalView ?? "wedge") === "circle";
 
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -786,38 +1155,58 @@ export function PancakeGraphView() {
   // is active we build the lightweight payload instead (and rebuild the full
   // graph lazily if the user switches to a graph-dependent renderer).
   const symmetryLite = preset === "pancake-zaks" && renderer === "symmetry";
-  // Analytic Dₙ Yankelovich presets avoid materializing the n! graph.
+  const simplexYankelovichFactorial =
+    preset === "simplex" &&
+    renderer === "yankelovich" &&
+    simplexFactorial &&
+    n >= SIMPLEX_YANKELOVICH_N_OPTIONS[0];
+  // Analytic random Yankelovich presets avoid materializing the n! graph.
   const analyticYankelovich =
-    usesAnalyticYankelovich(preset) && renderer === "yankelovich";
+    (usesAnalyticYankelovich(preset) || simplexYankelovichFactorial) &&
+    renderer === "yankelovich";
   const yankelovich = supportsYankelovich(preset) && renderer === "yankelovich";
   // The sampled-lines renderer also draws straight from the Zaks recursion (it
   // samples chords analytically), so it uses the same lightweight build path.
   const sampledLines = supportsSampledLines(preset) && renderer === "sampled";
-  const liteBuild = symmetryLite || analyticYankelovich || sampledLines;
+  // The kaleidoscope is always built via its lightweight materializer (never the
+  // n! Cayley builder), whatever the renderer.
+  const kaleidoscope = isKaleidoscope(preset);
+  const liteBuild = symmetryLite || analyticYankelovich || sampledLines || kaleidoscope;
+  // Only the kaleidoscope rebuilds on reseed; other presets reseed the field
+  // alone, so this stays constant for them and triggers no extra graph builds.
+  const kaleidoscopeSeed = kaleidoscope ? settings.yankelovichSampleSeed ?? 0 : 0;
   // Vector renders above this many segments are slow enough to be worth a
   // visible "Rendering…" phase; smaller ones draw synchronously to keep slider
   // tweaks snappy and flicker-free. Symmetry only emits a 1/n sector.
   const svgRenderLoad =
     activeRenderer === "symmetry" && supportsSymmetry({ preset })
       ? graphEdgeCount(n, preset) / n
-      : graphEdgeCount(n, preset);
+      : displayEdgeCount(n, preset, renderer, simplexYankelovichFactorial);
   const showRenderProgress =
     (activeRenderer === "svg" || activeRenderer === "symmetry") &&
     svgRenderLoad >= 120_000;
   const availableNOptions = useMemo(
-    () =>
-      N_OPTIONS.filter((option) => option <= maxNForRenderer(preset, renderer)),
+    () => nSelectOptionsForRenderer(preset, renderer),
     [preset, renderer]
   );
   const yankelovichSampleCount = clampYankelovichSampleCount(
     yankelovichSampleDraftCount,
     n,
-    preset
+    preset,
+    renderer,
+    simplexYankelovichFactorial
   );
   const sampledRepCount = clampSampledRepCount(
     settings.sampledRepCount ?? SAMPLED_REPS_DEFAULT,
     n
   );
+  const renderGraph = useMemo<PancakeGraph | null>(() => {
+    if (!graph) return null;
+    if (graph.preset !== "hypercube" || hypercubeLayout !== "recursive") {
+      return graph;
+    }
+    return { ...graph, coords: hypercubeRecursiveCoords(graph) };
+  }, [graph, hypercubeLayout]);
 
   // Reflect every control in the URL so a given view can be shared and
   // restored, including default values.
@@ -830,8 +1219,15 @@ export function PancakeGraphView() {
       g: preset,
       n: String(n),
       r: renderer,
+      sf: simplexYankelovichFactorial ? "1" : null,
       parity: null,
       sc: settings.symmetryColoring,
+      zfw: settings.zaksFundamentalOnly ? "1" : null,
+      zfv:
+        settings.zaksFundamentalOnly &&
+        (settings.zaksFundamentalView ?? "wedge") !== "wedge"
+          ? settings.zaksFundamentalView
+          : null,
       ax: settings.showDihedralAxes ? "1" : null,
       sym: settings.showSymmetryAxes ? "1" : null,
       fd: settings.showFundamentalDomain ? "1" : null,
@@ -881,7 +1277,8 @@ export function PancakeGraphView() {
           ? settings.yankelovichTone
           : null,
       ycm:
-        (settings.yankelovichColormap ?? "gray") !== "gray"
+        (settings.yankelovichColormap ?? defaultColormapFor(preset)) !==
+        defaultColormapFor(preset)
           ? settings.yankelovichColormap
           : null,
       ysc:
@@ -893,6 +1290,10 @@ export function PancakeGraphView() {
         (settings.yankelovichSampleSeed ?? 0) > 0
           ? String(settings.yankelovichSampleSeed)
           : null,
+      kst:
+        kaleidoscopeLevel !== KALEIDOSCOPE_DEFAULT_LEVEL
+          ? String(kaleidoscopeLevel)
+          : null,
       srp:
         (settings.sampledRepCount ?? SAMPLED_REPS_DEFAULT) !==
         SAMPLED_REPS_DEFAULT
@@ -903,12 +1304,20 @@ export function PancakeGraphView() {
           ? String(settings.sampledContrast)
           : null,
       depth: String(quotientDepth),
+      hy:
+        preset === "hypercube" && hypercubeLayout !== "circle"
+          ? hypercubeLayout
+          : null,
     });
   }, [
     n,
     preset,
     renderer,
+    hypercubeLayout,
+    simplexYankelovichFactorial,
     settings.symmetryColoring,
+    settings.zaksFundamentalOnly,
+    settings.zaksFundamentalView,
     settings.showDihedralAxes,
     settings.showSymmetryAxes,
     settings.showFundamentalDomain,
@@ -937,6 +1346,7 @@ export function PancakeGraphView() {
     settings.yankelovichColormap,
     settings.yankelovichSampleCount,
     settings.yankelovichSampleSeed,
+    kaleidoscopeLevel,
     settings.sampledRepCount,
     settings.sampledContrast,
     quotientDepth,
@@ -989,7 +1399,10 @@ export function PancakeGraphView() {
           // no path/edge arrays. Yield one frame first: otherwise setRunning(true)
           // and the blocking build run in the same task and the browser never
           // paints the loading spinner until everything is already done.
-          const graphStatus = `Computing ${graphPresetLabel(preset)} symmetry for n = ${n}…`;
+          const graphStatus =
+            simplexYankelovichFactorial
+              ? `Computing ${graphPresetLabel(preset)} for n = ${n}!…`
+              : `Computing ${graphPresetLabel(preset)} symmetry for n = ${n}…`;
           if (yankelovich) {
             flushSync(() => {
               setYankelovichStage("Graph");
@@ -1007,10 +1420,20 @@ export function PancakeGraphView() {
           // sector is too large to materialize; the Yankelovich renderer samples
           // chords analytically, so hand it the O(n²) sampling payload instead.
           const g =
-            preset === "random-dihedral"
+            preset === "random-cyclic"
+              ? buildRandomCyclicSamplingGraph(n)
+              : simplexYankelovichFactorial
+                ? buildSimplexSamplingGraph(n)
+              : preset === "random-dihedral"
               ? buildRandomDihedralSamplingGraph(n)
               : preset === "wedge-clipped-dihedral"
                 ? buildWedgeClippedDihedralSamplingGraph(n)
+                : preset === "kaleidoscope"
+                ? buildKaleidoscopeSamplingGraph(
+                    n,
+                    settings.yankelovichSampleSeed ?? 0,
+                    kaleidoscopeStrokesForLevel(kaleidoscopeLevel)
+                  )
                 : (yankelovich || sampledLines) && factorial(n - 1) > 4_000_000
                   ? buildZaksSamplingGraph(n)
                   : buildZaksSymmetryGraph(n);
@@ -1025,8 +1448,24 @@ export function PancakeGraphView() {
             return unchanged ? s : { ...s, hiddenGenerators: initialHidden };
           });
           setMetrics({
-            vertices: graphVertexCount(n, preset),
-            cayleyEdges: graphEdgeCount(n, preset),
+            // The kaleidoscope has no n! Cayley structure; report what is
+            // actually drawn (segments and their endpoints).
+            vertices: isKaleidoscope(preset)
+              ? g.path.length
+              : displayVertexCount(
+                  n,
+                  preset,
+                  renderer,
+                  simplexYankelovichFactorial
+                ),
+            cayleyEdges: isKaleidoscope(preset)
+              ? g.edges.length / 3
+              : displayEdgeCount(
+                  n,
+                  preset,
+                  renderer,
+                  simplexYankelovichFactorial
+                ),
             cycleEdges: factorial(n),
             rnEdges: preset === "pancake-zaks" ? n : 0,
             evenEdges: g.evenEdgeCount,
@@ -1099,7 +1538,16 @@ export function PancakeGraphView() {
       ac.abort();
       clearTimeout(id);
     };
-  }, [n, preset, liteBuild, yankelovich, sampledLines]);
+  }, [
+    n,
+    preset,
+    liteBuild,
+    yankelovich,
+    sampledLines,
+    simplexYankelovichFactorial,
+    kaleidoscopeSeed,
+    kaleidoscopeLevel,
+  ]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -1126,7 +1574,7 @@ export function PancakeGraphView() {
   useEffect(() => {
     if (activeRenderer !== "canvas" && activeRenderer !== "density") return;
     const canvas = canvasRef.current;
-    if (!canvas || !graph) return;
+    if (!canvas || !renderGraph) return;
     const { width, height } = stageSize;
     if (width === 0 || height === 0) return;
     const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
@@ -1139,7 +1587,7 @@ export function PancakeGraphView() {
     const edgeMode: EdgeRenderMode =
       activeRenderer === "density" ? "density" : "line";
     drawToCanvas(ctx, {
-      graph,
+      graph: renderGraph,
       settings: { ...settings, edgeMode },
       cssWidth: width,
       cssHeight: height,
@@ -1148,7 +1596,7 @@ export function PancakeGraphView() {
       panX: pan.x,
       panY: pan.y,
     });
-  }, [activeRenderer, graph, settings, stageSize, pan.x, pan.y, zoom]);
+  }, [activeRenderer, renderGraph, settings, stageSize, pan.x, pan.y, zoom]);
 
   // Build the coarsened quotient when that renderer is active. It only needs
   // per-block counts, so even the n = 10 pancake (3.6M vertices) collapses to a
@@ -1230,17 +1678,18 @@ export function PancakeGraphView() {
     if (symmetryLite) return;
     if (activeRenderer !== "svg" && activeRenderer !== "symmetry") return;
     const host = svgHostRef.current;
-    if (!host || !graph) return;
+    if (!host || !renderGraph) return;
     // Square SVG with a viewBox — CSS scales it to fill the stage. The symmetry
     // renderer falls back to the flat one if the graph lacks the n-fold layout.
-    const useSymmetry = activeRenderer === "symmetry" && supportsSymmetry(graph);
+    const useSymmetry =
+      activeRenderer === "symmetry" && supportsSymmetry(renderGraph);
     const render = !useSymmetry
       ? toSVG
-      : graph.preset === "pancake-zaks"
+      : renderGraph.preset === "pancake-zaks"
         ? toZaksSymmetrySVG
         : toSymmetrySVG;
     const draw = () => {
-      const svg = render({ graph, settings, size: SVG_VIEWBOX });
+      const svg = render({ graph: renderGraph, settings, size: SVG_VIEWBOX });
       host.innerHTML = svg
         .replace(`width="${SVG_VIEWBOX}"`, 'width="100%"')
         .replace(`height="${SVG_VIEWBOX}"`, 'height="100%"');
@@ -1261,7 +1710,7 @@ export function PancakeGraphView() {
     const raf1 = requestAnimationFrame(() => {
       if (cancelled) return;
       setIsRendering(true);
-      setStatus(`Rendering n = ${graph.n}…`);
+      setStatus(`Rendering n = ${renderGraph.n}…`);
       raf2 = requestAnimationFrame(() => {
         if (cancelled) return;
         draw();
@@ -1275,7 +1724,7 @@ export function PancakeGraphView() {
       cancelAnimationFrame(raf2);
       setIsRendering(false);
     };
-  }, [symmetryLite, activeRenderer, graph, settings, showRenderProgress]);
+  }, [symmetryLite, activeRenderer, renderGraph, settings, showRenderProgress]);
 
   // Sampled-lines renderer (pancake-zaks only): draws a random subset of the rₙ
   // matching as a single vector <path> in the SVG host, so zoom/pan reuse the
@@ -1390,7 +1839,11 @@ export function PancakeGraphView() {
       .join(",");
     const key = `${graph.n}|${Math.floor(width * dpr)}x${Math.floor(
       height * dpr
-    )}|${settings.symmetryColoring ?? "parity"}|${hiddenKey}`;
+    )}|${settings.symmetryColoring ?? "parity"}|${hiddenKey}|${
+      settings.zaksFundamentalOnly
+        ? `fund-${settings.zaksFundamentalView ?? "wedge"}`
+        : "full"
+    }`;
     const cacheMiss = symSectorCacheRef.current?.key !== key;
 
     if (!cacheMiss || !showRenderProgress) {
@@ -1625,12 +2078,12 @@ export function PancakeGraphView() {
   }, [activeRenderer, graph, settings, zoom, pan.x, pan.y, stageSize]);
 
   const downloadSVG = useCallback(() => {
-    if (!graph) return;
+    if (!graph || !renderGraph) return;
     setStatus("Generating SVG…");
     setTimeout(() => {
       try {
         const useSymmetry =
-          activeRenderer === "symmetry" && supportsSymmetry(graph);
+          activeRenderer === "symmetry" && supportsSymmetry(renderGraph);
         const svg = sampledLines
           ? toSampledLinesSVG({
               n: graph.n,
@@ -1640,10 +2093,10 @@ export function PancakeGraphView() {
             }).svg
           : (!useSymmetry
               ? toSVG
-              : graph.preset === "pancake-zaks"
+              : renderGraph.preset === "pancake-zaks"
                 ? toZaksSymmetrySVG
                 : toSymmetrySVG)({
-              graph,
+              graph: renderGraph,
               settings,
               size: svgExportSize,
             });
@@ -1663,10 +2116,10 @@ export function PancakeGraphView() {
         setStatus(`SVG export error: ${msg}`);
       }
     }, 30);
-  }, [activeRenderer, sampledLines, graph, settings, svgExportSize, yankelovichFieldViewport]);
+  }, [activeRenderer, sampledLines, graph, renderGraph, settings, svgExportSize, yankelovichFieldViewport]);
 
   const downloadPNG = useCallback(() => {
-    if (!graph) return;
+    if (!graph || !renderGraph) return;
     setStatus("Generating PNG…");
     setTimeout(() => {
       try {
@@ -1737,7 +2190,7 @@ export function PancakeGraphView() {
           const exportZoom = 1 / visible.scale;
           drawYankelovichToCanvas(ctx, {
             n: graph.n,
-            graph,
+            graph: renderGraph,
             settings,
             cssWidth: svgExportSize,
             cssHeight: svgExportSize,
@@ -1760,7 +2213,7 @@ export function PancakeGraphView() {
           const edgeMode: EdgeRenderMode =
             activeRenderer === "density" ? "density" : "line";
           drawToCanvas(ctx, {
-            graph,
+            graph: renderGraph,
             settings: { ...settings, edgeMode },
             cssWidth: svgExportSize,
             cssHeight: svgExportSize,
@@ -1788,7 +2241,7 @@ export function PancakeGraphView() {
         setStatus(`PNG export error: ${msg}`);
       }
     }, 30);
-  }, [activeRenderer, symmetryLite, sampledLines, yankelovich, graph, quotient, settings, svgExportSize, stageSize, zoom, pan, yankelovichFieldViewport]);
+  }, [activeRenderer, symmetryLite, sampledLines, yankelovich, graph, renderGraph, quotient, settings, svgExportSize, stageSize, zoom, pan, yankelovichFieldViewport]);
 
   const svgDownloadDisabled = useMemo(() => {
     if (!graph) return true;
@@ -1825,7 +2278,13 @@ export function PancakeGraphView() {
 
   const setYankelovichDraftStep = (delta: number) => {
     setYankelovichSampleDraftCount((value) =>
-      clampYankelovichSampleCount(value + delta, n, preset)
+      clampYankelovichSampleCount(
+        value + delta,
+        n,
+        preset,
+        renderer,
+        simplexYankelovichFactorial
+      )
     );
   };
 
@@ -1840,11 +2299,28 @@ export function PancakeGraphView() {
       ? crypto.getRandomValues(new Uint32Array(1))[0]
       : fallbackYankelovichSeedRef.current++) || 1;
 
+  // Random presets (random-cyclic / -dihedral / wedge-clipped) derive their
+  // entire matching from the sample seed, so a fresh seed is a brand-new random
+  // graph. Unlike Redraw this keeps the sample count/field-size drafts intact.
+  const regenerateRandomGraph = () => {
+    setSettings((s) => ({ ...s, yankelovichSampleSeed: newRandomSeed() }));
+    initialYankelovichFieldViewportRef.current = null;
+    setYankelovichFieldViewport(currentYankelovichViewport());
+  };
+
   const redrawYankelovichSample = () => {
     if (sampledLines) {
       // Like Yankelovich: bind the sample to the current zoom window and reseed,
       // so lines concentrate on the visible region.
       setS("yankelovichSampleSeed", newRandomSeed());
+      initialYankelovichFieldViewportRef.current = null;
+      setYankelovichFieldViewport(currentYankelovichViewport());
+      return;
+    }
+    if (isKaleidoscope(preset)) {
+      // The kaleidoscope is deterministic (reseeding is "New pattern"): redraw
+      // only rebinds the field to the current zoom/pan window and resolution.
+      setSettings((s) => ({ ...s, yankelovichFieldSize: yankelovichFieldDraftSize }));
       initialYankelovichFieldViewportRef.current = null;
       setYankelovichFieldViewport(currentYankelovichViewport());
       return;
@@ -1866,7 +2342,12 @@ export function PancakeGraphView() {
     setStatus("Computing Radon space…");
     window.setTimeout(() => {
       try {
-        const analysis = buildPancakeGraphLineSpace(graph);
+        const analysis = buildPancakeGraphLineSpace(graph, {
+          sampleCount: settings.yankelovichSampleCount,
+          sampleSeed: settings.yankelovichSampleSeed,
+          hiddenGenerators: settings.hiddenGenerators,
+          resolution: radonResolution,
+        });
         setRadonAnalysis(analysis);
         setStatus("Ready.");
       } catch (e) {
@@ -1876,9 +2357,21 @@ export function PancakeGraphView() {
         setRadonComputing(false);
       }
     }, 30);
-  }, [graph, radonComputing]);
+  }, [
+    graph,
+    radonComputing,
+    radonResolution,
+    settings.hiddenGenerators,
+    settings.yankelovichSampleCount,
+    settings.yankelovichSampleSeed,
+  ]);
 
-  const resetViewForGraph = (nextN: number, nextPreset: GraphPreset) => {
+  const resetViewForGraph = (
+    nextN: number,
+    nextPreset: GraphPreset,
+    nextRenderer: Renderer = renderer,
+    nextSimplexFactorial = simplexFactorial
+  ) => {
     // Switching graph or n changes the whole layout, so any prior
     // zoom/pan no longer makes sense — snap the view back to fit.
     setZoom(1);
@@ -1893,18 +2386,22 @@ export function PancakeGraphView() {
     // renderer instead wants bold, thick strokes (its accumulation + tone-map
     // expects them), so it keeps its own strong defaults.
     const rec =
-      renderer === "sampled" && supportsSampledLines(nextPreset)
+      nextRenderer === "sampled" && supportsSampledLines(nextPreset)
         ? { alpha: 100, width: 50 }
         : recommendedEdgeSliders(nextN, nextPreset);
     const nextYankelovichSampleCount = clampYankelovichSampleCount(
       YANKELOVICH_DEFAULT_SAMPLE_COUNT,
       nextN,
-      nextPreset
+      nextPreset,
+      nextRenderer,
+      nextSimplexFactorial
     );
     setSettings((s) => ({
       ...s,
       alpha: rec.alpha,
       width: rec.width,
+      showCycle: defaultVisibilityFor(nextPreset).showCycle,
+      showVertices: defaultVisibilityFor(nextPreset).showVertices,
       vertexOrbitLevel: nextN,
       yankelovichSampleCount: nextYankelovichSampleCount,
       sampledRepCount: clampSampledRepCount(SAMPLED_REPS_DEFAULT, nextN),
@@ -1916,14 +2413,20 @@ export function PancakeGraphView() {
   };
 
   const selectN = (value: string) => {
-    const nextN = Number(value) as NValue;
+    const option = parseNSelectValue(value);
+    const nextN = option.n as NValue;
+    setSimplexFactorial(option.simplexFactorial);
     setN(nextN);
-    resetViewForGraph(nextN, preset);
+    resetViewForGraph(nextN, preset, renderer, option.simplexFactorial);
   };
 
   const selectPreset = (value: string) => {
     const nextPreset = value as GraphPreset;
-    const nextRenderer = requiresYankelovich(nextPreset) ? "yankelovich" : renderer;
+    let nextRenderer: Renderer = requiresYankelovich(nextPreset) ? "yankelovich" : renderer;
+    if (isVariableCoxeterRootPreset(nextPreset) && nextRenderer === "svg") {
+      nextRenderer = "canvas";
+    }
+    const nextSimplexFactorial = false;
     const nextN = Math.min(
       DEFAULT_N,
       maxNForRenderer(nextPreset, nextRenderer)
@@ -1937,14 +2440,29 @@ export function PancakeGraphView() {
     if (renderer === "symmetry" && !supportsSymmetry({ preset: nextPreset })) {
       setRenderer("svg");
     }
+    // Sampled lines only apply to layouts that support analytic chord sampling.
+    if (renderer === "sampled" && !supportsSampledLines(nextPreset)) {
+      setRenderer("svg");
+    }
     if (requiresYankelovich(nextPreset)) {
       setRenderer("yankelovich");
     }
+    if (isVariableCoxeterRootPreset(nextPreset) && renderer === "svg") {
+      setRenderer("canvas");
+    }
+    setSimplexFactorial(nextSimplexFactorial);
+    // Follow the new family's default colour map unless the user picked one.
+    setSettings((s) => {
+      const current = s.yankelovichColormap ?? defaultColormapFor(preset);
+      return current === defaultColormapFor(preset)
+        ? { ...s, yankelovichColormap: defaultColormapFor(nextPreset) }
+        : s;
+    });
     setPreset(nextPreset);
     // Switching graph family resets n to the default, clamped to the new
     // preset's maximum (some presets, e.g. the sliding puzzle, top out lower).
     setN(nextN);
-    resetViewForGraph(nextN, nextPreset);
+    resetViewForGraph(nextN, nextPreset, nextRenderer, nextSimplexFactorial);
   };
 
   const zoomOut = () => {
@@ -2145,6 +2663,13 @@ export function PancakeGraphView() {
     const hidden = new Set(settings.hiddenGenerators);
     return graph.generators.filter((gen) => !hidden.has(gen.id)).length;
   }, [graph, settings.hiddenGenerators]);
+  const hypercubeGraySequence = useMemo(() => {
+    if (!graph || graph.preset !== "hypercube" || graph.n > 5) return null;
+    return {
+      generators: graph.flips.map((id) => `b${id}`),
+      vertices: graph.path.map((vertex) => Array.from(vertex).join("")),
+    };
+  }, [graph]);
 
   // Cₙ orbit table: only meaningful for the pancake-zaks layout, where the
   // index ring matches the fundamental-sector enumeration, and only legible at
@@ -2333,8 +2858,7 @@ export function PancakeGraphView() {
         <CardHeader className="space-y-1">
           <CardTitle className="text-lg">Graph explorer</CardTitle>
           <CardDescription>
-            Vertices are placed on a circle and connected by the selected graph
-            generators.
+            Vertices use the selected layout and connect by graph generators.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -2397,10 +2921,10 @@ export function PancakeGraphView() {
 
             <div className="space-y-2">
               <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-                Value of n
+                {kaleidoscope ? "Mirrors" : "Value of n"}
               </Label>
               <Select
-                value={String(n)}
+                value={nSelectValue(n, simplexYankelovichFactorial)}
                 onValueChange={selectN}
                 disabled={running}
               >
@@ -2408,23 +2932,90 @@ export function PancakeGraphView() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper">
-                  {availableNOptions.map((opt) => (
-                    <SelectItem key={opt} value={String(opt)}>
-                      n = {opt} —{" "}
-                      {vertexCountLabel(graphVertexCount(opt, preset))} vertices
+                  {availableNOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {nOptionLabel(option, preset, renderer)}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
 
+            {preset === "hypercube" ? (
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                  Layout
+                </Label>
+                <Select
+                  value={hypercubeLayout}
+                  onValueChange={(value) =>
+                    setHypercubeLayout(value as HypercubeLayout)
+                  }
+                  disabled={running}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="popper">
+                    <SelectItem value="circle">Circle</SelectItem>
+                    <SelectItem value="recursive">Recursive mirror blocks</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
+
+            {kaleidoscope ? (
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                  Segments
+                </Label>
+                <Select
+                  value={String(kaleidoscopeLevel)}
+                  onValueChange={(v) => setKaleidoscopeLevel(Number(v))}
+                  disabled={running}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="popper">
+                    {KALEIDOSCOPE_LEVEL_VALUES.map((level) => (
+                      <SelectItem key={level} value={String(level)}>
+                        {KALEIDOSCOPE_LEVEL_LABELS[level]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
+
             <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
-              <Stat label="Vertices" value={metrics?.vertices} />
-              <Stat label="Edges" value={metrics?.cayleyEdges} />
-              <Stat
-                label="Degree"
-                value={metrics ? (graphEdgesPerVertex(n, preset) ?? "—") : undefined}
-              />
+              {kaleidoscope ? (
+                <>
+                  <Stat label="Mirrors" value={n} />
+                  <Stat label="Sectors" value={2 * n} />
+                  <Stat label="Wedge" value={degreesLabel(180 / n)} />
+                  <Stat label="Level" value={`${kaleidoscopeLevel} / 5`} />
+                  <Stat label="Segments" value={metrics?.cayleyEdges} full />
+                </>
+              ) : (
+                <>
+                  <Stat label="Vertices" value={metrics?.vertices} />
+                  <Stat label="Edges" value={metrics?.cayleyEdges} />
+                  <Stat
+                    label="Degree"
+                    value={
+                      metrics
+                        ? (displayEdgesPerVertex(
+                            n,
+                            preset,
+                            renderer,
+                            simplexYankelovichFactorial
+                          ) ?? "—")
+                        : undefined
+                    }
+                  />
+                </>
+              )}
               {yankelovich ? (
                 <Stat
                   label="Visible edges"
@@ -2524,10 +3115,27 @@ export function PancakeGraphView() {
                   const next = v as Renderer;
                   // Leaving Yankelovich for a renderer that enumerates the graph
                   // must drop n back under that renderer's ceiling.
-                  const cap = maxNForRenderer(preset, next);
-                  if (n > cap) {
-                    setN(cap as NValue);
-                    resetViewForGraph(cap, preset);
+                  const nextOptions = nOptionsForRenderer(preset, next);
+                  const cap = nextOptions[nextOptions.length - 1];
+                  const floor = nextOptions[0];
+                  const nextN = n > cap ? cap : n < floor ? floor : n;
+                  const nextSimplexFactorial =
+                    preset === "simplex" &&
+                    next === "yankelovich" &&
+                    simplexFactorial &&
+                    nextN >= SIMPLEX_YANKELOVICH_N_OPTIONS[0];
+                  if (
+                    nextN !== n ||
+                    nextSimplexFactorial !== simplexFactorial
+                  ) {
+                    setN(nextN as NValue);
+                    setSimplexFactorial(nextSimplexFactorial);
+                    resetViewForGraph(
+                      nextN,
+                      preset,
+                      next,
+                      nextSimplexFactorial
+                    );
                   }
                   // The auto edge sliders target the full 10²⁰-edge density, so
                   // they bottom out; a sparse line sample needs visibly stronger
@@ -2610,8 +3218,72 @@ export function PancakeGraphView() {
                     ))}
                   </SelectContent>
                 </Select>
+                {preset === "pancake-zaks" && activeRenderer === "symmetry" ? (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] text-muted-foreground">
+                        Scope
+                      </span>
+                      <div className="inline-flex overflow-hidden rounded-md border">
+                        <button
+                          type="button"
+                          onClick={() => setS("zaksFundamentalOnly", false)}
+                          className={`px-2 py-0.5 text-[11px] transition-colors ${
+                            !settings.zaksFundamentalOnly
+                              ? "bg-violet-600 text-white"
+                              : "bg-background hover:bg-muted"
+                          }`}
+                        >
+                          Full
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setS("zaksFundamentalOnly", true)}
+                          className={`px-2 py-0.5 text-[11px] transition-colors ${
+                            settings.zaksFundamentalOnly
+                              ? "bg-violet-600 text-white"
+                              : "bg-background hover:bg-muted"
+                          }`}
+                        >
+                          Fundamental
+                        </button>
+                      </div>
+                    </div>
+                    {settings.zaksFundamentalOnly ? (
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] text-muted-foreground">
+                          View
+                        </span>
+                        <div className="inline-flex overflow-hidden rounded-md border">
+                          {ZAKS_FUNDAMENTAL_VIEWS.map((view) => (
+                            <button
+                              key={view}
+                              type="button"
+                              onClick={() => setS("zaksFundamentalView", view)}
+                              className={`px-2 py-0.5 text-[11px] capitalize transition-colors ${
+                                (settings.zaksFundamentalView ?? "wedge") ===
+                                view
+                                  ? "bg-violet-600 text-white"
+                                  : "bg-background hover:bg-muted"
+                              }`}
+                            >
+                              {view}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
                 <p className="text-[11px] leading-snug text-muted-foreground">
-                  {settings.symmetryColoring === "orbit" ? (
+                  {settings.zaksFundamentalOnly ? (
+                    <>
+                      Fundamental scope shows the 360/(2n) wedge, rₙ only.
+                      {(settings.zaksFundamentalView ?? "wedge") === "circle"
+                        ? " Bottom circle: n−1 quotient by reflection."
+                        : ""}
+                    </>
+                  ) : settings.symmetryColoring === "orbit" ? (
                     <>
                       One hue per <span className="font-medium">Cₙ orbit</span>{" "}
                       (ρ: i ↦ i+(n-1)!): each color class is a clean rotated
@@ -2979,18 +3651,20 @@ export function PancakeGraphView() {
 
             {yankelovich || sampledLines ? (
               <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-                    {sampledLines || usesAnalyticYankelovich(preset)
-                      ? "Random vertices"
-                      : "Random edges"}
-                  </Label>
-                  <span className="font-mono text-xs text-muted-foreground">
-                    {formatUiNumber(
-                      sampledLines ? sampledRepCount : yankelovichSampleCount
-                    )}
-                  </span>
-                </div>
+                {!isKaleidoscope(preset) ? (
+                  <div className="flex items-center justify-between gap-2">
+                    <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                      {sampledLines || usesAnalyticYankelovich(preset)
+                        ? "Random vertices"
+                        : "Random edges"}
+                    </Label>
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {formatUiNumber(
+                        sampledLines ? sampledRepCount : yankelovichSampleCount
+                      )}
+                    </span>
+                  </div>
+                ) : null}
                 {sampledLines || usesAnalyticYankelovich(preset) ? (
                   <div className="flex items-center justify-between text-xs text-muted-foreground">
                     <span>Angular sector</span>
@@ -3000,6 +3674,7 @@ export function PancakeGraphView() {
                     </span>
                   </div>
                 ) : null}
+                {!isKaleidoscope(preset) ? (
                 <div className="grid grid-cols-2 gap-2">
                   <Button
                     type="button"
@@ -3008,7 +3683,7 @@ export function PancakeGraphView() {
                     onClick={() =>
                       sampledLines
                         ? setSampledRepStep(-SAMPLED_REPS_STEP)
-                        : setYankelovichDraftStep(-YANKELOVICH_SAMPLE_COUNT_STEP)
+                        : setYankelovichDraftStep(-yankelovichSampleStep)
                     }
                     disabled={
                       sampledLines
@@ -3023,9 +3698,7 @@ export function PancakeGraphView() {
                   >
                     <Minus className="size-3.5" />
                     {formatUiNumber(
-                      sampledLines
-                        ? SAMPLED_REPS_STEP
-                        : YANKELOVICH_SAMPLE_COUNT_STEP
+                      sampledLines ? SAMPLED_REPS_STEP : yankelovichSampleStep
                     )}
                   </Button>
                   <Button
@@ -3035,7 +3708,7 @@ export function PancakeGraphView() {
                     onClick={() =>
                       sampledLines
                         ? setSampledRepStep(SAMPLED_REPS_STEP)
-                        : setYankelovichDraftStep(YANKELOVICH_SAMPLE_COUNT_STEP)
+                        : setYankelovichDraftStep(yankelovichSampleStep)
                     }
                     disabled={
                       sampledLines
@@ -3051,12 +3724,48 @@ export function PancakeGraphView() {
                   >
                     <Plus className="size-3.5" />
                     {formatUiNumber(
-                      sampledLines
-                        ? SAMPLED_REPS_STEP
-                        : YANKELOVICH_SAMPLE_COUNT_STEP
+                      sampledLines ? SAMPLED_REPS_STEP : yankelovichSampleStep
                     )}
                   </Button>
                 </div>
+                ) : null}
+                {!sampledLines && !isKaleidoscope(preset) ? (
+                  <div className="flex items-center justify-between gap-2">
+                    <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                      Step
+                    </Label>
+                    <Select
+                      value={String(yankelovichSampleStep)}
+                      onValueChange={(v) =>
+                        setYankelovichSampleStep(Number(v))
+                      }
+                    >
+                      <SelectTrigger className="h-8 w-28">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent position="popper">
+                        {YANKELOVICH_SAMPLE_STEP_OPTIONS.map((step) => (
+                          <SelectItem key={step} value={String(step)}>
+                            {formatUiNumber(step)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ) : null}
+                {requiresYankelovich(preset) || isKaleidoscope(preset) ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={regenerateRandomGraph}
+                    disabled={running || isComputing || isRendering}
+                  >
+                    <Dices className="size-3.5" />
+                    {isKaleidoscope(preset) ? "New pattern" : "New random graph"}
+                  </Button>
+                ) : null}
                 <Button
                   type="button"
                   variant="outline"
@@ -3176,7 +3885,9 @@ export function PancakeGraphView() {
                     Colormap
                   </Label>
                   <Select
-                    value={settings.yankelovichColormap ?? "gray"}
+                    value={
+                      settings.yankelovichColormap ?? defaultColormapFor(preset)
+                    }
                     onValueChange={(v) =>
                       setS("yankelovichColormap", v as YankelovichColormap)
                     }
@@ -3362,6 +4073,9 @@ export function PancakeGraphView() {
                 <p className="text-[11px] leading-snug text-muted-foreground">
                   Click a label to hide its edges. The small degree value is the
                   average arc between the points each generator connects.
+                  {graph.preset === "hypercube"
+                    ? " For hypercube, b1 is the LSB and bn is the MSB."
+                    : ""}
                 </p>
                 <DistanceHistogram
                   bins={selectedDistanceHistogram}
@@ -3429,7 +4143,9 @@ export function PancakeGraphView() {
       <Card className="overflow-hidden p-0">
         <div
           ref={stageRef}
-          className="relative h-[calc(100vh-9rem)] min-h-[680px] w-full bg-white"
+          className={`relative h-[calc(100vh-9rem)] w-full bg-white ${
+            needsTallStage ? "min-h-[1360px]" : "min-h-[680px]"
+          }`}
         >
           {running || (activeRenderer === "quotient" && quotientLoading) ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 bg-white">
@@ -3501,15 +4217,35 @@ export function PancakeGraphView() {
                   {graphPresetLabel(preset)}
                 </span>
                 <span>·</span>
-                <span className="font-mono">n = {n}</span>
-                {metrics ? (
+                {kaleidoscope ? (
                   <>
+                    <span className="font-mono">
+                      {n} mirrors · {degreesLabel(180 / n)}
+                    </span>
                     <span>·</span>
-                    <span>{formatUiNumber(metrics.vertices)} vertices</span>
-                    <span>·</span>
-                    <span>{formatUiNumber(metrics.cayleyEdges)} edges</span>
+                    <span>{2 * n} sectors</span>
+                    {metrics ? (
+                      <>
+                        <span>·</span>
+                        <span>
+                          {formatUiNumber(metrics.cayleyEdges)} segments
+                        </span>
+                      </>
+                    ) : null}
                   </>
-                ) : null}
+                ) : (
+                  <>
+                    <span className="font-mono">n = {n}</span>
+                    {metrics ? (
+                      <>
+                        <span>·</span>
+                        <span>{formatUiNumber(metrics.vertices)} vertices</span>
+                        <span>·</span>
+                        <span>{formatUiNumber(metrics.cayleyEdges)} edges</span>
+                      </>
+                    ) : null}
+                  </>
+                )}
                 <span>·</span>
                 <span className="rounded border bg-muted px-1 py-px font-mono text-[10px] uppercase">
                   {activeRenderer}
@@ -3564,6 +4300,13 @@ export function PancakeGraphView() {
           )}
         </div>
       </Card>
+      {graph && hypercubeGraySequence ? (
+        <HypercubeGraySequenceCard
+          n={graph.n}
+          generators={hypercubeGraySequence.generators}
+          vertices={hypercubeGraySequence.vertices}
+        />
+      ) : null}
       <RadonSpaceCard
         result={radonAnalysis}
         computing={radonComputing}
@@ -3571,6 +4314,21 @@ export function PancakeGraphView() {
         disabled={!canGenerateRadon || running || isComputing || isRendering}
         seedWedgeOnly={radonSeedWedgeOnly}
         setSeedWedgeOnly={setRadonSeedWedgeOnly}
+        gridKey={radonGridKey}
+        setGridKey={(value) => {
+          setRadonGridKey(value);
+          setRadonAnalysis(null);
+        }}
+        seedPsi={radonSeedPsi}
+        setSeedPsi={(value) => {
+          setRadonSeedPsi(value);
+          setRadonAnalysis(null);
+        }}
+        fftKey={radonFftKey}
+        setFftKey={(value) => {
+          setRadonFftKey(value);
+          setRadonAnalysis(null);
+        }}
       />
       {showOrbitTable ? <OrbitTable orbits={orbitTable} n={n} /> : null}
       </div>
@@ -3585,6 +4343,12 @@ function RadonSpaceCard({
   disabled,
   seedWedgeOnly,
   setSeedWedgeOnly,
+  gridKey,
+  setGridKey,
+  seedPsi,
+  setSeedPsi,
+  fftKey,
+  setFftKey,
 }: {
   result: LineSpace | null;
   computing: boolean;
@@ -3592,6 +4356,12 @@ function RadonSpaceCard({
   disabled: boolean;
   seedWedgeOnly: boolean;
   setSeedWedgeOnly: (value: boolean) => void;
+  gridKey: RadonGridKey;
+  setGridKey: (value: RadonGridKey) => void;
+  seedPsi: RadonSeedPsi;
+  setSeedPsi: (value: RadonSeedPsi) => void;
+  fftKey: RadonFftKey;
+  setFftKey: (value: RadonFftKey) => void;
 }) {
   return (
     <Card>
@@ -3613,24 +4383,94 @@ function RadonSpaceCard({
           </Button>
         </div>
       </CardHeader>
-      {result ? (
-        <CardContent className="space-y-4">
-          <LineSpaceView
-            lineSpace={result}
-            orderLabel="graph"
-            showRasterLayer
-          />
-          <AngleWhiteCharts
-            lineSpace={result}
-            seedWedgeOnly={seedWedgeOnly}
-            setSeedWedgeOnly={setSeedWedgeOnly}
-          />
-          <CircularAutocorrelationChart
-            lineSpace={result}
-            seedWedgeOnly={seedWedgeOnly}
-          />
-        </CardContent>
-      ) : null}
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 text-xs sm:grid-cols-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">Radon bins</Label>
+            <Select
+              value={gridKey}
+              onValueChange={(value) => setGridKey(value as RadonGridKey)}
+            >
+              <SelectTrigger className="h-8 w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RADON_GRID_OPTIONS.map((option) => (
+                  <SelectItem key={option.key} value={option.key}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">Seed θ bins</Label>
+            <Select
+              value={String(seedPsi)}
+              onValueChange={(value) => setSeedPsi(Number(value) as RadonSeedPsi)}
+            >
+              <SelectTrigger className="h-8 w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RADON_SEED_PSI_OPTIONS.map((option) => (
+                  <SelectItem key={option} value={String(option)}>
+                    {option}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">FFT bins</Label>
+            <Select
+              value={fftKey}
+              onValueChange={(value) => setFftKey(value as RadonFftKey)}
+            >
+              <SelectTrigger className="h-8 w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RADON_FFT_OPTIONS.map((option) => (
+                  <SelectItem key={option.key} value={option.key}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        {result ? (
+          <>
+            {result.hasSeedWedge ? (
+              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 accent-blue-600"
+                  checked={seedWedgeOnly}
+                  onChange={(event) => setSeedWedgeOnly(event.target.checked)}
+                />
+                <span>Seed wedge only</span>
+              </label>
+            ) : null}
+            <LineSpaceView
+              lineSpace={result}
+              orderLabel="graph"
+              showRasterLayer
+              seedWedgeOnly={seedWedgeOnly}
+            />
+            <AngleWhiteCharts
+              lineSpace={result}
+              seedWedgeOnly={seedWedgeOnly}
+              setSeedWedgeOnly={setSeedWedgeOnly}
+            />
+            <CircularAutocorrelationChart
+              lineSpace={result}
+              seedWedgeOnly={seedWedgeOnly}
+            />
+          </>
+        ) : null}
+      </CardContent>
     </Card>
   );
 }
@@ -3923,6 +4763,41 @@ function GeneratorChip({
         <span className="text-[9px] leading-none opacity-70">{arcLabel}</span>
       ) : null}
     </button>
+  );
+}
+
+function HypercubeGraySequenceCard({
+  n,
+  generators,
+  vertices,
+}: {
+  n: number;
+  generators: string[];
+  vertices: string[];
+}) {
+  return (
+    <Card>
+      <CardHeader className="space-y-1">
+        <CardTitle className="text-base">Gray-code generator sequence</CardTitle>
+        <CardDescription>
+          n = {n}; b1 is the LSB. Closing edge included.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="space-y-1">
+          <h3 className="text-xs font-medium">Vertices</h3>
+          <p className="break-words font-mono text-xs leading-6 text-muted-foreground">
+            {vertices.join(", ")}
+          </p>
+        </div>
+        <div className="space-y-1">
+          <h3 className="text-xs font-medium">Generators</h3>
+          <p className="break-words font-mono text-xs leading-6 text-muted-foreground">
+            {generators.join(", ")}
+          </p>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

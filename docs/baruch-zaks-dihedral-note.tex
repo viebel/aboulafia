@@ -1,0 +1,42 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+
+\begin{document}
+Let
+\[
+  \mathcal A_{n-1}=\{x_i=x_j\}
+  \subset
+  \mathbb R^n/\langle(1,\ldots,1)\rangle
+\]
+be the type \(A_{n-1}\) braid arrangement. Its chambers are indexed by the
+\(n!\) linear orders of the coordinates \(x_1,\ldots,x_n\).
+
+There is a cyclic ordering of all chambers, obtained from Zaks' recursive
+Hamiltonian-cycle algorithm, with the following property. If
+\[
+  \Phi_n:\{\text{chambers of }\mathcal A_{n-1}\}
+  \longrightarrow
+  \mathbb Z/n!\mathbb Z
+\]
+denotes this ordering, then the cyclic rotation of the indices
+\[
+  r:1\mapsto2\mapsto\cdots\mapsto n\mapsto1
+\]
+acts by
+\[
+  \Phi_n(r\cdot C)=\Phi_n(C)+(n-1)! \pmod{n!},
+\]
+and the reversal of the indices acts by
+\[
+  \Phi_n(s\cdot C)=a-\Phi_n(C) \pmod{n!}
+\]
+for some constant \(a\).
+
+Thus the natural dihedral subgroup \(D_n\subset S_n\), acting on the indices
+\(1,\ldots,n\), is realized as the ordinary dihedral symmetry of the cycle of
+length \(n!\) formed by all chambers.
+
+\end{document}
+

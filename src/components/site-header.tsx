@@ -39,6 +39,18 @@ export function SiteHeader() {
           >
             Dihedral
           </Link>
+          <Link
+            href="/kaleidoscope"
+            className="transition-colors hover:text-foreground"
+          >
+            Kaleidoscope
+          </Link>
+          <Link
+            href="/stabilization"
+            className="transition-colors hover:text-foreground"
+          >
+            Stabilization
+          </Link>
         </nav>
       </div>
     </header>

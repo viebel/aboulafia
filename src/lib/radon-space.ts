@@ -6,6 +6,14 @@ export const AUTOCORR_THETA_BINS = 1024;
 export const TWO_WEDGE_AUTOCORR_THETA_BINS = 4096;
 export const AUTOCORR_P_BINS = 128;
 
+export interface LineSpaceResolution {
+  psiBins?: number;
+  pBins?: number;
+  seedWedgePsiBins?: number;
+  autocorrThetaBins?: number;
+  autocorrPBins?: number;
+}
+
 export interface LineSpaceBin {
   x: number;
   y: number;
@@ -39,17 +47,41 @@ export interface LineSpace {
   thetaMax: number;
   psiBins: number;
   pBins: number;
+  seedWedgePsiBins: number;
   bins: LineSpaceBin[];
+  seedWedgeBins: LineSpaceBin[];
   angleWhiteBins: AngleWhiteBin[];
   seedWedgeAngleWhiteBins: AngleWhiteBin[];
   thetaAutocorrelation: AutocorrelationField;
   twoWedgeAutocorrelation: AutocorrelationField;
   maxCount: number;
+  seedWedgeMaxCount: number;
   maxWhiteCells: number;
   maxHoleCount: number;
   totalEdgeCount: number;
   seedEdgeCount: number;
   usedEdgeCount: number;
+}
+
+export interface PancakeGraphLineSpaceOptions {
+  sampleCount?: number;
+  sampleSeed?: number;
+  hiddenGenerators?: readonly number[];
+  resolution?: LineSpaceResolution;
+}
+
+function makeRadonRng(seed: number): () => number {
+  let s = seed >>> 0 || 1;
+  return () => {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return ((s >>> 0) & 0xffffffff) / 0x100000000;
+  };
+}
+
+function dihedralSectorVertexCount(n: number): number {
+  return Math.max(1, Math.floor(factorial(n - 1) / 2));
 }
 
 function angleWhiteStats(
@@ -202,6 +234,7 @@ export function buildLineSpaceFromEdges({
   totalEdgeCount,
   seedEdgeCount,
   hasSeedWedge,
+  resolution,
   emitEdges,
 }: {
   n: number;
@@ -209,6 +242,7 @@ export function buildLineSpaceFromEdges({
   totalEdgeCount: number;
   seedEdgeCount: number;
   hasSeedWedge: boolean;
+  resolution?: LineSpaceResolution;
   emitEdges: (
     addEdge: (
       a: number,
@@ -219,19 +253,26 @@ export function buildLineSpaceFromEdges({
   ) => void;
 }): LineSpace {
   const total = vertexCount;
-  const psiBins = 180;
-  const pBins = 120;
+  const psiBins = resolution?.psiBins ?? 180;
+  const pBins = resolution?.pBins ?? 120;
+  const seedWedgePsiBins = resolution?.seedWedgePsiBins ?? SEED_WEDGE_PSI_BINS;
+  const twoWedgePsiBins = 2 * seedWedgePsiBins;
+  const autocorrThetaBins =
+    resolution?.autocorrThetaBins ?? AUTOCORR_THETA_BINS;
+  const twoWedgeAutocorrThetaBins = 4 * autocorrThetaBins;
+  const autocorrPBins = resolution?.autocorrPBins ?? AUTOCORR_P_BINS;
   const thetaMax = Math.PI;
   const seedWedgeThetaMax = thetaMax / n;
   const counts = new Uint32Array(psiBins * pBins);
-  const seedWedgeCounts = new Uint32Array(SEED_WEDGE_PSI_BINS * pBins);
-  const twoWedgeCounts = new Uint32Array(TWO_WEDGE_PSI_BINS * pBins);
-  const autocorrCounts = new Uint32Array(AUTOCORR_THETA_BINS * AUTOCORR_P_BINS);
+  const seedWedgeCounts = new Uint32Array(seedWedgePsiBins * pBins);
+  const twoWedgeCounts = new Uint32Array(twoWedgePsiBins * pBins);
+  const autocorrCounts = new Uint32Array(autocorrThetaBins * autocorrPBins);
   const twoWedgeAutocorrCounts = new Uint32Array(
-    TWO_WEDGE_AUTOCORR_THETA_BINS * AUTOCORR_P_BINS
+    twoWedgeAutocorrThetaBins * autocorrPBins
   );
   let usedEdgeCount = 0;
   let maxCount = 0;
+  let seedWedgeMaxCount = 0;
 
   const addLine = (
     aIndex: number,
@@ -276,14 +317,14 @@ export function buildLineSpaceFromEdges({
       if (count > maxCount) maxCount = count;
 
       const autocorrX = Math.min(
-        AUTOCORR_THETA_BINS - 1,
-        Math.floor((psi / thetaMax) * AUTOCORR_THETA_BINS)
+        autocorrThetaBins - 1,
+        Math.floor((psi / thetaMax) * autocorrThetaBins)
       );
       const autocorrY = Math.min(
-        AUTOCORR_P_BINS - 1,
-        Math.max(0, Math.floor(((p + 1) / 2) * AUTOCORR_P_BINS))
+        autocorrPBins - 1,
+        Math.max(0, Math.floor(((p + 1) / 2) * autocorrPBins))
       );
-      autocorrCounts[autocorrY * AUTOCORR_THETA_BINS + autocorrX]++;
+      autocorrCounts[autocorrY * autocorrThetaBins + autocorrX]++;
 
       usedEdgeCount++;
     }
@@ -291,30 +332,33 @@ export function buildLineSpaceFromEdges({
     if (includeSeedWedge) {
       if (psi <= seedWedgeThetaMax) {
         const seedX = Math.min(
-          SEED_WEDGE_PSI_BINS - 1,
-          Math.floor((psi / seedWedgeThetaMax) * SEED_WEDGE_PSI_BINS)
+          seedWedgePsiBins - 1,
+          Math.floor((psi / seedWedgeThetaMax) * seedWedgePsiBins)
         );
-        seedWedgeCounts[y * SEED_WEDGE_PSI_BINS + seedX]++;
+        const seedIndex = y * seedWedgePsiBins + seedX;
+        const seedCount = seedWedgeCounts[seedIndex] + 1;
+        seedWedgeCounts[seedIndex] = seedCount;
+        if (seedCount > seedWedgeMaxCount) seedWedgeMaxCount = seedCount;
       }
 
       const twoWedgeThetaMax = 2 * seedWedgeThetaMax;
       if (psi <= twoWedgeThetaMax) {
         const twoWedgeX = Math.min(
-          TWO_WEDGE_PSI_BINS - 1,
-          Math.floor((psi / twoWedgeThetaMax) * TWO_WEDGE_PSI_BINS)
+          twoWedgePsiBins - 1,
+          Math.floor((psi / twoWedgeThetaMax) * twoWedgePsiBins)
         );
-        twoWedgeCounts[y * TWO_WEDGE_PSI_BINS + twoWedgeX]++;
+        twoWedgeCounts[y * twoWedgePsiBins + twoWedgeX]++;
 
         const twoWedgeAutocorrX = Math.min(
-          TWO_WEDGE_AUTOCORR_THETA_BINS - 1,
-          Math.floor((psi / twoWedgeThetaMax) * TWO_WEDGE_AUTOCORR_THETA_BINS)
+          twoWedgeAutocorrThetaBins - 1,
+          Math.floor((psi / twoWedgeThetaMax) * twoWedgeAutocorrThetaBins)
         );
         const twoWedgeAutocorrY = Math.min(
-          AUTOCORR_P_BINS - 1,
-          Math.max(0, Math.floor(((p + 1) / 2) * AUTOCORR_P_BINS))
+          autocorrPBins - 1,
+          Math.max(0, Math.floor(((p + 1) / 2) * autocorrPBins))
         );
         twoWedgeAutocorrCounts[
-          twoWedgeAutocorrY * TWO_WEDGE_AUTOCORR_THETA_BINS + twoWedgeAutocorrX
+          twoWedgeAutocorrY * twoWedgeAutocorrThetaBins + twoWedgeAutocorrX
         ]++;
       }
     }
@@ -334,18 +378,18 @@ export function buildLineSpaceFromEdges({
   const fullWhiteStats = angleWhiteStats(counts, psiBins, pBins);
   const seedWedgeWhiteStats = angleWhiteStats(
     seedWedgeCounts,
-    SEED_WEDGE_PSI_BINS,
+    seedWedgePsiBins,
     pBins
   );
   const thetaAutocorrelation = circularThetaAutocorrelationByRow(
     autocorrCounts,
-    AUTOCORR_THETA_BINS,
-    AUTOCORR_P_BINS
+    autocorrThetaBins,
+    autocorrPBins
   );
   const twoWedgeAutocorrelation = circularThetaAutocorrelationByRow(
     twoWedgeAutocorrCounts,
-    TWO_WEDGE_AUTOCORR_THETA_BINS,
-    AUTOCORR_P_BINS
+    twoWedgeAutocorrThetaBins,
+    autocorrPBins
   );
 
   const bins: LineSpaceBin[] = [];
@@ -353,6 +397,13 @@ export function buildLineSpaceFromEdges({
     for (let x = 0; x < psiBins; x++) {
       const count = counts[y * psiBins + x];
       if (count > 0) bins.push({ x, y, count });
+    }
+  }
+  const seedWedgeBins: LineSpaceBin[] = [];
+  for (let y = 0; y < pBins; y++) {
+    for (let x = 0; x < seedWedgePsiBins; x++) {
+      const count = seedWedgeCounts[y * seedWedgePsiBins + x];
+      if (count > 0) seedWedgeBins.push({ x, y, count });
     }
   }
 
@@ -363,12 +414,15 @@ export function buildLineSpaceFromEdges({
     thetaMax,
     psiBins,
     pBins,
+    seedWedgePsiBins,
     bins,
+    seedWedgeBins,
     angleWhiteBins: fullWhiteStats.bins,
     seedWedgeAngleWhiteBins: seedWedgeWhiteStats.bins,
     thetaAutocorrelation,
     twoWedgeAutocorrelation,
     maxCount,
+    seedWedgeMaxCount,
     maxWhiteCells: fullWhiteStats.maxWhiteCells,
     maxHoleCount: fullWhiteStats.maxHoleCount,
     totalEdgeCount,
@@ -377,15 +431,26 @@ export function buildLineSpaceFromEdges({
   };
 }
 
-export function buildPancakeGraphLineSpace(graph: PancakeGraph): LineSpace {
+export function buildPancakeGraphLineSpace(
+  graph: PancakeGraph,
+  options: PancakeGraphLineSpaceOptions = {}
+): LineSpace {
   const n = graph.n;
   const total = graph.path.length || factorial(n);
   const blockSize = factorial(n - 1);
-  const hasSeedWedge = graph.preset === "pancake-zaks";
+  const analyticCyclic = graph.preset === "random-cyclic";
+  const analyticDihedral =
+    graph.preset === "random-dihedral" ||
+    graph.preset === "wedge-clipped-dihedral" ||
+    graph.preset === "kaleidoscope";
+  const analyticRandom = analyticCyclic || analyticDihedral;
+  const hasSeedWedge = graph.preset === "pancake-zaks" || analyticRandom;
   const totalEdgeCount =
     graph.preset === "pancake-zaks"
       ? total / 2
-      : graph.preset === "pancake-williams"
+      : analyticRandom
+        ? total / 2
+        : graph.preset === "pancake-williams"
         ? (total * (n - 1)) / 2
         : graph.edges.length / 3;
   const wedgeVertexCount = Math.floor(blockSize / 2);
@@ -397,6 +462,7 @@ export function buildPancakeGraphLineSpace(graph: PancakeGraph): LineSpace {
     totalEdgeCount,
     seedEdgeCount,
     hasSeedWedge,
+    resolution: options.resolution,
     emitEdges(addEdge) {
       if (graph.preset === "pancake-zaks") {
         for (let i = 0; i < total; i++) {
@@ -415,6 +481,47 @@ export function buildPancakeGraphLineSpace(graph: PancakeGraph): LineSpace {
               true
             );
           }
+        }
+        return;
+      }
+
+      if (analyticRandom) {
+        if (options.hiddenGenerators?.includes(1)) return;
+        const sampleCount = Math.max(1, Math.round(options.sampleCount ?? 50_000));
+        const rng = makeRadonRng(options.sampleSeed ?? 1);
+        const sectorVertices = dihedralSectorVertexCount(n);
+        const usedSources = new Set<number>();
+        const usedVertices = new Set<number>();
+        let samples = 0;
+        let attempts = 0;
+        const maxAttempts = sampleCount * 4;
+
+        while (samples < sampleCount && attempts < maxAttempts) {
+          attempts++;
+          const i = Math.floor(rng() * sectorVertices);
+          if (usedSources.has(i) || usedVertices.has(i)) continue;
+
+          let j = Math.floor(rng() * total);
+          let targetAttempts = 0;
+          while ((j === i || usedVertices.has(j)) && targetAttempts < 20) {
+            j = Math.floor(rng() * total);
+            targetAttempts++;
+          }
+          if (j === i || usedVertices.has(j)) continue;
+
+          usedSources.add(i);
+          usedVertices.add(i);
+          usedVertices.add(j);
+          for (let k = 0; k < n; k++) {
+            const offset = k * blockSize;
+            const a = (i + offset) % total;
+            const b = (j + offset) % total;
+            addEdge(a, b, true, true);
+            if (analyticDihedral) {
+              addEdge(total - 1 - a, total - 1 - b, true, true);
+            }
+          }
+          samples++;
         }
         return;
       }

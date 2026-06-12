@@ -35,8 +35,18 @@ import { Loader2 } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const N_OPTIONS = [3, 4, 5, 6, 7, 8, 9, 10] as const;
-type NValue = (typeof N_OPTIONS)[number];
+const MIN_N = 3;
+const BASE_MAX_N = 10;
+const SIMPLEX_MAX_N = 22;
+const N_OPTIONS: readonly number[] = Array.from(
+  { length: BASE_MAX_N - MIN_N + 1 },
+  (_, i) => i + MIN_N
+);
+const SIMPLEX_N_OPTIONS: readonly number[] = Array.from(
+  { length: SIMPLEX_MAX_N - MIN_N + 1 },
+  (_, i) => i + MIN_N
+);
+type NValue = number;
 const DEFAULT_N: NValue = 4;
 const ORDER_OPTIONS = [
   "zaks",
@@ -65,6 +75,14 @@ const ORDER_LABELS: Record<AnalysisOrder, string> = {
   sierpinski: "Sierpinski",
   "sierpinski-random-dihedral": "Sierpinski random dihedral",
 };
+
+function nOptionsForOrder(order: AnalysisOrder): readonly number[] {
+  return order === "simplex" ? SIMPLEX_N_OPTIONS : N_OPTIONS;
+}
+
+function maxNForOrder(order: AnalysisOrder): number {
+  return order === "simplex" ? SIMPLEX_MAX_N : BASE_MAX_N;
+}
 
 const GRAPH_PREVIEW_SETTINGS: RenderSettings = {
   alpha: 36,
@@ -780,7 +798,7 @@ function buildWedgeComparison(
 ): WedgeComparison | null {
   if (order !== "zaks") return null;
   const previousN = n - 2;
-  if (previousN < N_OPTIONS[0]) return null;
+  if (previousN < MIN_N) return null;
 
   const previousSigma = buildSigmaData(previousN, order).values;
   const current = buildFoldedWedgeField(n, sigmaValues);
@@ -794,7 +812,7 @@ function buildFullComparison(
   order: AnalysisOrder
 ): WedgeComparison | null {
   const previousN = n - 2;
-  if (previousN < N_OPTIONS[0]) return null;
+  if (previousN < MIN_N) return null;
 
   const previousLineSpace = isPancakeOrder(order)
     ? buildLineSpace(previousN, buildSigmaData(previousN, order), order)
@@ -1342,7 +1360,12 @@ export function AnalysisView() {
   );
   const initialN = useMemo(
     () => {
-      const value = readIntParam(searchParams, "n", N_OPTIONS, DEFAULT_N) as NValue;
+      const value = readIntParam(
+        searchParams,
+        "n",
+        nOptionsForOrder(initialOrder),
+        DEFAULT_N
+      ) as NValue;
       return initialOrder === "williams" && value > WILLIAMS_RANDOMNESS_MAX_N
         ? WILLIAMS_RANDOMNESS_MAX_N
         : value;
@@ -1357,6 +1380,7 @@ export function AnalysisView() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisStatus, setAnalysisStatus] = useState("Ready.");
   const didMountRef = useRef(false);
+  const availableNOptions = nOptionsForOrder(order);
 
   useEffect(() => {
     writeUrlParams({ n: String(n), order });
@@ -1414,8 +1438,12 @@ export function AnalysisView() {
             onValueChange={(value) => {
               const nextOrder = value as AnalysisOrder;
               setOrder(nextOrder);
-              if (nextOrder === "williams" && n > WILLIAMS_RANDOMNESS_MAX_N) {
-                setN(WILLIAMS_RANDOMNESS_MAX_N);
+              const nextMax =
+                nextOrder === "williams"
+                  ? WILLIAMS_RANDOMNESS_MAX_N
+                  : maxNForOrder(nextOrder);
+              if (n > nextMax) {
+                setN(nextMax);
               }
             }}
           >
@@ -1441,7 +1469,7 @@ export function AnalysisView() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {N_OPTIONS.map((option) => (
+              {availableNOptions.map((option) => (
                 <SelectItem
                   key={option}
                   value={String(option)}
@@ -1508,6 +1536,7 @@ export function AnalysisView() {
           lineSpace={analysis.lineSpace}
           orderLabel={ORDER_LABELS[analysis.order]}
           showRasterLayer={showRasterLayers}
+          seedWedgeOnly={seedWedgeOnly}
         />
         <AngleWhiteCharts
           lineSpace={analysis.lineSpace}
@@ -1589,6 +1618,10 @@ export function CircularAutocorrelationChart({
     if (lowNumberRef.current) lowNumberRef.current.value = String(svgNumber(indexToUnit(low)));
     if (highNumberRef.current) highNumberRef.current.value = String(svgNumber(indexToUnit(high)));
   };
+  const draftUnitToIndex = (value: string | undefined, fallbackIndex: number) => {
+    const unit = Number(value);
+    return Number.isFinite(unit) ? unitToIndex(unit) : fallbackIndex;
+  };
   const absSumValues = Array.from({ length: visibleWidth }, (_, x) => {
     const sourceX = lowIndex + x;
     let sum = 0;
@@ -1606,6 +1639,10 @@ export function CircularAutocorrelationChart({
     },
     { value: visibleShiftEnd, label: piShiftLabel(visibleShiftEnd) },
   ];
+  const wedgeMarkers = Array.from(
+    { length: Math.floor(visibleShiftEnd / boundUnit) + 1 },
+    (_, i) => i * boundUnit
+  ).filter((theta) => theta >= visibleShiftStart && theta <= visibleShiftEnd);
 
   return (
     <section className="rounded-lg border bg-card p-3">
@@ -1633,7 +1670,7 @@ export function CircularAutocorrelationChart({
           </TooltipContent>
         </Tooltip>
         <span className="font-mono text-xs text-muted-foreground">
-          peak {field.peak.toFixed(3)}
+          bins {field.width} × {field.height} · peak {field.peak.toFixed(3)}
         </span>
       </div>
       <div className="mb-2 grid gap-2 text-xs text-muted-foreground">
@@ -1642,46 +1679,16 @@ export function CircularAutocorrelationChart({
           <div className="grid grid-cols-2 gap-2">
             <input
               ref={lowNumberRef}
-              type="number"
-              min={0}
-              max={maxBoundUnit}
-              step={0.01}
+              type="text"
               defaultValue={svgNumber(indexToUnit(lowIndex))}
-              onChange={(event) => {
-                if (!Number.isFinite(Number(event.target.value))) return;
-                const value = Math.min(
-                  unitToIndex(Number(event.target.value)),
-                  unitToIndex(Number(highNumberRef.current?.value ?? indexToUnit(highIndex))) -
-                    minVisibleBins
-                );
-                syncDraftInputs(
-                  value,
-                  unitToIndex(Number(highNumberRef.current?.value ?? indexToUnit(highIndex)))
-                );
-              }}
-              className="h-7 rounded border bg-background px-2 font-mono text-xs text-foreground [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+              className="h-7 rounded border bg-background px-2 font-mono text-xs text-foreground"
               aria-label="Low bound in 2 pi over 2 n units"
             />
             <input
               ref={highNumberRef}
-              type="number"
-              min={0}
-              max={maxBoundUnit}
-              step={0.01}
+              type="text"
               defaultValue={svgNumber(indexToUnit(highIndex))}
-              onChange={(event) => {
-                if (!Number.isFinite(Number(event.target.value))) return;
-                const value = Math.max(
-                  unitToIndex(Number(event.target.value)),
-                  unitToIndex(Number(lowNumberRef.current?.value ?? indexToUnit(lowIndex))) +
-                    minVisibleBins
-                );
-                syncDraftInputs(
-                  unitToIndex(Number(lowNumberRef.current?.value ?? indexToUnit(lowIndex))),
-                  value
-                );
-              }}
-              className="h-7 rounded border bg-background px-2 font-mono text-xs text-foreground [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+              className="h-7 rounded border bg-background px-2 font-mono text-xs text-foreground"
               aria-label="High bound in 2 pi over 2 n units"
             />
           </div>
@@ -1695,15 +1702,13 @@ export function CircularAutocorrelationChart({
             type="button"
             className="rounded border bg-background px-2 py-0.5 font-medium hover:text-foreground"
             onClick={() => {
+              const draftLow = draftUnitToIndex(lowNumberRef.current?.value, lowIndex);
+              const draftHigh = draftUnitToIndex(highNumberRef.current?.value, highIndex);
               const nextLow = Math.min(
-                unitToIndex(Number(lowNumberRef.current?.value ?? indexToUnit(lowIndex))),
-                unitToIndex(Number(highNumberRef.current?.value ?? indexToUnit(highIndex))) -
-                  minVisibleBins
+                draftLow,
+                draftHigh - minVisibleBins
               );
-              const nextHigh = Math.max(
-                unitToIndex(Number(highNumberRef.current?.value ?? indexToUnit(highIndex))),
-                nextLow + minVisibleBins
-              );
+              const nextHigh = Math.max(draftHigh, nextLow + minVisibleBins);
               syncDraftInputs(nextLow, nextHigh);
               setLowBound(nextLow / field.width);
               setHighBound(nextHigh / field.width);
@@ -1769,6 +1774,18 @@ export function CircularAutocorrelationChart({
           </g>
         ))}
 
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`wedge-shift-${index}`}
+            x1={svgNumber(xForShift(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForShift(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.55 : 0.28)}
+            strokeDasharray="3 5"
+          />
+        ))}
+
         {Array.from({ length: field.height }, (_, y) =>
           Array.from({ length: visibleWidth }, (_, x) => {
             const value = field.values[y * field.width + lowIndex + x];
@@ -1790,6 +1807,18 @@ export function CircularAutocorrelationChart({
             );
           })
         )}
+
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`wedge-shift-overlay-${index}`}
+            x1={svgNumber(xForShift(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForShift(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.75 : 0.5)}
+            strokeDasharray="3 5"
+          />
+        ))}
 
         <text
           x={svgNumber(margin.left + plotWidth / 2)}
@@ -1815,6 +1844,7 @@ export function CircularAutocorrelationChart({
         thetaStart={visibleShiftStart}
         thetaMax={visibleShiftEnd}
         thetaTicks={thetaTicks}
+        wedgeStep={boundUnit}
       />
     </section>
   );
@@ -1826,12 +1856,14 @@ function SummedCorrelationChart({
   thetaStart,
   thetaMax,
   thetaTicks,
+  wedgeStep,
 }: {
   values: number[];
   maxValue: number;
   thetaStart: number;
   thetaMax: number;
   thetaTicks: { value: number; label: string }[];
+  wedgeStep: number;
 }) {
   const width = 900;
   const height = 180;
@@ -1852,6 +1884,10 @@ function SummedCorrelationChart({
       return `${command}${svgNumber(xForIndex(index))},${svgNumber(yForValue(value))}`;
     })
     .join(" ");
+  const wedgeMarkers = Array.from(
+    { length: Math.floor(thetaMax / wedgeStep) + 1 },
+    (_, i) => i * wedgeStep
+  ).filter((theta) => theta >= thetaStart && theta <= thetaMax);
 
   return (
     <div className="mt-3 border-t pt-3">
@@ -1917,6 +1953,18 @@ function SummedCorrelationChart({
           </g>
         ))}
 
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`sum-wedge-${index}`}
+            x1={svgNumber(xForTheta(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForTheta(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.55 : 0.28)}
+            strokeDasharray="3 5"
+          />
+        ))}
+
         {path ? (
           <path
             d={path}
@@ -1945,10 +1993,12 @@ export function AngleWhiteCharts({
   lineSpace,
   seedWedgeOnly,
   setSeedWedgeOnly,
+  showSeedWedgeToggle = true,
 }: {
   lineSpace: LineSpace;
   seedWedgeOnly: boolean;
   setSeedWedgeOnly: (value: boolean) => void;
+  showSeedWedgeToggle?: boolean;
 }) {
   const showSeedWedge = lineSpace.hasSeedWedge && seedWedgeOnly;
   const seedThetaMax = lineSpace.thetaMax / lineSpace.n;
@@ -1972,7 +2022,7 @@ export function AngleWhiteCharts({
 
   return (
     <section className="space-y-3">
-      {lineSpace.hasSeedWedge ? (
+      {lineSpace.hasSeedWedge && showSeedWedgeToggle ? (
         <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
           <input
             type="checkbox"
@@ -1990,6 +2040,7 @@ export function AngleWhiteCharts({
           maxValue={Math.max(0, ...whiteValues)}
           thetaMax={thetaMax}
           thetaTicks={thetaTicks}
+          wedgeStep={lineSpace.hasSeedWedge ? seedThetaMax : null}
           yLabel="white cells"
         />
         <AngleLineChart
@@ -1998,6 +2049,7 @@ export function AngleWhiteCharts({
           maxValue={Math.max(0, ...holeValues)}
           thetaMax={thetaMax}
           thetaTicks={thetaTicks}
+          wedgeStep={lineSpace.hasSeedWedge ? seedThetaMax : null}
           yLabel="holes"
         />
       </div>
@@ -2011,6 +2063,7 @@ function AngleLineChart({
   maxValue,
   thetaMax,
   thetaTicks,
+  wedgeStep,
   yLabel,
 }: {
   title: string;
@@ -2018,6 +2071,7 @@ function AngleLineChart({
   maxValue: number;
   thetaMax: number;
   thetaTicks: { value: number; label: string }[];
+  wedgeStep: number | null;
   yLabel: string;
 }) {
   const width = 440;
@@ -2037,6 +2091,12 @@ function AngleLineChart({
       return `${command}${svgNumber(xForIndex(index))},${svgNumber(yForValue(value))}`;
     })
     .join(" ");
+  const wedgeMarkers = wedgeStep
+    ? Array.from(
+        { length: Math.floor(thetaMax / wedgeStep) + 1 },
+        (_, i) => i * wedgeStep
+      )
+    : [];
 
   return (
     <section className="rounded-lg border bg-card p-3">
@@ -2102,6 +2162,18 @@ function AngleLineChart({
           </g>
         ))}
 
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`wedge-${index}`}
+            x1={svgNumber(xForTheta(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForTheta(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.55 : 0.28)}
+            strokeDasharray="3 5"
+          />
+        ))}
+
         {path ? (
           <path
             d={path}
@@ -2112,6 +2184,18 @@ function AngleLineChart({
             strokeWidth={2}
           />
         ) : null}
+
+        {wedgeMarkers.map((theta, index) => (
+          <line
+            key={`wedge-overlay-${index}`}
+            x1={svgNumber(xForTheta(theta))}
+            y1={margin.top}
+            x2={svgNumber(xForTheta(theta))}
+            y2={margin.top + plotHeight}
+            stroke={svgRgba(124, 58, 237, index === 0 ? 0.75 : 0.5)}
+            strokeDasharray="3 5"
+          />
+        ))}
 
         <text
           x={svgNumber(margin.left + plotWidth / 2)}

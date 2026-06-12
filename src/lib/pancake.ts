@@ -2,7 +2,7 @@
  * Cayley-style graph visualizations.
  *
  * The pancake, star, permutohedron, cyclic-adjacent, transposition, and
- * kaleidoscope graphs have every permutation of {1,…,n} as a vertex. The
+ * reversal graphs have every permutation of {1,…,n} as a vertex. The
  * hypercube and Feistel graphs have every n-bit string as a vertex. They
  * differ by the generator set used for edges.
  *
@@ -48,6 +48,266 @@ export function key(p: Perm): string {
   return s;
 }
 
+type Vec4 = [number, number, number, number];
+
+function dot4(a: Vec4, b: Vec4): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}
+
+function norm4(a: Vec4): number {
+  return Math.sqrt(dot4(a, a));
+}
+
+function normalize4(a: Vec4): Vec4 {
+  const n = norm4(a) || 1;
+  return [a[0] / n, a[1] / n, a[2] / n, a[3] / n];
+}
+
+function subScaled4(v: Vec4, a: Vec4, scale: number): Vec4 {
+  return [
+    v[0] - scale * a[0],
+    v[1] - scale * a[1],
+    v[2] - scale * a[2],
+    v[3] - scale * a[3],
+  ];
+}
+
+function reflect4(v: Vec4, root: Vec4): Vec4 {
+  return subScaled4(v, root, 2 * dot4(v, root));
+}
+
+function vecKey(v: Vec4): string {
+  return v.map((x) => Math.round(x * 1e10) / 1e10).join(",");
+}
+
+function choleskyRows4(g: number[][]): Vec4[] {
+  const l = Array.from({ length: 4 }, () => new Array<number>(4).fill(0));
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j <= i; j++) {
+      let sum = g[i][j];
+      for (let k = 0; k < j; k++) sum -= l[i][k] * l[j][k];
+      l[i][j] = i === j ? Math.sqrt(Math.max(0, sum)) : sum / l[j][j];
+    }
+  }
+  return l.map((row) => [row[0], row[1], row[2], row[3]] as Vec4);
+}
+
+function h4SimpleRoots(): Vec4[] {
+  const phiOver2 = (1 + Math.sqrt(5)) / 4; // cos(pi/5)
+  const g = [
+    [1, -phiOver2, 0, 0],
+    [-phiOver2, 1, -0.5, 0],
+    [0, -0.5, 1, -0.5],
+    [0, 0, -0.5, 1],
+  ];
+  return choleskyRows4(g).map(normalize4);
+}
+
+function applyCoxeterElement(v: Vec4, roots: Vec4[]): Vec4 {
+  let out = v;
+  for (const root of roots) out = reflect4(out, root);
+  return out;
+}
+
+function h4RootSystem(simpleRoots: Vec4[]): Vec4[] {
+  const roots: Vec4[] = [...simpleRoots];
+  const seen = new Set(roots.map(vecKey));
+  for (let i = 0; i < roots.length; i++) {
+    for (const root of simpleRoots) {
+      const next = normalize4(reflect4(roots[i], root));
+      const k = vecKey(next);
+      if (!seen.has(k)) {
+        seen.add(k);
+        roots.push(next);
+      }
+    }
+  }
+  return roots;
+}
+
+function h4CoxeterPlane(simpleRoots: Vec4[]): [Vec4, Vec4] {
+  const h = 30;
+  const theta = (2 * Math.PI) / h;
+  let v: Vec4 = [1, 0.37, -0.23, 0.61];
+  let a: Vec4 = [0, 0, 0, 0];
+  let b: Vec4 = [0, 0, 0, 0];
+  for (let k = 0; k < h; k++) {
+    const c = Math.cos(k * theta);
+    const s = Math.sin(k * theta);
+    a = [a[0] + c * v[0], a[1] + c * v[1], a[2] + c * v[2], a[3] + c * v[3]];
+    b = [b[0] + s * v[0], b[1] + s * v[1], b[2] + s * v[2], b[3] + s * v[3]];
+    v = applyCoxeterElement(v, simpleRoots);
+  }
+  const e1 = normalize4(a);
+  const bOrth = subScaled4(b, e1, dot4(b, e1));
+  return [e1, normalize4(bOrth)];
+}
+
+type Vec = number[];
+type CoxeterFamilyPreset = "coxeter-a" | "coxeter-b" | "coxeter-d";
+
+function dot(a: Vec, b: Vec): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
+  return sum;
+}
+
+function norm(a: Vec): number {
+  return Math.sqrt(dot(a, a));
+}
+
+function normalize(a: Vec): Vec {
+  const n = norm(a) || 1;
+  return a.map((x) => x / n);
+}
+
+function subScaled(v: Vec, a: Vec, scale: number): Vec {
+  return v.map((x, i) => x - scale * a[i]);
+}
+
+function reflect(v: Vec, root: Vec): Vec {
+  return subScaled(v, root, (2 * dot(v, root)) / dot(root, root));
+}
+
+function applyCoxeterElementGeneric(v: Vec, roots: Vec[]): Vec {
+  let out = v;
+  for (const root of roots) out = reflect(out, root);
+  return out;
+}
+
+function coxeterPlane(simpleRoots: Vec[], coxeterNumber: number): [Vec, Vec] {
+  const dim = simpleRoots[0].length;
+  const theta = (2 * Math.PI) / coxeterNumber;
+  let v = Array.from({ length: dim }, (_, i) => (i === 0 ? 1 : (37 * (i + 1)) % 101 / 101));
+  const a = new Array<number>(dim).fill(0);
+  const b = new Array<number>(dim).fill(0);
+  for (let k = 0; k < coxeterNumber; k++) {
+    const c = Math.cos(k * theta);
+    const s = Math.sin(k * theta);
+    for (let i = 0; i < dim; i++) {
+      a[i] += c * v[i];
+      b[i] += s * v[i];
+    }
+    v = applyCoxeterElementGeneric(v, simpleRoots);
+  }
+  const e1 = normalize(a);
+  return [e1, normalize(subScaled(b, e1, dot(b, e1)))];
+}
+
+function basis(dim: number, i: number): Vec {
+  const v = new Array<number>(dim).fill(0);
+  v[i] = 1;
+  return v;
+}
+
+function rootDataForCoxeterFamily(
+  n: number,
+  preset: CoxeterFamilyPreset
+): { simpleRoots: Vec[]; coxeterNumber: number } {
+  if (preset === "coxeter-a") {
+    const dim = n + 1;
+    const simpleRoots = Array.from({ length: n }, (_, i) =>
+      basis(dim, i).map((x, k) => x - (k === i + 1 ? 1 : 0))
+    );
+    return { simpleRoots, coxeterNumber: n + 1 };
+  }
+
+  const dim = n;
+  const simpleRoots: Vec[] = [];
+  for (let i = 0; i < dim - 1; i++) {
+    const r = new Array<number>(dim).fill(0);
+    r[i] = 1;
+    r[i + 1] = -1;
+    simpleRoots.push(r);
+  }
+  if (preset === "coxeter-b") {
+    simpleRoots.push(basis(dim, dim - 1));
+    return { simpleRoots, coxeterNumber: 2 * n };
+  }
+
+  const last = new Array<number>(dim).fill(0);
+  last[dim - 2] = 1;
+  last[dim - 1] = 1;
+  simpleRoots.push(last);
+  return { simpleRoots, coxeterNumber: 2 * (n - 1) };
+}
+
+function forEachCoxeterRoot(
+  n: number,
+  preset: CoxeterFamilyPreset,
+  visit: (root: Vec) => void
+): void {
+  if (preset === "coxeter-a") {
+    const dim = n + 1;
+    for (let i = 0; i < dim; i++) {
+      for (let j = 0; j < dim; j++) {
+        if (i === j) continue;
+        const r = new Array<number>(dim).fill(0);
+        r[i] = 1;
+        r[j] = -1;
+        visit(r);
+      }
+    }
+    return;
+  }
+
+  if (preset === "coxeter-b") {
+    for (let i = 0; i < n; i++) {
+      const p = basis(n, i);
+      visit(p);
+      visit(p.map((x) => -x));
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      for (const si of [-1, 1]) {
+        for (const sj of [-1, 1]) {
+          const r = new Array<number>(n).fill(0);
+          r[i] = si;
+          r[j] = sj;
+          visit(r);
+        }
+      }
+    }
+  }
+}
+
+function forEachCoxeterRootProjection(
+  n: number,
+  preset: CoxeterFamilyPreset,
+  e1: Vec,
+  e2: Vec,
+  visit: (x: number, y: number) => void
+): void {
+  if (preset === "coxeter-a") {
+    const dim = n + 1;
+    for (let i = 0; i < dim; i++) {
+      for (let j = 0; j < dim; j++) {
+        if (i !== j) visit(e1[i] - e1[j], e2[i] - e2[j]);
+      }
+    }
+    return;
+  }
+
+  if (preset === "coxeter-b") {
+    for (let i = 0; i < n; i++) {
+      visit(e1[i], e2[i]);
+      visit(-e1[i], -e2[i]);
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      for (const si of [-1, 1]) {
+        for (const sj of [-1, 1]) {
+          visit(si * e1[i] + sj * e1[j], si * e2[i] + sj * e2[j]);
+        }
+      }
+    }
+  }
+}
+
 /**
  * Reverse the last k elements of p (the Zaks 1984 suffix reversal), returning
  * a new Uint8Array. A suffix reversal of length k < n leaves the leading n-k
@@ -89,8 +349,13 @@ export type GraphPreset =
   | "pancake-zaks"
   | "pancake-zaks-recursive"
   | "pancake-williams"
+  | "coxeter-a"
+  | "coxeter-b"
+  | "coxeter-d"
+  | "random-cyclic"
   | "random-dihedral"
   | "wedge-clipped-dihedral"
+  | "kaleidoscope"
   | "aes-powers"
   | "star"
   | "permutohedron"
@@ -98,19 +363,28 @@ export type GraphPreset =
   | "cyclic-adjacent"
   | "transposition"
   | "asymmetric-tree"
-  | "kaleidoscope"
+  | "reversal"
+  | "reversal-greedy"
+  | "reversal-graycode"
   | "lexicographic"
+  | "hyperoctahedral"
   | "hypercube"
   | "feistel"
   | "sliding-puzzle"
   | "simplex"
   | "complete"
   | "cayley-complete"
-  | "sierpinski";
+  | "sierpinski"
+  | "coxeter-h4-600-cell";
 export type GraphKind =
   | "pancake"
+  | "coxeter-a"
+  | "coxeter-b"
+  | "coxeter-d"
+  | "random-cyclic"
   | "random-dihedral"
   | "wedge-clipped-dihedral"
+  | "kaleidoscope"
   | "aes-powers"
   | "star"
   | "permutohedron"
@@ -118,18 +392,21 @@ export type GraphKind =
   | "cyclic-adjacent"
   | "transposition"
   | "asymmetric-tree"
-  | "kaleidoscope"
+  | "reversal"
   | "lexicographic"
+  | "hyperoctahedral"
   | "hypercube"
   | "feistel"
   | "sliding-puzzle"
   | "simplex"
   | "complete"
   | "cayley-complete"
-  | "sierpinski";
+  | "sierpinski"
+  | "coxeter-h4-600-cell";
 
 /** Number of symbols of the Sierpiński graph S(n, k); 3 = the triangle gasket. */
 const SIERPINSKI_K = 3;
+const COXETER_EDGE_MATERIALIZE_LIMIT = 5_000;
 
 const AES_MIN_N = 3;
 const AES_MAX_N = 20;
@@ -435,7 +712,7 @@ export function supportsQuotient(preset: GraphPreset): boolean {
     preset === "cyclic-adjacent" ||
     preset === "transposition" ||
     preset === "asymmetric-tree" ||
-    preset === "kaleidoscope" ||
+    isReversalPreset(preset) ||
     preset === "lexicographic" ||
     preset === "cayley-complete"
   );
@@ -662,11 +939,27 @@ export async function buildPancakeGraph(
   signal?: AbortSignal
 ): Promise<PancakeGraph> {
   const maxN = graphMaxN(preset);
-  const minN = preset === "aes-powers" ? AES_MIN_N : 2;
+  const minN =
+    preset === "aes-powers"
+      ? AES_MIN_N
+      : preset === "coxeter-h4-600-cell"
+        ? 4
+        : 2;
   if (n < minN || n > maxN) {
     throw new Error(`n must be between ${minN} and ${maxN} for ${graphPresetLabel(preset)}, got ${n}`);
   }
   throwIfAborted(signal);
+
+  if (preset === "coxeter-h4-600-cell") {
+    return buildH4CoxeterPlaneGraph(onProgress, signal);
+  }
+  if (
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d"
+  ) {
+    return buildCoxeterFamilyGraph(n, preset, onProgress, signal);
+  }
 
   const kind = graphKind(preset);
   const order = preset === "pancake-williams" ? "williams" : preset === "pancake-zaks" ? "zaks" : undefined;
@@ -676,6 +969,8 @@ export async function buildPancakeGraph(
       ? await hypercubeGrayOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : preset === "feistel"
       ? await feistelOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
+      : preset === "hyperoctahedral"
+      ? await hyperoctahedralOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : preset === "aes-powers"
       ? await aesPowerCycleOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
       : preset === "sliding-puzzle"
@@ -714,6 +1009,18 @@ export async function buildPancakeGraph(
           (done, total) => onProgress?.("cycle", done, total),
           signal
         )
+      : preset === "reversal-greedy"
+      ? await reversalGreedyCycle(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
+      : preset === "reversal-graycode"
+      ? await johnsonTrotterOrder(
+          n,
+          (done, total) => onProgress?.("cycle", done, total),
+          signal
+        )
       : order === undefined
         ? preset === "permutohedron" || preset === "cyclic-adjacent" || preset === "transposition"
         ? await johnsonTrotterOrder(n, (done, total) => onProgress?.("cycle", done, total), signal)
@@ -732,9 +1039,15 @@ export async function buildPancakeGraph(
   throwIfAborted(signal);
 
   onProgress?.("parity", 0, total);
+  const parityMode: VertexParityMode =
+    preset === "hypercube" || preset === "feistel" || preset === "aes-powers"
+      ? "bitstring"
+      : preset === "hyperoctahedral"
+      ? "signed"
+      : "permutation";
   const vertexParity = await computeVertexParity(
     path,
-    preset === "hypercube" || preset === "feistel" || preset === "aes-powers",
+    parityMode,
     (done, totalSteps) => onProgress?.("parity", done, totalSteps),
     signal
   );
@@ -915,6 +1228,184 @@ export async function buildPancakeGraph(
     evenEdgeCount,
     oddEdgeCount,
     generators: generatorInfos,
+    coords,
+  };
+}
+
+function buildH4CoxeterPlaneGraph(
+  onProgress?: (phase: string, done: number, total: number) => void,
+  signal?: AbortSignal
+): PancakeGraph {
+  const n = 4;
+  const preset: GraphPreset = "coxeter-h4-600-cell";
+  const kind = graphKind(preset);
+  const simpleRoots = h4SimpleRoots();
+  const roots = h4RootSystem(simpleRoots);
+  const total = roots.length;
+  onProgress?.("cycle", total, total);
+  throwIfAborted(signal);
+
+  const path = Array.from({ length: total }, (_, i) => new Uint8Array([i + 1]) as Perm);
+  const flips: number[] = [];
+  const vertexParity = new Uint8Array(total);
+  const [e1, e2] = h4CoxeterPlane(simpleRoots);
+  const coords = new Float64Array(total * 2);
+  let maxRadius = 0;
+  for (let i = 0; i < total; i++) {
+    const x = dot4(roots[i], e1);
+    const y = dot4(roots[i], e2);
+    coords[2 * i] = x;
+    coords[2 * i + 1] = y;
+    maxRadius = Math.max(maxRadius, Math.hypot(x, y));
+  }
+  const scale = maxRadius > 0 ? 0.98 / maxRadius : 1;
+  for (let i = 0; i < coords.length; i++) coords[i] *= scale;
+
+  onProgress?.("edges", 0, total);
+  let minDist = Infinity;
+  const dist2 = (a: Vec4, b: Vec4): number => {
+    let sum = 0;
+    for (let k = 0; k < 4; k++) {
+      const d = a[k] - b[k];
+      sum += d * d;
+    }
+    return sum;
+  };
+  for (let i = 0; i < total; i++) {
+    for (let j = i + 1; j < total; j++) {
+      const d = dist2(roots[i], roots[j]);
+      if (d > 1e-8 && d < minDist) minDist = d;
+    }
+  }
+  const edgeTriples: number[] = [];
+  const eps = Math.max(1e-7, minDist * 1e-5);
+  for (let i = 0; i < total; i++) {
+    for (let j = i + 1; j < total; j++) {
+      if (Math.abs(dist2(roots[i], roots[j]) - minDist) <= eps) {
+        edgeTriples.push(i, j, 1);
+      }
+    }
+  }
+  onProgress?.("edges", total, total);
+  const edgeCount = edgeTriples.length / 3;
+
+  return {
+    n,
+    preset,
+    kind,
+    path,
+    flips,
+    edges: Uint32Array.from(edgeTriples),
+    rn: new Uint32Array(0),
+    vertexParity,
+    evenEdgeCount: edgeCount,
+    oddEdgeCount: 0,
+    generators: [
+      {
+        id: 1,
+        parity: 0,
+        label: "edge",
+      },
+    ],
+    coords,
+  };
+}
+
+function buildCoxeterFamilyGraph(
+  n: number,
+  preset: CoxeterFamilyPreset,
+  onProgress?: (phase: string, done: number, total: number) => void,
+  signal?: AbortSignal
+): PancakeGraph {
+  const kind = graphKind(preset);
+  const { simpleRoots, coxeterNumber } = rootDataForCoxeterFamily(n, preset);
+  const total = graphVertexCount(n, preset);
+  onProgress?.("cycle", total, total);
+  throwIfAborted(signal);
+
+  const emptyPerm = new Uint8Array(0) as Perm;
+  const path = new Array(total).fill(emptyPerm) as Perm[];
+  const flips: number[] = [];
+  const vertexParity = new Uint8Array(total);
+  const [e1, e2] = coxeterPlane(simpleRoots, coxeterNumber);
+  const coords = new Float64Array(total * 2);
+  const smallRoots: Vec[] | null =
+    total <= COXETER_EDGE_MATERIALIZE_LIMIT ? [] : null;
+  let maxRadius = 0;
+  const writePoint = (x: number, y: number, root?: Vec) => {
+    coords[2 * write] = x;
+    coords[2 * write + 1] = y;
+    maxRadius = Math.max(maxRadius, Math.hypot(x, y));
+    if (root) smallRoots?.push(root);
+    write++;
+  };
+  let write = 0;
+  if (smallRoots) {
+    forEachCoxeterRoot(n, preset, (root) => writePoint(dot(root, e1), dot(root, e2), root));
+  } else {
+    forEachCoxeterRootProjection(n, preset, e1, e2, writePoint);
+  }
+  const scale = maxRadius > 0 ? 0.98 / maxRadius : 1;
+  for (let i = 0; i < coords.length; i++) coords[i] *= scale;
+
+  if (!smallRoots) {
+    onProgress?.("edges", total, total);
+    return {
+      n,
+      preset,
+      kind,
+      path,
+      flips,
+      edges: new Uint32Array(0),
+      rn: new Uint32Array(0),
+      vertexParity,
+      evenEdgeCount: 0,
+      oddEdgeCount: 0,
+      generators: [{ id: 1, parity: 0, label: "edge" }],
+      coords,
+    };
+  }
+
+  onProgress?.("edges", 0, total);
+  let minDist = Infinity;
+  const dist2 = (a: Vec, b: Vec): number => {
+    let sum = 0;
+    for (let k = 0; k < a.length; k++) {
+      const d = a[k] - b[k];
+      sum += d * d;
+    }
+    return sum;
+  };
+  for (let i = 0; i < total; i++) {
+    for (let j = i + 1; j < total; j++) {
+      const d = dist2(smallRoots[i], smallRoots[j]);
+      if (d > 1e-8 && d < minDist) minDist = d;
+    }
+  }
+  const edgeTriples: number[] = [];
+  const eps = Math.max(1e-7, minDist * 1e-5);
+  for (let i = 0; i < total; i++) {
+    for (let j = i + 1; j < total; j++) {
+      if (Math.abs(dist2(smallRoots[i], smallRoots[j]) - minDist) <= eps) {
+        edgeTriples.push(i, j, 1);
+      }
+    }
+  }
+  onProgress?.("edges", total, total);
+  const edgeCount = edgeTriples.length / 3;
+
+  return {
+    n,
+    preset,
+    kind,
+    path,
+    flips,
+    edges: Uint32Array.from(edgeTriples),
+    rn: new Uint32Array(0),
+    vertexParity,
+    evenEdgeCount: edgeCount,
+    oddEdgeCount: 0,
+    generators: [{ id: 1, parity: 0, label: "edge" }],
     coords,
   };
 }
@@ -1302,8 +1793,11 @@ export function buildZaksSamplingGraph(n: number): PancakeGraph {
   };
 }
 
-/** Lightweight payload for the analytic random Dₙ matching renderers. */
-function buildDihedralSamplingGraph(n: number, preset: GraphPreset): PancakeGraph {
+/** Lightweight payload for the analytic random symmetry matching renderers. */
+function buildSymmetricRandomSamplingGraph(
+  n: number,
+  preset: "random-cyclic" | "random-dihedral" | "wedge-clipped-dihedral"
+): PancakeGraph {
   const generatorInfos = computeGeneratorInfos(n, preset, graphGenerators(n, preset));
   const totalEdges = factorial(n) / 2;
   if (generatorInfos[0]) {
@@ -1324,7 +1818,7 @@ function buildDihedralSamplingGraph(n: number, preset: GraphPreset): PancakeGrap
   return {
     n,
     preset,
-    kind: preset === "wedge-clipped-dihedral" ? "wedge-clipped-dihedral" : "random-dihedral",
+    kind: preset,
     order: undefined,
     path: [],
     flips: [],
@@ -1337,12 +1831,234 @@ function buildDihedralSamplingGraph(n: number, preset: GraphPreset): PancakeGrap
   };
 }
 
+export function buildRandomCyclicSamplingGraph(n: number): PancakeGraph {
+  return buildSymmetricRandomSamplingGraph(n, "random-cyclic");
+}
+
 export function buildRandomDihedralSamplingGraph(n: number): PancakeGraph {
-  return buildDihedralSamplingGraph(n, "random-dihedral");
+  return buildSymmetricRandomSamplingGraph(n, "random-dihedral");
 }
 
 export function buildWedgeClippedDihedralSamplingGraph(n: number): PancakeGraph {
-  return buildDihedralSamplingGraph(n, "wedge-clipped-dihedral");
+  return buildSymmetricRandomSamplingGraph(n, "wedge-clipped-dihedral");
+}
+
+export const KALEIDOSCOPE_STROKES_MIN = 4;
+export const KALEIDOSCOPE_STROKES_MAX = 80;
+export const KALEIDOSCOPE_STROKES_DEFAULT = 20;
+const KALEIDOSCOPE_BEAD_LEN = 0.07;
+const KALEIDOSCOPE_RIBBON_OFFSET = 0.006;
+
+function kaleidoscopeRng(seed: number): () => number {
+  let s = seed >>> 0 || 1;
+  return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+}
+
+/** Clip a unit-disk segment to the fundamental wedge [0, π/n]. */
+function clipSegmentToWedge(
+  n: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number
+): [number, number, number, number] | null {
+  const wedge = Math.PI / n;
+  const sin = Math.sin(wedge);
+  const cos = Math.cos(wedge);
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (h0: number, dh: number): boolean => {
+    if (Math.abs(dh) < 1e-15) return h0 >= 0;
+    const t = -h0 / dh;
+    if (dh > 0) {
+      if (t > t0) t0 = t;
+    } else if (t < t1) {
+      t1 = t;
+    }
+    return t0 < t1;
+  };
+  if (!clip(y1, dy)) return null;
+  if (!clip(sin * x1 - cos * y1, sin * dx - cos * dy)) return null;
+  return [x1 + dx * t0, y1 + dy * t0, x1 + dx * t1, y1 + dy * t1];
+}
+
+/** A raw kaleidoscope segment in the wedge frame, with a relative intensity. */
+export interface KaleidoscopeShard {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  /** 0..1 intensity, used as colour/weight by the density field. */
+  w: number;
+}
+
+/**
+ * Geometry of the kaleidoscope, defined once and shared by the vector graph
+ * (SVG / Canvas) and the density field (Yankelovich). Returns raw segments in
+ * the fundamental wedge frame [0, π/n]; each caller clips them to the wedge and
+ * tiles the 2n dihedral copies.
+ *
+ * The composition has three layers so the mirrors weave a designed rosette
+ * instead of random dust: a central bloom of radial petals anchored at the apex
+ * (so the centre has a heart, not a hole), curved ribbons — chains of connected
+ * beads — spread across the radius with a light centre bias that fold into
+ * petals under reflection, and a few outer crystals for rim sparkle. Per-shard
+ * intensities give the density field varied hues under a colour map.
+ *
+ * `strokes` is the number of base ribbons in the wedge (the bloom and crystals
+ * scale with it); the seed is the "twist" of the tube.
+ */
+export function kaleidoscopeShards(
+  n: number,
+  seed = 1,
+  strokes = KALEIDOSCOPE_STROKES_DEFAULT
+): KaleidoscopeShard[] {
+  const rng = kaleidoscopeRng(seed);
+  const wedge = Math.PI / n;
+  const ribbons = Math.max(1, Math.round(strokes));
+  const petals = Math.min(8, Math.max(2, Math.round(ribbons * 0.25)));
+  const crystals = Math.min(24, Math.max(0, Math.round(ribbons * 0.35)));
+  const out: KaleidoscopeShard[] = [];
+  const push = (x1: number, y1: number, x2: number, y2: number, w: number) =>
+    out.push({ x1, y1, x2, y2, w });
+
+  // 1. Central bloom: short radial petals anchored near the apex.
+  for (let i = 0; i < petals; i++) {
+    const a = (wedge * (i + 0.5 + 0.3 * (rng() - 0.5))) / petals;
+    const r0 = 0.03 + 0.04 * rng();
+    const r1 = r0 + 0.12 + 0.1 * rng();
+    const w = 0.55 + 0.45 * rng();
+    push(r0 * Math.cos(a), r0 * Math.sin(a), r1 * Math.cos(a), r1 * Math.sin(a), w);
+  }
+
+  // 2. Curved ribbons: chains of beads spread across the radius (centre-biased).
+  for (let g = 0; g < ribbons; g++) {
+    const baseR = 0.05 + 0.85 * Math.pow(rng(), 1.15);
+    const baseA = rng() * wedge;
+    const beads = 3 + Math.floor(rng() * 4);
+    const len = KALEIDOSCOPE_BEAD_LEN * (0.6 + 0.8 * rng());
+    const w = 0.3 + 0.7 * rng();
+    let px = baseR * Math.cos(baseA);
+    let py = baseR * Math.sin(baseA);
+    let dir = rng() * 2 * Math.PI;
+    const curl = (rng() - 0.5) * 1.4;
+    for (let b = 0; b < beads; b++) {
+      const nx = px + Math.cos(dir) * len;
+      const ny = py + Math.sin(dir) * len;
+      push(px, py, nx, ny, w);
+      px = nx;
+      py = ny;
+      dir += curl;
+    }
+  }
+
+  // 3. Outer crystals: short bright slivers near the rim.
+  for (let c = 0; c < crystals; c++) {
+    const r = 0.6 + 0.32 * rng();
+    const a = rng() * wedge;
+    const cx = r * Math.cos(a);
+    const cy = r * Math.sin(a);
+    const half = 0.03 + 0.05 * rng();
+    const dir = rng() * Math.PI;
+    const hx = Math.cos(dir) * half;
+    const hy = Math.sin(dir) * half;
+    push(cx - hx, cy - hy, cx + hx, cy + hy, 0.5 + 0.5 * rng());
+  }
+
+  return out;
+}
+
+/**
+ * Kaleidoscope: the {@link kaleidoscopeShards} composition clipped to one Dₙ
+ * fundamental chamber (π/n) so reflections meet continuously at the mirrors,
+ * then materialized as the 2n dihedral copies of every shard. Unlike the
+ * random-matching controls this is a concrete vector graph (coords + edge
+ * segments), so it renders in SVG / Canvas as well as the density field. The
+ * seed is the "twist" of the tube.
+ */
+export function buildKaleidoscopeSamplingGraph(
+  n: number,
+  seed = 1,
+  strokes = KALEIDOSCOPE_STROKES_DEFAULT
+): PancakeGraph {
+  const coordsArr: number[] = [];
+  const edgesArr: number[] = [];
+  let v = 0;
+  // A couple of parallel offset copies give every shard a little body, so the
+  // mirrored petals read as panes of glass rather than hairlines.
+  const ribbon = [-KALEIDOSCOPE_RIBBON_OFFSET, 0, KALEIDOSCOPE_RIBBON_OFFSET];
+  const emit = (seg: [number, number, number, number]) => {
+    for (let k = 0; k < n; k++) {
+      const ang = (2 * Math.PI * k) / n;
+      const rc = Math.cos(ang);
+      const rs = Math.sin(ang);
+      for (let m = 0; m < 2; m++) {
+        const tp = (x: number, y: number): [number, number] => {
+          const Y = m === 1 ? -y : y;
+          return [x * rc - Y * rs, x * rs + Y * rc];
+        };
+        const [px, py] = tp(seg[0], seg[1]);
+        const [qx, qy] = tp(seg[2], seg[3]);
+        coordsArr.push(px, py, qx, qy);
+        edgesArr.push(v, v + 1, 1);
+        v += 2;
+      }
+    }
+  };
+  for (const shard of kaleidoscopeShards(n, seed, strokes)) {
+    const dx = shard.x2 - shard.x1;
+    const dy = shard.y2 - shard.y1;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    for (const off of ribbon) {
+      const seg = clipSegmentToWedge(
+        n,
+        shard.x1 + nx * off,
+        shard.y1 + ny * off,
+        shard.x2 + nx * off,
+        shard.y2 + ny * off
+      );
+      if (seg) emit(seg);
+    }
+  }
+
+  const emptyPerm = new Uint8Array(0);
+  return {
+    n,
+    preset: "kaleidoscope",
+    kind: "kaleidoscope",
+    order: undefined,
+    path: new Array(v).fill(emptyPerm) as Perm[],
+    flips: [],
+    edges: Uint32Array.from(edgesArr),
+    rn: new Uint32Array(0),
+    vertexParity: new Uint8Array(v),
+    evenEdgeCount: 0,
+    oddEdgeCount: edgesArr.length / 3,
+    generators: [{ id: 1, parity: 1, label: "shard" }],
+    coords: Float64Array.from(coordsArr),
+  };
+}
+
+export function buildSimplexSamplingGraph(n: number): PancakeGraph {
+  const edgeCount = factorial(n) * (factorial(n) - 1) / 2;
+  return {
+    n,
+    preset: "simplex",
+    kind: "simplex",
+    order: undefined,
+    path: [],
+    flips: [],
+    edges: new Uint32Array(0),
+    rn: new Uint32Array(0),
+    vertexParity: new Uint8Array(0),
+    evenEdgeCount: edgeCount,
+    oddEdgeCount: 0,
+    generators: [{ id: 1, parity: 0, label: "edges", avgArcDegrees: 90 }],
+  };
 }
 
 function computeGeneratorInfos(
@@ -1350,7 +2066,12 @@ function computeGeneratorInfos(
   preset: GraphPreset,
   generators: Generator[]
 ): GeneratorInfo[] {
-  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") {
+  if (
+    preset === "random-cyclic" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral" ||
+    preset === "kaleidoscope"
+  ) {
     return [{ id: 1, parity: 1, label: "random matching" }];
   }
 
@@ -1390,6 +2111,20 @@ function computeGeneratorInfos(
         label: generatorLabel(gen.id, preset, n),
       }))
       .sort((a, b) => a.id - b.id);
+  }
+
+  if (preset === "hyperoctahedral") {
+    // Every Coxeter generator is a reflection (odd), so the graph is bipartite.
+    // Read the Coxeter sign of each generator applied to the identity.
+    const identity = new Uint8Array(n) as Perm;
+    for (let i = 0; i < n; i++) identity[i] = i + 1;
+    const infos = generators.map((gen) => ({
+      id: gen.id,
+      parity: signedParity(gen.apply(identity)),
+      label: generatorLabel(gen.id, preset, n),
+    }));
+    infos.sort((a, b) => a.id - b.id);
+    return infos;
   }
 
   const isBitString = preset === "hypercube" || preset === "feistel";
@@ -1438,7 +2173,10 @@ function generatorLabel(
     return String(id);
   }
   if (preset === "hypercube") {
-    return String(id);
+    return `b${id}`;
+  }
+  if (preset === "hyperoctahedral") {
+    return id <= n - 1 ? `s${id}` : `±${id - n + 1}`;
   }
   if (preset === "feistel") {
     const round = Math.floor((id + 1) / 2);
@@ -1464,7 +2202,7 @@ function generatorLabel(
     const j = id % 100;
     return `${i},${j}`;
   }
-  if (preset === "kaleidoscope") {
+  if (isReversalPreset(preset)) {
     const i = Math.floor(id / 100);
     const j = id % 100;
     return `${i}–${j}`;
@@ -1476,9 +2214,11 @@ function generatorLabel(
   return String(id);
 }
 
+type VertexParityMode = "permutation" | "bitstring" | "signed";
+
 async function computeVertexParity(
   path: Perm[],
-  isHypercube: boolean,
+  mode: VertexParityMode,
   onProgress?: (done: number, total: number) => void,
   signal?: AbortSignal,
   chunk = 100_000
@@ -1487,12 +2227,24 @@ async function computeVertexParity(
   const total = path.length;
   const parity = new Uint8Array(total);
 
-  if (isHypercube) {
+  if (mode === "bitstring") {
     for (let i = 0; i < total; i++) {
       const v = path[i];
       let s = 0;
       for (let b = 0; b < v.length; b++) s ^= v[b];
       parity[i] = s & 1;
+      if ((i + 1) % chunk === 0) {
+        onProgress?.(i + 1, total);
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+      }
+    }
+  } else if (mode === "signed") {
+    // Signed permutation: byte v ≤ n means +v, v > n means -(v-n). The Coxeter
+    // sign of Bₙ (every simple reflection ↦ −1) is the inversion parity of the
+    // magnitudes XOR the parity of the negative-sign count.
+    for (let i = 0; i < total; i++) {
+      parity[i] = signedParity(path[i]);
       if ((i + 1) % chunk === 0) {
         onProgress?.(i + 1, total);
         await yieldToEventLoop();
@@ -1531,10 +2283,20 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Pancake graph — Zaks (recursive)";
     case "pancake-williams":
       return "Pancake graph — Williams";
+    case "random-cyclic":
+      return "Random graph — Cₙ symmetry";
     case "random-dihedral":
       return "Random graph — Dₙ symmetry";
     case "wedge-clipped-dihedral":
       return "Wedge-clipped Dₙ density";
+    case "coxeter-a":
+      return "Coxeter plane — Aₙ";
+    case "coxeter-b":
+      return "Coxeter plane — Bₙ";
+    case "coxeter-d":
+      return "Coxeter plane — Dₙ";
+    case "kaleidoscope":
+      return "Kaleidoscope";
     case "aes-powers":
       return "AES powers of two";
     case "star":
@@ -1549,12 +2311,18 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Transposition graph";
     case "asymmetric-tree":
       return "Asymmetric tree Cayley graph";
-    case "kaleidoscope":
-      return "Kaleidoscope graph";
+    case "reversal":
+      return "Reversal graph (Rₙ)";
+    case "reversal-greedy":
+      return "Reversal graph — greedy (Warnsdorff)";
+    case "reversal-graycode":
+      return "Reversal graph — plain changes";
     case "lexicographic":
       return "Lexicographic graph";
+    case "hyperoctahedral":
+      return "Hyperoctahedral group (Bₙ)";
     case "hypercube":
-      return "Hypercube";
+      return "Hypercube — binary reflected Gray code";
     case "feistel":
       return "Feistel cipher";
     case "sliding-puzzle":
@@ -1567,6 +2335,8 @@ export function graphPresetLabel(preset: GraphPreset): string {
       return "Complete Cayley graph of Sₙ";
     case "sierpinski":
       return "Sierpiński graph S(n, 3)";
+    case "coxeter-h4-600-cell":
+      return "600-cell — Coxeter plane";
   }
 }
 
@@ -1578,10 +2348,20 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Suffix reversals, Zaks' explicit recursion pathₙ = (pathₙ₋₁ rₙ)ⁿ⁻¹ pathₙ₋₁";
     case "pancake-williams":
       return "Suffix reversals, maximum new flip";
+    case "random-cyclic":
+      return "Random matching with Cₙ symmetry on n! vertices";
     case "random-dihedral":
       return "Random matching with Dₙ symmetry on n! vertices";
     case "wedge-clipped-dihedral":
       return "Random matching clipped to a Dₙ fundamental wedge";
+    case "coxeter-a":
+      return "Aₙ root polytope projected to the Coxeter plane";
+    case "coxeter-b":
+      return "Bₙ root polytope projected to the Coxeter plane";
+    case "coxeter-d":
+      return "Dₙ root polytope projected to the Coxeter plane";
+    case "kaleidoscope":
+      return "Glass strokes in one wedge, mirrored by the Dₙ kaleidoscope";
     case "aes-powers":
       return "Repeated AES xtime multiplication in GF(2ⁿ)";
     case "star":
@@ -1596,12 +2376,18 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "All transpositions (i, j)";
     case "asymmetric-tree":
       return "Transpositions of a rigid (identity) tree — Aut = Sₙ (Feng's minimum)";
-    case "kaleidoscope":
+    case "reversal":
       return "Reverse any contiguous block";
+    case "reversal-greedy":
+      return "Reverse any block, Hamiltonian path by Warnsdorff greedy (naive Zaks/Williams greedy dead-ends here)";
+    case "reversal-graycode":
+      return "Reverse any block, Hamiltonian cycle via plain changes (length-2 reversals, Steinhaus–Johnson–Trotter)";
     case "lexicographic":
       return "Lexicographic-successor generators Aₙ = {pᵢ⁻¹·pᵢ₊₁}";
+    case "hyperoctahedral":
+      return "Signed permutations of the n-cube symmetry group Bₙ: adjacent swaps and per-coordinate sign flips, ordered by SJT × binary-Gray product";
     case "hypercube":
-      return "Flip one bit";
+      return "Generators b1…bn flip bits from LSB to MSB, ordered by binary reflected Gray code";
     case "feistel":
       return "Toy Feistel round mixers on n-bit blocks";
     case "sliding-puzzle":
@@ -1614,21 +2400,43 @@ export function graphPresetDescription(preset: GraphPreset): string {
       return "Cayley graph of Sₙ with every non-identity permutation as a generator — the complete graph K_{n!}";
     case "sierpinski":
       return "The triangle gasket on words over {0,1,2}, laid out on a Hamiltonian cycle";
+    case "coxeter-h4-600-cell":
+      return "The H₄ root system ({3,3,5}) projected to the Coxeter plane";
   }
 }
 
 export function graphVertexCount(n: number, preset: GraphPreset): number {
+  if (preset === "coxeter-a") return n * (n + 1);
+  if (preset === "coxeter-b") return 2 * n * n;
+  if (preset === "coxeter-d") return 2 * n * (n - 1);
+  if (preset === "coxeter-h4-600-cell") return 120;
   if (preset === "aes-powers") return aesPowerCycleLength(n);
   if (preset === "sliding-puzzle") return factorial(SLIDING_PUZZLE_ROWS * n);
   if (preset === "simplex") return n + 1;
   if (preset === "complete") return n;
   if (preset === "sierpinski") return SIERPINSKI_K ** n;
+  if (preset === "hyperoctahedral") return 2 ** n * factorial(n);
   return preset === "hypercube" || preset === "feistel" ? 2 ** n : factorial(n);
 }
 
 export function graphEdgeCount(n: number, preset: GraphPreset): number {
+  if (
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d"
+  ) {
+    // Exact values are computed when the root graph is materialized; this
+    // formula is only used for UI estimates and slider recommendations.
+    return 2 * graphVertexCount(n, preset);
+  }
+  if (preset === "coxeter-h4-600-cell") return 720;
   if (preset === "aes-powers") return aesPowerCycleLength(n);
-  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") {
+  if (
+    preset === "random-cyclic" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral" ||
+    preset === "kaleidoscope"
+  ) {
     return factorial(n) / 2;
   }
   if (preset === "simplex") return (n * (n + 1)) / 2;
@@ -1637,6 +2445,7 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
     const v = factorial(n);
     return (v * (v - 1)) / 2;
   }
+  if (preset === "hyperoctahedral") return ((2 * n - 1) * 2 ** n * factorial(n)) / 2;
   if (preset === "hypercube") return n * 2 ** (n - 1);
   if (preset === "feistel") return 2 * feistelRoundCount(n) * 2 ** (n - 1);
   // S(n, k) has k(kⁿ − 1)/2 edges (each of levels 1..n contributes kʰ(k−1)/2).
@@ -1651,7 +2460,7 @@ export function graphEdgeCount(n: number, preset: GraphPreset): number {
     return (3 * n - 2) * factorial(N - 1);
   }
   if (
-    preset === "kaleidoscope" ||
+    isReversalPreset(preset) ||
     preset === "transposition" ||
     preset === "lexicographic"
   ) {
@@ -1675,18 +2484,31 @@ export function graphEdgesPerVertex(n: number, preset: GraphPreset): number | nu
 }
 
 export function graphMaxN(preset: GraphPreset): number {
+  if (
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d"
+  )
+    return 317;
+  if (preset === "coxeter-h4-600-cell") return 4;
   if (preset === "aes-powers") return AES_MAX_N;
   // The puzzle has (2n)! states, so it hits the 10! ceiling already at n = 5
   // (a 2 × 5 grid). The true 15-puzzle (4 × 4, 16!/2 ≈ 10¹³ states) is far
   // beyond what can be enumerated here.
   if (preset === "sliding-puzzle") return 5;
-  // K_{n+1} has only n+1 vertices and n(n+1)/2 edges, so the simplex stays
-  // cheap far past the permutation graphs' limits. Kₙ is just as cheap.
-  if (preset === "simplex") return 40;
+  // K_{n+1} has only n+1 vertices and n(n+1)/2 edges, but we keep this range
+  // aligned with the analysis simplex controls.
+  if (preset === "simplex") return 22;
   if (preset === "complete") return 40;
   // Materialized views are intentionally not used for this preset; Yankelovich
   // samples it analytically up to n = 40.
-  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") return 8;
+  if (
+    preset === "random-cyclic" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral" ||
+    preset === "kaleidoscope"
+  )
+    return 8;
   // K_{n!} explodes fast: the generator set is S_n \ {id}, so edge-building
   // is O((n!)²). n = 6 already gives 720 vertices, 719 generators, and
   // ~259k edges; n = 7 would be 5040 vertices and ~12.7M edges, so cap here.
@@ -1696,6 +2518,11 @@ export function graphMaxN(preset: GraphPreset): number {
   if (preset === "asymmetric-tree") return 8;
   // S(n, 3) has 3ⁿ vertices: 3¹⁰ ≈ 59k stays comfortable, 3¹¹ ≈ 177k is heavy.
   if (preset === "sierpinski") return 10;
+  // |Bₙ| = 2ⁿ·n!: n = 7 is 645,120 vertices / ~2.26M edges (comfortable),
+  // n = 8 would be 10.3M vertices, beyond the materialized-graph ceiling.
+  if (preset === "hyperoctahedral") return 7;
+  // Q₁₅ has 32,768 vertices and 245,760 edges, still comfortable to materialize.
+  if (preset === "hypercube") return 15;
   if (preset === "feistel") return 16;
   if (
     preset === "pancake-zaks" ||
@@ -1703,14 +2530,30 @@ export function graphMaxN(preset: GraphPreset): number {
     preset === "pancake-williams"
   )
     return 11;
-  return preset === "kaleidoscope" ||
+  // The Warnsdorff greedy walk over all reversals is O(n!·(n²)²) per step, so
+  // it stays snappy through n = 8 (~40k vertices) but is too slow at n = 9.
+  if (preset === "reversal-greedy") return 8;
+  return isReversalPreset(preset) ||
     preset === "transposition" ||
     preset === "lexicographic"
     ? 9
     : 10;
 }
 
+/**
+ * The reversal-graph family: the same Cayley graph (Sₙ generated by every
+ * contiguous block reversal) under different display orderings.
+ */
+function isReversalPreset(preset: GraphPreset): boolean {
+  return (
+    preset === "reversal" ||
+    preset === "reversal-greedy" ||
+    preset === "reversal-graycode"
+  );
+}
+
 function graphKind(preset: GraphPreset): GraphKind {
+  if (isReversalPreset(preset)) return "reversal";
   if (
     preset === "star" ||
     preset === "aes-powers" ||
@@ -1719,17 +2562,23 @@ function graphKind(preset: GraphPreset): GraphKind {
     preset === "cyclic-adjacent" ||
     preset === "transposition" ||
     preset === "asymmetric-tree" ||
-    preset === "kaleidoscope" ||
     preset === "lexicographic" ||
+    preset === "coxeter-a" ||
+    preset === "coxeter-b" ||
+    preset === "coxeter-d" ||
+    preset === "hyperoctahedral" ||
     preset === "hypercube" ||
     preset === "feistel" ||
     preset === "sliding-puzzle" ||
     preset === "simplex" ||
     preset === "complete" ||
     preset === "cayley-complete" ||
+    preset === "random-cyclic" ||
     preset === "random-dihedral" ||
     preset === "wedge-clipped-dihedral" ||
-    preset === "sierpinski"
+    preset === "kaleidoscope" ||
+    preset === "sierpinski" ||
+    preset === "coxeter-h4-600-cell"
   ) {
     return preset;
   }
@@ -1752,7 +2601,12 @@ function materializedPancakeGeneratorIds(
 }
 
 function graphGenerators(n: number, preset: GraphPreset): Generator[] {
-  if (preset === "random-dihedral" || preset === "wedge-clipped-dihedral") {
+  if (
+    preset === "random-cyclic" ||
+    preset === "random-dihedral" ||
+    preset === "wedge-clipped-dihedral" ||
+    preset === "kaleidoscope"
+  ) {
     return [{ id: 1, apply: (p) => p }];
   }
   if (preset.startsWith("pancake")) {
@@ -1770,10 +2624,32 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
     const generators: Generator[] = [];
     for (let i = 0; i < n; i++) {
       generators.push({
-        id: i + 1,
+        id: n - i,
         apply: (p) => {
           const q = new Uint8Array(p);
           q[i] = q[i] === 0 ? 1 : 0;
+          return q;
+        },
+      });
+    }
+    return generators;
+  }
+  if (preset === "hyperoctahedral") {
+    // "Signed permutation" generators of Bₙ: n-1 adjacent transpositions sᵢ
+    // (ids 1..n-1) swap positions (i, i+1), and n sign flips tₚ (ids n..2n-1)
+    // negate the value at one coordinate. All are involutions with no fixed
+    // points; together they generate Bₙ. This larger set (degree 2n-1) is what
+    // makes the SJT × binary-Gray product a Hamiltonian cycle of single steps.
+    const generators: Generator[] = [];
+    for (let i = 0; i < n - 1; i++) {
+      generators.push({ id: i + 1, apply: (p) => swap(p, i, i + 1) });
+    }
+    for (let pos = 0; pos < n; pos++) {
+      generators.push({
+        id: n + pos,
+        apply: (p) => {
+          const q = new Uint8Array(p) as Perm;
+          q[pos] = q[pos] > n ? q[pos] - n : q[pos] + n;
           return q;
         },
       });
@@ -1841,7 +2717,7 @@ function graphGenerators(n: number, preset: GraphPreset): Generator[] {
       apply: (p) => swap(p, a - 1, b - 1),
     }));
   }
-  if (preset === "kaleidoscope") {
+  if (isReversalPreset(preset)) {
     const generators: Generator[] = [];
     for (let start = 0; start < n - 1; start++) {
       for (let end = start + 1; end < n; end++) {
@@ -2091,6 +2967,160 @@ async function hypercubeGrayOrder(
   }
 
   if (path.length > 1) flips.push(changedBitId(path[path.length - 1], path[0]));
+  onProgress?.(total, total);
+  return { path, flips };
+}
+
+/**
+ * Coxeter sign of a signed permutation of Bₙ stored in the byte encoding used
+ * by `hyperoctahedralOrder`: position i holds +v as v and −v as v+n. Equals the
+ * inversion parity of the magnitudes XOR the parity of the negative count, so
+ * every simple reflection (adjacent swap or sign flip) toggles it — making the
+ * Coxeter Cayley graph bipartite.
+ */
+function signedParity(v: Perm): 0 | 1 {
+  const n = v.length;
+  let par = 0;
+  for (let a = 0; a < n; a++) {
+    const va = v[a] > n ? v[a] - n : v[a];
+    if (v[a] > n) par ^= 1;
+    for (let b = a + 1; b < n; b++) {
+      const vb = v[b] > n ? v[b] - n : v[b];
+      if (va > vb) par ^= 1;
+    }
+  }
+  return par as 0 | 1;
+}
+
+/**
+ * Steinhaus–Johnson–Trotter "plain changes" as a sequence of n!−1 adjacent
+ * transpositions: move m (0-based, the left index of the swapped pair) walks the
+ * identity through every permutation of Sₙ. Each move is an involution, so
+ * applying the list in reverse retraces the same permutations backwards.
+ */
+function steinhausJohnsonTrotterMoves(n: number): number[] {
+  const p = new Uint8Array(n);
+  const dir = new Int8Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    p[i] = i + 1;
+    dir[i + 1] = -1;
+  }
+  const total = factorial(n);
+  const moves: number[] = [];
+  let count = 1;
+  while (count < total) {
+    let mobile = 0;
+    let mobileIndex = -1;
+    for (let i = 0; i < n; i++) {
+      const j = i + dir[p[i]];
+      if (j >= 0 && j < n && p[i] > p[j] && p[i] > mobile) {
+        mobile = p[i];
+        mobileIndex = i;
+      }
+    }
+    if (mobileIndex === -1) break;
+    const swapIndex = mobileIndex + dir[mobile];
+    const a = Math.min(mobileIndex, swapIndex);
+    const t = p[mobileIndex];
+    p[mobileIndex] = p[swapIndex];
+    p[swapIndex] = t;
+    moves.push(a);
+    for (let v = mobile + 1; v <= n; v++) dir[v] *= -1;
+    count++;
+  }
+  return moves;
+}
+
+/**
+ * Hamiltonian cycle of Bₙ as the product of two Gray codes: the
+ * Steinhaus–Johnson–Trotter listing of Sₙ (adjacent transpositions) nested
+ * inside the binary reflected Gray code of ℤ₂ⁿ (single sign flips). A vertex is
+ * a length-n byte array where position i holds w(i): a value v ∈ {1,…,n} means
+ * +v and v+n means −v, so the identity is [1,…,n].
+ *
+ * Signs are read per value (the sign rides with the value through transpositions
+ * and is invariant under SJT), so each block of constant sign vector runs a full
+ * SJT pass, alternating direction (snake) so successive blocks share an endpoint.
+ * Between blocks, one Gray step flips the sign of a single value at its current
+ * position — exactly a tₚ generator. The 2ⁿ blocks (even) close back to the
+ * identity, so the final flip returns to the start. The returned `flips` are the
+ * generator ids along the cycle, which makes it render as the perimeter.
+ */
+async function hyperoctahedralOrder(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 50_000
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const sjt = steinhausJohnsonTrotterMoves(n);
+  const blocks = 1 << n;
+  const total = blocks * factorial(n);
+
+  let w = new Uint8Array(n) as Perm;
+  for (let i = 0; i < n; i++) w[i] = i + 1;
+  const path: Perm[] = [w];
+  const flips: number[] = [];
+
+  const swapAt = (src: Perm, i: number): Perm => {
+    const q = new Uint8Array(src) as Perm;
+    const t = q[i];
+    q[i] = q[i + 1];
+    q[i + 1] = t;
+    return q;
+  };
+  const flipSignAt = (src: Perm, pos: number): Perm => {
+    const q = new Uint8Array(src) as Perm;
+    q[pos] = q[pos] > n ? q[pos] - n : q[pos] + n;
+    return q;
+  };
+  // Value whose sign flips going from Gray(k) to Gray(k+1): the position of the
+  // changed bit, i.e. the number of trailing zeros of (k+1), as a 1-based value.
+  const grayChangedValue = (k: number): number => {
+    let x = k + 1;
+    let b = 0;
+    while ((x & 1) === 0) {
+      x >>= 1;
+      b++;
+    }
+    return b + 1;
+  };
+
+  let done = 0;
+  for (let blk = 0; blk < blocks; blk++) {
+    const forward = blk % 2 === 0;
+    for (let s = 0; s < sjt.length; s++) {
+      const m = forward ? sjt[s] : sjt[sjt.length - 1 - s];
+      w = swapAt(w, m);
+      flips.push(m + 1);
+      path.push(w);
+      done++;
+      if (done % chunk === 0) {
+        onProgress?.(done, total);
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+      }
+    }
+    // Boundary sign flip. The closing flip of the last block goes Gray(2ⁿ−1) →
+    // Gray(0), which differs in the top bit (value n); earlier blocks use the
+    // normal reflected-Gray transition.
+    const value = blk < blocks - 1 ? grayChangedValue(blk) : n;
+    let pos = 0;
+    for (let i = 0; i < n; i++) {
+      const mag = w[i] > n ? w[i] - n : w[i];
+      if (mag === value) {
+        pos = i;
+        break;
+      }
+    }
+    flips.push(n + pos);
+    if (blk < blocks - 1) {
+      w = flipSignAt(w, pos);
+      path.push(w);
+      done++;
+    }
+  }
+
   onProgress?.(total, total);
   return { path, flips };
 }
@@ -2520,6 +3550,91 @@ async function johnsonTrotterOrder(
   return { path, flips };
 }
 
+/**
+ * Greedy Hamiltonian path of the reversal graph Rₙ (Cayley graph of Sₙ whose
+ * generators are every contiguous block reversal). The pancake analogue would
+ * be a naive smallest- or largest-reversal-first greedy, but on the full
+ * reversal set that rule dead-ends for n ≥ 6 (Zaks' theorem is specific to
+ * prefix/suffix reversals). We instead use Warnsdorff's rule: step to the
+ * unvisited neighbour with the fewest unvisited neighbours, breaking ties
+ * toward the shortest reversal. This visits all n! permutations for n ≤ 8, but
+ * the path does not generally close back into a cycle (only n ≤ 3 does), so the
+ * final perimeter chord may not be a graph edge.
+ */
+async function reversalGreedyCycle(
+  n: number,
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+  chunk = 5_000
+): Promise<{ path: Perm[]; flips: number[] }> {
+  throwIfAborted(signal);
+  const total = factorial(n);
+  type Op = { id: number; start: number; end: number };
+  const ops: Op[] = [];
+  for (let start = 0; start < n - 1; start++) {
+    for (let end = start + 1; end < n; end++) {
+      ops.push({ id: (start + 1) * 100 + (end + 1), start, end });
+    }
+  }
+  // Shortest reversals first so Warnsdorff ties resolve toward small blocks.
+  ops.sort((a, b) => a.end - a.start - (b.end - b.start) || a.start - b.start);
+
+  const start = new Uint8Array(n);
+  for (let i = 0; i < n; i++) start[i] = i + 1;
+  const seen = new Set<string>([key(start)]);
+  const path: Perm[] = [start];
+  const flips: number[] = [];
+
+  const unvisitedDegree = (q: Perm): number => {
+    let d = 0;
+    for (const op of ops) {
+      if (!seen.has(key(reverseBlock(q, op.start, op.end)))) d++;
+    }
+    return d;
+  };
+
+  let p = start;
+  for (let step = 1; step < total; step++) {
+    let bestQ: Perm | null = null;
+    let bestId = -1;
+    let bestDeg = Infinity;
+    for (const op of ops) {
+      const q = reverseBlock(p, op.start, op.end);
+      if (seen.has(key(q))) continue;
+      const deg = unvisitedDegree(q);
+      if (deg < bestDeg) {
+        bestDeg = deg;
+        bestQ = q;
+        bestId = op.id;
+      }
+    }
+    if (!bestQ) {
+      throw new Error(
+        `Reversal greedy walk got stuck at ${path.length}/${total} — should be impossible for n ≤ 8.`
+      );
+    }
+    seen.add(key(bestQ));
+    path.push(bestQ);
+    flips.push(bestId);
+    p = bestQ;
+    if (step % chunk === 0) {
+      onProgress?.(step, total);
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    }
+  }
+
+  const startKey = key(start);
+  for (const op of ops) {
+    if (key(reverseBlock(p, op.start, op.end)) === startKey) {
+      flips.push(op.id);
+      break;
+    }
+  }
+  onProgress?.(total, total);
+  return { path, flips };
+}
+
 function nextPermutation(p: Uint8Array): void {
   let i = p.length - 2;
   while (i >= 0 && p[i] > p[i + 1]) i--;
@@ -2557,7 +3672,7 @@ function closingTranspositionId(a: Perm, b: Perm): number {
 
 function changedBitId(a: Perm, b: Perm): number {
   for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return i + 1;
+    if (a[i] !== b[i]) return a.length - i;
   }
   return 0;
 }
