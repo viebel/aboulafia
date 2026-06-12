@@ -29,11 +29,14 @@ const SIZE_MIN = 0.05;
 const SIZE_STEP = 0.05;
 const SIZE_DEFAULT = 1;
 const MIN_ZOOM = 0.5;
+const ABSOLUTE_MIN_ZOOM = 0.05;
 const ZOOM_FACTOR = 1.5;
 const VIEW_PARAM_PRECISION = 3;
 const WHEEL_LINE_HEIGHT = 16;
 const WHEEL_DELTA_LINE = 1;
 const WHEEL_DELTA_PAGE = 2;
+const GROWING_SURFACE_BASE_M = M_DEFAULT;
+const SURFACE_MARGIN = 50;
 
 const SVG_SIZE = 700;
 const CX = 350;
@@ -81,6 +84,7 @@ interface RenderState {
   hashKind: HashKind;
   motifKind: MotifKind;
   copyMode: CopyMode;
+  surfaceMode: SurfaceMode;
   zoom: number;
   pan: { x: number; y: number };
 }
@@ -147,6 +151,8 @@ const MOTIF_KINDS = ["random", "square", "circle", "pentagon", "hexagon"] as con
 type MotifKind = (typeof MOTIF_KINDS)[number];
 const COPY_MODES = ["coxeter", "rotation"] as const;
 type CopyMode = (typeof COPY_MODES)[number];
+const SURFACE_MODES = ["fixed", "growing"] as const;
+type SurfaceMode = (typeof SURFACE_MODES)[number];
 type FundamentalView = "wedge" | "incremental" | "flat" | "circle";
 
 const HASH_LABELS: Record<HashKind, string> = {
@@ -168,6 +174,11 @@ const MOTIF_LABELS: Record<MotifKind, string> = {
   circle: "Circle",
   pentagon: "Pentagon",
   hexagon: "Hexagon",
+};
+
+const SURFACE_LABELS: Record<SurfaceMode, string> = {
+  fixed: "Fixed",
+  growing: "Growing",
 };
 
 const HASH_NOTES: Record<HashKind, string> = {
@@ -409,29 +420,42 @@ function polar(angleDeg: number, radius: number): [number, number] {
   return [round(CX + radius * Math.cos(a)), round(CY + radius * Math.sin(a))];
 }
 
+function surfaceRadius(m: number, mode: SurfaceMode): number {
+  return mode === "growing" ? R * Math.sqrt(m / GROWING_SURFACE_BASE_M) : R;
+}
+
+function surfaceMinZoom(radius: number): number {
+  return Math.min(
+    MIN_ZOOM,
+    Math.max(ABSOLUTE_MIN_ZOOM, SVG_SIZE / (2 * (radius + SURFACE_MARGIN)))
+  );
+}
+
 function chamberPoint(
   point: MotifPoint,
   chamber: number,
   chamberDeg: number,
-  startDeg: number
+  startDeg: number,
+  radius: number
 ): [number, number] {
   const theta = point.theta * chamberDeg;
   const local =
     chamber % 2 === 0
       ? chamber * chamberDeg + theta
       : (chamber + 1) * chamberDeg - theta;
-  return polar(startDeg + local, point.radius * R);
+  return polar(startDeg + local, point.radius * radius);
 }
 
 function rotatedChamberPoint(
   point: MotifPoint,
   chamber: number,
   chamberDeg: number,
-  startDeg: number
+  startDeg: number,
+  radius: number
 ): [number, number] {
   return polar(
     startDeg + chamber * chamberDeg + point.theta * chamberDeg,
-    point.radius * R
+    point.radius * radius
   );
 }
 
@@ -442,8 +466,8 @@ function flatPoint(point: MotifPoint): [number, number] {
   ];
 }
 
-function circleChamberPoint(point: MotifPoint): [number, number] {
-  return polar(-90 + point.theta * 360, point.radius * R);
+function circleChamberPoint(point: MotifPoint, radius: number): [number, number] {
+  return polar(-90 + point.theta * 360, point.radius * radius);
 }
 
 function fmtAngle(value: number): string {
@@ -475,15 +499,17 @@ function fmtInteger(value: number): string {
   return Math.round(value).toString();
 }
 
-function nextPowerOfTwo(value: number): number {
-  return 2 ** Math.ceil(Math.log2(Math.max(1, value)));
+function nextMultiple(value: number, step: number): number {
+  return Math.ceil(value / step) * step;
 }
 
 function polarAngularBins(m: number): number {
-  return Math.max(
+  const chamberMultiple = 2 * m;
+  const requiredBins = Math.max(
     POLAR_MIN_ANGULAR_BINS,
-    nextPowerOfTwo(2 * POLAR_HARMONICS * m + 1)
+    2 * POLAR_HARMONICS * m + 1
   );
+  return nextMultiple(requiredBins, chamberMultiple);
 }
 
 function harmonicUnit(scope: PolarSpectrum["scope"]): string {
@@ -523,6 +549,7 @@ function sameRenderState(a: RenderState, b: RenderState): boolean {
     a.hashKind === b.hashKind &&
     a.motifKind === b.motifKind &&
     a.copyMode === b.copyMode &&
+    a.surfaceMode === b.surfaceMode &&
     a.zoom === b.zoom &&
     a.pan.x === b.pan.x &&
     a.pan.y === b.pan.y
@@ -538,8 +565,7 @@ function buildPolarSpectrum(
   scope: "full" | "circle" | "wedge",
   copyMode: CopyMode
 ): PolarSpectrum | null {
-  const angularBins =
-    scope === "wedge" ? POLAR_MIN_ANGULAR_BINS : polarAngularBins(m);
+  const angularBins = polarAngularBins(m);
   const maxAngularMode = POLAR_HARMONICS * (scope === "wedge" ? 1 : m);
   const heatmapMaxAngularMode = Math.min(
     POLAR_HEATMAP_MAX_ANGULAR_MODE,
@@ -801,6 +827,7 @@ function buildPolarSpectrumText(
     `hash\t${state.hashKind}`,
     `motif\t${state.motifKind}`,
     `copies\t${state.copyMode}`,
+    `surface\t${state.surfaceMode}`,
     `scope\t${state.circleChamber ? "circle" : "full"}`,
     `radius_range\t${fmtSpectrum(POLAR_R_MIN)}R..${fmtSpectrum(POLAR_R_MAX)}R`,
     `samples\t${spectrum.samples}`,
@@ -999,13 +1026,21 @@ export function KaleidoscopeView() {
     () => readEnumParam(searchParams, "copy", COPY_MODES, "coxeter"),
     [searchParams]
   );
+  const initialSurfaceMode = useMemo(
+    () => readEnumParam(searchParams, "surf", SURFACE_MODES, "fixed"),
+    [searchParams]
+  );
   const initialRadiusBands = useMemo(() => {
     const value = readNonNegIntParam(searchParams, "rings", RADIUS_BANDS_DEFAULT);
     return Math.min(RADIUS_BANDS_MAX, Math.max(RADIUS_BANDS_MIN, value));
   }, [searchParams]);
+  const initialSurfaceRadius = useMemo(
+    () => surfaceRadius(initialM, initialSurfaceMode),
+    [initialM, initialSurfaceMode]
+  );
   const initialZoom = useMemo(
-    () => readNumberParam(searchParams, "z", 1, MIN_ZOOM),
-    [searchParams]
+    () => readNumberParam(searchParams, "z", 1, surfaceMinZoom(initialSurfaceRadius)),
+    [initialSurfaceRadius, searchParams]
   );
   const initialPanX = useMemo(
     () => readNumberParam(searchParams, "px", 0),
@@ -1047,9 +1082,11 @@ export function KaleidoscopeView() {
   const [hashKind, setHashKind] = useState<HashKind>(initialHashKind);
   const [motifKind, setMotifKind] = useState<MotifKind>(initialMotifKind);
   const [copyMode, setCopyMode] = useState<CopyMode>(initialCopyMode);
+  const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>(initialSurfaceMode);
   const [radiusBands, setRadiusBands] = useState(initialRadiusBands);
   const [zoom, setZoom] = useState(initialZoom);
   const [pan, setPan] = useState({ x: initialPanX, y: initialPanY });
+  const [hoveredRadiusBand, setHoveredRadiusBand] = useState<number | null>(null);
   const [isPanning, setIsPanning] = useState(false);
   const renderStartRef = useRef<number | null>(null);
   const renderFrameRef = useRef<number | null>(null);
@@ -1082,6 +1119,7 @@ export function KaleidoscopeView() {
       hashKind: initialHashKind,
       motifKind: initialMotifKind,
       copyMode: initialCopyMode,
+      surfaceMode: initialSurfaceMode,
       zoom: initialZoom,
       pan: { x: initialPanX, y: initialPanY },
     }),
@@ -1099,6 +1137,7 @@ export function KaleidoscopeView() {
       initialHashKind,
       initialMotifKind,
       initialCopyMode,
+      initialSurfaceMode,
       initialZoom,
       initialPanX,
       initialPanY,
@@ -1119,6 +1158,7 @@ export function KaleidoscopeView() {
       hashKind,
       motifKind,
       copyMode,
+      surfaceMode,
       zoom,
       pan,
     }),
@@ -1136,6 +1176,7 @@ export function KaleidoscopeView() {
       hashKind,
       motifKind,
       copyMode,
+      surfaceMode,
       zoom,
       pan,
     ]
@@ -1152,6 +1193,10 @@ export function KaleidoscopeView() {
     drawnState !== null && sameRenderState(liveRenderState, drawnState);
   const displayState = rendered ?? liveRenderState;
   const chamberDeg = 180 / displayState.m;
+  const displaySurfaceRadius = surfaceRadius(displayState.m, displayState.surfaceMode);
+  const minZoom = surfaceMinZoom(surfaceRadius(m, surfaceMode));
+  const effectiveZoom = Math.max(minZoom, zoom);
+  const displayZoom = Math.max(surfaceMinZoom(displaySurfaceRadius), displayState.zoom);
   const displayChamberDeg =
     (displayState.chamberOnly ||
       displayState.flatChamber ||
@@ -1208,27 +1253,27 @@ export function KaleidoscopeView() {
     frameSize.width || SVG_SIZE,
     frameSize.height || SVG_SIZE
   );
-  const pointPxPerUnit = (displaySize * displayState.zoom) / SVG_SIZE;
+  const pointPxPerUnit = (displaySize * displayZoom) / SVG_SIZE;
   const pointRadius = displayState.pointSize / pointPxPerUnit;
   const pointStep = niceStep(pointCount);
-  const viewPxPerUnit = (displaySize * zoom) / SVG_SIZE;
-  const viewBoxWidth = SVG_SIZE / zoom;
+  const viewPxPerUnit = (displaySize * effectiveZoom) / SVG_SIZE;
+  const viewBoxWidth = SVG_SIZE / effectiveZoom;
   const focusX = SVG_SIZE / 2 - pan.x / viewPxPerUnit;
   const focusY = SVG_SIZE / 2 - pan.y / viewPxPerUnit;
   const viewBox = `${focusX - viewBoxWidth / 2} ${focusY - viewBoxWidth / 2} ${viewBoxWidth} ${viewBoxWidth}`;
   const directBasePoints = useMemo(
     () =>
       gemMotif.map((point) =>
-        chamberPoint(point, 0, displayChamberDeg, startDeg)
+        chamberPoint(point, 0, displayChamberDeg, startDeg, displaySurfaceRadius)
       ),
-    [gemMotif, displayChamberDeg, startDeg]
+    [gemMotif, displayChamberDeg, startDeg, displaySurfaceRadius]
   );
   const reflectedBasePoints = useMemo(
     () =>
       gemMotif.map((point) =>
-        chamberPoint(point, 1, displayChamberDeg, startDeg)
+        chamberPoint(point, 1, displayChamberDeg, startDeg, displaySurfaceRadius)
       ),
-    [gemMotif, displayChamberDeg, startDeg]
+    [gemMotif, displayChamberDeg, startDeg, displaySurfaceRadius]
   );
   const polarSpectrum = useMemo(
     () =>
@@ -1293,6 +1338,7 @@ export function KaleidoscopeView() {
       hash: hashKind === "sine" ? null : hashKind,
       motif: motifKind === "random" ? null : motifKind,
       copy: copyMode === "coxeter" ? null : copyMode,
+      surf: surfaceMode === "fixed" ? null : surfaceMode,
       rings:
         radiusBands === RADIUS_BANDS_DEFAULT ? null : String(radiusBands),
       z: zoom !== 1 || pan.x !== 0 || pan.y !== 0 ? viewParam(zoom) : null,
@@ -1313,6 +1359,7 @@ export function KaleidoscopeView() {
     hashKind,
     motifKind,
     copyMode,
+    surfaceMode,
     radiusBands,
     zoom,
     pan.x,
@@ -1359,8 +1406,12 @@ export function KaleidoscopeView() {
   }, []);
 
   const changeM = useCallback((delta: number) => {
-    setM((value) => Math.max(M_MIN, value + delta));
-  }, []);
+    const nextM = Math.max(M_MIN, m + delta);
+    setM(nextM);
+    setZoom((value) =>
+      Math.max(surfaceMinZoom(surfaceRadius(nextM, surfaceMode)), value)
+    );
+  }, [m, surfaceMode]);
   const changePointCount = useCallback((direction: -1 | 1) => {
     setPointCount((value) =>
       Math.max(POINTS_MIN, value + direction * niceStep(value))
@@ -1425,6 +1476,10 @@ export function KaleidoscopeView() {
   const toggleCopyMode = useCallback(() => {
     setCopyMode((value) => (value === "coxeter" ? "rotation" : "coxeter"));
   }, []);
+  const setSurfaceScaleMode = useCallback((mode: SurfaceMode) => {
+    setSurfaceMode(mode);
+    setZoom((value) => Math.max(surfaceMinZoom(surfaceRadius(m, mode)), value));
+  }, [m]);
   const drawNow = useCallback(() => {
     setIsRendering(true);
     setLastRenderMs(null);
@@ -1438,17 +1493,17 @@ export function KaleidoscopeView() {
     });
   }, [liveRenderState]);
   const zoomOut = () => {
-    setZoom((value) => Math.max(MIN_ZOOM, value / ZOOM_FACTOR));
+    setZoom((value) => Math.max(minZoom, value / ZOOM_FACTOR));
   };
   const zoomIn = () => {
-    setZoom((value) => value * ZOOM_FACTOR);
+    setZoom((value) => Math.max(minZoom, value) * ZOOM_FACTOR);
   };
   const resetView = () => {
-    setZoom(1);
+    setZoom(Math.max(minZoom, 1));
     setPan({ x: 0, y: 0 });
   };
   const handlePanStart = (event: PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || zoom <= 1) return;
+    if (event.button !== 0 || effectiveZoom <= 1) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     panStartRef.current = {
       pointerId: event.pointerId,
@@ -1477,7 +1532,7 @@ export function KaleidoscopeView() {
     setIsPanning(false);
   };
   const handleWheelPan = (event: WheelEvent<HTMLDivElement>) => {
-    if (zoom <= 1) return;
+    if (effectiveZoom <= 1) return;
     event.preventDefault();
     const rect = svgFrameRef.current?.getBoundingClientRect();
     const deltaMultiplier =
@@ -1510,9 +1565,23 @@ export function KaleidoscopeView() {
             />
           )
         ) : displayState.circleChamber ? (
-          <circle cx={CX} cy={CY} r={R} fill="none" stroke={COLOR.ring} strokeWidth={0.8} />
+          <circle
+            cx={CX}
+            cy={CY}
+            r={displaySurfaceRadius}
+            fill="none"
+            stroke={COLOR.ring}
+            strokeWidth={0.8}
+          />
         ) : (
-          <circle cx={CX} cy={CY} r={R} fill="none" stroke={COLOR.ring} strokeWidth={0.8} />
+          <circle
+            cx={CX}
+            cy={CY}
+            r={displaySurfaceRadius}
+            fill="none"
+            stroke={COLOR.ring}
+            strokeWidth={0.8}
+          />
         )}
 
         {optimizedFullDisk ? (
@@ -1581,11 +1650,25 @@ export function KaleidoscopeView() {
           visibleMotifChambers.slice(0, visibleChambers).map((chamber) => {
             const points = gemMotif.map((point) => {
               if (displayState.flatChamber) return flatPoint(point);
-              if (displayState.circleChamber) return circleChamberPoint(point);
-              if (displayState.copyMode === "rotation") {
-                return rotatedChamberPoint(point, chamber, displayChamberDeg, startDeg);
+              if (displayState.circleChamber) {
+                return circleChamberPoint(point, displaySurfaceRadius);
               }
-              return chamberPoint(point, chamber, displayChamberDeg, startDeg);
+              if (displayState.copyMode === "rotation") {
+                return rotatedChamberPoint(
+                  point,
+                  chamber,
+                  displayChamberDeg,
+                  startDeg,
+                  displaySurfaceRadius
+                );
+              }
+              return chamberPoint(
+                point,
+                chamber,
+                displayChamberDeg,
+                startDeg,
+                displaySurfaceRadius
+              );
             });
             const opacity = displayState.solidBlack ? 1 : chamber === 0 ? 0.95 : 0.68;
 
@@ -1611,12 +1694,37 @@ export function KaleidoscopeView() {
           })
         )}
 
+        {hoveredRadiusBand !== null &&
+        polarSpectrum &&
+        !displayState.flatChamber &&
+        polarSpectrum.radiusProfiles[hoveredRadiusBand] ? (
+          <circle
+            cx={CX}
+            cy={CY}
+            r={
+              ((polarSpectrum.radiusProfiles[hoveredRadiusBand].rMin +
+                polarSpectrum.radiusProfiles[hoveredRadiusBand].rMax) /
+                2) *
+              displaySurfaceRadius
+            }
+            fill="none"
+            stroke={COLOR.mirror}
+            strokeWidth={
+              (polarSpectrum.radiusProfiles[hoveredRadiusBand].rMax -
+                polarSpectrum.radiusProfiles[hoveredRadiusBand].rMin) *
+              displaySurfaceRadius
+            }
+            opacity={0.2}
+            pointerEvents="none"
+          />
+        ) : null}
+
         {!displayState.flatChamber &&
           !displayState.circleChamber &&
           displayState.showAxes &&
           visibleGuides.map((i) => {
             const angle = startDeg + i * displayChamberDeg;
-            const [x, y] = polar(angle, R);
+            const [x, y] = polar(angle, displaySurfaceRadius);
             return (
               <line
                 key={`guide-${i}`}
@@ -1643,9 +1751,12 @@ export function KaleidoscopeView() {
       directBasePoints,
       directMotifId,
       displayChamberDeg,
+      displaySurfaceRadius,
       displayState,
+      hoveredRadiusBand,
       gemMotif,
       optimizedFullDisk,
+      polarSpectrum,
       pointRadius,
       reflectedBasePoints,
       reflectedMotifId,
@@ -1657,13 +1768,13 @@ export function KaleidoscopeView() {
   );
 
   return (
-    <div className="mx-auto flex max-w-[920px] flex-col items-center gap-5">
+    <div className="mx-auto grid w-full max-w-[1600px] gap-5 xl:grid-cols-[minmax(0,920px)_minmax(440px,1fr)]">
       <div
         ref={svgFrameRef}
-        className="relative w-full rounded-xl border bg-card p-3"
+        className="relative w-full rounded-xl border bg-card p-3 xl:col-start-1 xl:row-start-1"
       >
         <div
-          className={`touch-none ${zoom > 1 ? (isPanning ? "cursor-grabbing" : "cursor-grab") : ""}`}
+          className={`touch-none ${effectiveZoom > 1 ? (isPanning ? "cursor-grabbing" : "cursor-grab") : ""}`}
           onPointerDown={handlePanStart}
           onPointerMove={handlePanMove}
           onPointerUp={handlePanEnd}
@@ -1679,13 +1790,13 @@ export function KaleidoscopeView() {
             variant="ghost"
             size="icon-sm"
             onClick={zoomOut}
-            disabled={zoom <= MIN_ZOOM}
+            disabled={effectiveZoom <= minZoom}
             aria-label="Zoom out"
           >
             <Minus className="h-3.5 w-3.5" />
           </Button>
           <span className="w-12 text-center font-mono">
-            {Math.round(zoom * 100)}%
+            {Math.round(effectiveZoom * 100)}%
           </span>
           <Button
             variant="ghost"
@@ -1699,7 +1810,7 @@ export function KaleidoscopeView() {
             variant="ghost"
             size="icon-sm"
             onClick={resetView}
-            disabled={zoom === 1 && pan.x === 0 && pan.y === 0}
+            disabled={effectiveZoom === 1 && pan.x === 0 && pan.y === 0}
             aria-label="Reset zoom and pan"
           >
             <RotateCcw className="h-3.5 w-3.5" />
@@ -1719,10 +1830,13 @@ export function KaleidoscopeView() {
         ) : null}
       </div>
 
-      <div className="flex w-full flex-wrap items-center justify-between gap-3">
+      <div className="flex w-full flex-wrap items-center justify-between gap-3 xl:col-span-2 xl:row-start-2">
         <p className="font-mono text-sm text-foreground">
           I<sub>2</sub>({m}) · {m} mirrors · {2 * m} copies · {pointCount} points ·{" "}
           {fmtAngle(pointSize)}px size
+          {surfaceMode === "growing"
+            ? ` · radius ${fmtAngle(displaySurfaceRadius / R)}R`
+            : ""}
           {isRendering ? " · rendering..." : ""}
           {drawPending ? " · pending draw" : ""}
           {lastRenderMs !== null ? ` · rendered in ${Math.round(lastRenderMs)} ms` : ""}
@@ -1805,6 +1919,20 @@ export function KaleidoscopeView() {
             >
               Fundamental
             </Button>
+          </div>
+          <span className="ml-2 text-muted-foreground">surface</span>
+          <div className="flex items-center rounded-lg border bg-background p-0.5">
+            {SURFACE_MODES.map((mode) => (
+              <Button
+                key={mode}
+                variant={surfaceMode === mode ? "default" : "ghost"}
+                size="sm"
+                onClick={() => setSurfaceScaleMode(mode)}
+                aria-pressed={surfaceMode === mode}
+              >
+                {SURFACE_LABELS[mode]}
+              </Button>
+            ))}
           </div>
           <span className="ml-2 text-muted-foreground">fundamental</span>
           <div className="flex items-center rounded-lg border bg-background p-0.5">
@@ -1914,7 +2042,7 @@ export function KaleidoscopeView() {
         </div>
       </div>
 
-      <div className="w-full rounded-lg border bg-background/60 p-3 text-sm text-muted-foreground">
+      <div className="w-full rounded-lg border bg-background/60 p-3 text-sm text-muted-foreground xl:col-span-2 xl:row-start-3">
         <p>
           <span className="font-medium text-foreground">Coxeter link.</span>{" "}
           I<sub>2</sub>({m}) is the rank-2 Coxeter group generated by two
@@ -1926,14 +2054,16 @@ export function KaleidoscopeView() {
         </p>
       </div>
 
-      <div className="w-full rounded-lg border bg-background/60 p-3 text-sm text-muted-foreground">
+      <div className="w-full rounded-lg border bg-background/60 p-3 text-sm text-muted-foreground xl:col-start-2 xl:row-start-1 xl:max-h-[calc(100vh-3rem)] xl:overflow-auto">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <p className="font-medium text-foreground">Polar FFT</p>
+          <p className="font-medium text-foreground">
+            Polar FFT · m={displayState.m} · {polarSpectrum?.scope ?? "pending"}
+          </p>
           <div className="flex items-center gap-2">
             <p className="font-mono text-xs">
               {fmtSpectrum(POLAR_R_MIN)}R..{fmtSpectrum(POLAR_R_MAX)}R ·{" "}
               {polarSpectrum
-                ? `${polarSpectrum.samples} samples · energy ${fmtSpectrum(polarSpectrum.totalEnergy)}`
+                ? `${polarSpectrum.samples} samples · ${polarSpectrum.angularBins} bins · energy ${fmtSpectrum(polarSpectrum.totalEnergy)}`
                 : "not available"}
             </p>
             <div className="flex items-center gap-1 rounded-md border bg-background px-1 py-0.5">
@@ -2033,132 +2163,50 @@ export function KaleidoscopeView() {
                     {harmonicUnit(polarSpectrum.scope)}
                   </span>
                 ))}
-                {polarSpectrum.radiusProfiles.flatMap((profile, profileIndex) => [
-                  <span
-                    key={`radius-label-${profileIndex}`}
-                    className="text-muted-foreground"
-                  >
-                    {fmtSpectrum(profile.rMin)}R..{fmtSpectrum(profile.rMax)}R
-                  </span>,
+                {polarSpectrum.radiusProfiles.map((profile, profileIndex) => (
                   <div
-                    key={`radius-points-${profileIndex}`}
-                    className="rounded-sm px-1 py-1 text-center text-foreground"
-                    title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, wedge points: ${fmtInteger(profile.wedgePoints)}, full-circle samples: ${profile.samples}`}
+                    key={`radius-row-${profileIndex}`}
+                    className="contents"
+                    onMouseEnter={() => setHoveredRadiusBand(profileIndex)}
+                    onMouseLeave={() => setHoveredRadiusBand(null)}
                   >
-                    {fmtInteger(profile.wedgePoints)}
-                  </div>,
-                  <div
-                    key={`radius-total-${profileIndex}`}
-                    className="rounded-sm px-1 py-1 text-center text-foreground"
-                    style={{ backgroundColor: heatColor(profile.totalIntensity) }}
-                    title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, total: ${fmtSpectrum(profile.totalEnergy)}`}
-                  >
-                    {fmtInteger(profile.totalEnergy)}
-                  </div>,
-                  <div
-                    key={`radius-shown-${profileIndex}`}
-                    className="rounded-sm px-1 py-1 text-center text-foreground"
-                    style={{ backgroundColor: heatColor(profile.shownIntensity) }}
-                    title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, shown: ${fmtSpectrum(profile.shownEnergy)}`}
-                  >
-                    {fmtPercent(profile.shownEnergy, profile.totalEnergy)}
-                  </div>,
-                  ...profile.harmonics.map((entry) => (
+                    <span className="text-muted-foreground">
+                      {fmtSpectrum(profile.rMin)}R..{fmtSpectrum(profile.rMax)}R
+                    </span>
                     <div
-                      key={`radius-${profileIndex}-${entry.harmonic}`}
                       className="rounded-sm px-1 py-1 text-center text-foreground"
-                      style={{ backgroundColor: heatColor(entry.intensity) }}
-                      title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, ${entry.harmonic}${harmonicUnit(polarSpectrum.scope)}: ${fmtPercent(entry.energy, profile.totalEnergy)} (${fmtSpectrum(entry.energy)})`}
+                      title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, wedge points: ${fmtInteger(profile.wedgePoints)}, full-circle samples: ${profile.samples}`}
                     >
-                      {fmtPercent(entry.energy, profile.totalEnergy)}
+                      {fmtInteger(profile.wedgePoints)}
                     </div>
-                  )),
-                ])}
-              </div>
-            </div>
-            <div className="grid gap-3 lg:grid-cols-[1fr_auto]">
-            <svg
-              viewBox={`0 0 ${54 + polarSpectrum.radialModes.length * 24} ${
-                28 + polarSpectrum.angularModes.length * 7
-              }`}
-              className="w-full overflow-visible rounded-md border bg-background"
-              role="img"
-              aria-label="Polar Fourier spectrum"
-            >
-              {polarSpectrum.cells.map((cell) => {
-                const x = 42 + cell.radialMode * 24;
-                const y =
-                  8 +
-                  (polarSpectrum.heatmapMaxAngularMode - cell.angularMode) * 7;
-                const isTarget = polarSpectrum.targetModes.some(
-                  (target) => target.mode === cell.angularMode
-                );
-                return (
-                  <rect
-                    key={`${cell.radialMode}-${cell.angularMode}`}
-                    x={x}
-                    y={y}
-                    width={22}
-                    height={6}
-                    rx={1}
-                    fill={heatColor(cell.intensity)}
-                    stroke={isTarget ? "var(--foreground)" : "none"}
-                    strokeWidth={isTarget ? 0.45 : 0}
-                  >
-                    <title>
-                      {`ktheta=${cell.angularMode}, kr=${cell.radialMode}: ${fmtSpectrum(cell.value)}`}
-                    </title>
-                  </rect>
-                );
-              })}
-              {polarSpectrum.angularModes.map((mode) => {
-                if (
-                  mode % 4 !== 0 &&
-                  !polarSpectrum.targetModes.some((target) => target.mode === mode)
-                ) {
-                  return null;
-                }
-                return (
-                  <text
-                    key={`mode-${mode}`}
-                    x={35}
-                    y={13 + (polarSpectrum.heatmapMaxAngularMode - mode) * 7}
-                    textAnchor="end"
-                    className="fill-muted-foreground text-[6px]"
-                  >
-                    {mode}
-                  </text>
-                );
-              })}
-              {polarSpectrum.radialModes.map((mode) => (
-                <text
-                  key={`radial-${mode}`}
-                  x={53 + mode * 24}
-                  y={25 + polarSpectrum.heatmapMaxAngularMode * 7}
-                  textAnchor="middle"
-                  className="fill-muted-foreground text-[6px]"
-                >
-                  {mode}
-                </text>
-              ))}
-            </svg>
-            <div className="grid content-start gap-2 font-mono text-xs text-foreground">
-              {polarSpectrum.targetModes.map((entry) => (
-                <p key={entry.mode}>
-                  kθ={entry.mode}: {fmtSpectrum(entry.value)}
-                </p>
-              ))}
-              <p>max: {fmtSpectrum(polarSpectrum.maxValue)}</p>
-              <div className="pt-1">
-                <p className="text-muted-foreground">Top kθ</p>
-                {polarSpectrum.topAngularModes.map((entry) => (
-                  <p key={`top-${entry.mode}`}>
-                    {entry.mode}: {fmtSpectrum(entry.value)}
-                  </p>
+                    <div
+                      className="rounded-sm px-1 py-1 text-center text-foreground"
+                      style={{ backgroundColor: heatColor(profile.totalIntensity) }}
+                      title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, total: ${fmtSpectrum(profile.totalEnergy)}`}
+                    >
+                      {fmtInteger(profile.totalEnergy)}
+                    </div>
+                    <div
+                      className="rounded-sm px-1 py-1 text-center text-foreground"
+                      style={{ backgroundColor: heatColor(profile.shownIntensity) }}
+                      title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, shown: ${fmtSpectrum(profile.shownEnergy)}`}
+                    >
+                      {fmtPercent(profile.shownEnergy, profile.totalEnergy)}
+                    </div>
+                    {profile.harmonics.map((entry) => (
+                      <div
+                        key={`radius-${profileIndex}-${entry.harmonic}`}
+                        className="rounded-sm px-1 py-1 text-center text-foreground"
+                        style={{ backgroundColor: heatColor(entry.intensity) }}
+                        title={`r=${fmtSpectrum(profile.rMin)}R..${fmtSpectrum(profile.rMax)}R, ${entry.harmonic}${harmonicUnit(polarSpectrum.scope)}: ${fmtPercent(entry.energy, profile.totalEnergy)} (${fmtSpectrum(entry.energy)})`}
+                      >
+                        {fmtPercent(entry.energy, profile.totalEnergy)}
+                      </div>
+                    ))}
+                  </div>
                 ))}
               </div>
             </div>
-          </div>
           </div>
         ) : (
           <p className="mt-2">Draw the full scope to update the spectrum.</p>
